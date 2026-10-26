@@ -1,0 +1,105 @@
+/* eslint-disable global-require,@typescript-eslint/no-require-imports */
+import * as React from 'react';
+import * as ReactDOM from 'react-dom';
+import type { ReactElement } from 'react';
+import type { RenderReturnType } from './types/index.ts' with { 'resolution-mode': 'import' };
+
+// Type for legacy React DOM APIs (React 16/17) that were removed from @types/react-dom@19
+// These are only used at runtime when supportsRootApi is false
+interface LegacyReactDOM {
+  hydrate(element: ReactElement, container: Element): void;
+  render(element: ReactElement, container: Element): RenderReturnType;
+  unmountComponentAtNode(container: Element): boolean;
+}
+
+const reactMajorVersion = Number(ReactDOM.version?.split('.')[0]) || 16;
+
+// TODO: once we require React 18, we can remove this and inline everything guarded by it.
+export const supportsRootApi = reactMajorVersion >= 18;
+
+export const supportsHydrate = supportsRootApi || 'hydrate' in ReactDOM;
+
+// React 19 added the `onCaughtError`/`onUncaughtError` root options. React 18's root API only
+// supports `identifierPrefix` and `onRecoverableError`.
+export const supportsReact19RootErrorCallbacks = reactMajorVersion >= 19;
+
+// TODO: once React dependency is updated to >= 18, we can remove this and just
+// import ReactDOM from 'react-dom/client';
+let reactDomClient: typeof import('react-dom/client');
+if (supportsRootApi) {
+  // This will never throw an exception, but it's the way to tell Webpack the dependency is optional
+  // https://github.com/webpack/webpack/issues/339#issuecomment-47739112
+  // Unfortunately, it only converts the error to a warning. React 16/17 consumers can suppress
+  // the warning by passing `reactDomClientWarning` from 'react-on-rails/webpackHelpers' to their
+  // webpack `ignoreWarnings` config. See #3137.
+  try {
+    reactDomClient = require('react-dom/client') as typeof import('react-dom/client');
+  } catch (_e) {
+    // We should never get here, but if we do, we'll just use the default ReactDOM
+    // and live with the warning.
+    reactDomClient = ReactDOM as unknown as typeof import('react-dom/client');
+  }
+}
+
+export type ReactHydrateOptions = {
+  identifierPrefix?: string;
+  onCaughtError?: (error: unknown, errorInfo: unknown) => void;
+  onRecoverableError?: (error: unknown, errorInfo: unknown) => void;
+  onUncaughtError?: (error: unknown, errorInfo: unknown) => void;
+};
+
+type HydrateOrRenderType = (
+  domNode: Element,
+  reactElement: ReactElement,
+  options?: ReactHydrateOptions,
+) => RenderReturnType;
+
+// Cast ReactDOM to include legacy APIs for React 16/17 compatibility
+// These methods exist at runtime but are removed from @types/react-dom@19
+const legacyReactDOM = ReactDOM as unknown as LegacyReactDOM;
+
+// Validate legacy APIs exist at runtime when needed (React < 18)
+if (!supportsRootApi) {
+  if (typeof legacyReactDOM.hydrate !== 'function') {
+    throw new Error('React legacy hydrate API not available. Expected React 16/17.');
+  }
+  if (typeof legacyReactDOM.render !== 'function') {
+    throw new Error('React legacy render API not available. Expected React 16/17.');
+  }
+  if (typeof legacyReactDOM.unmountComponentAtNode !== 'function') {
+    throw new Error('React legacy unmountComponentAtNode API not available. Expected React 16/17.');
+  }
+}
+
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- reactDomClient is always defined when supportsRootApi is true */
+export const reactHydrate: HydrateOrRenderType = supportsRootApi
+  ? (domNode, reactElement, options) => reactDomClient!.hydrateRoot(domNode, reactElement, options)
+  : (domNode, reactElement) => legacyReactDOM.hydrate(reactElement, domNode);
+
+export function reactRender(
+  domNode: Element,
+  reactElement: ReactElement,
+  options?: ReactHydrateOptions,
+): RenderReturnType {
+  if (supportsRootApi) {
+    const root = reactDomClient!.createRoot(domNode, options);
+    root.render(reactElement);
+    return root;
+  }
+
+  return legacyReactDOM.render(reactElement, domNode);
+}
+
+export const unmountComponentAtNode: (container: Element) => boolean = supportsRootApi
+  ? // not used if we use root API
+
+    (_container: Element) => false
+  : (container: Element) => legacyReactDOM.unmountComponentAtNode(container);
+
+export const ensureReactUseAvailable = () => {
+  if (!('use' in React) || typeof React.use !== 'function') {
+    throw new Error(
+      'React.use is not defined. Please ensure you are using React 19 to use server components.',
+    );
+  }
+};

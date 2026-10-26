@@ -1,0 +1,630 @@
+# Upgrading React on Rails
+
+> [!NOTE]
+> **Summary for AI agents:** Use this page when the user is upgrading between React on Rails versions (e.g., v13 → v14). For upgrading from OSS to Pro, see [Upgrade to Pro](../../pro/upgrading-to-pro.md). For upgrading between **React on Rails Pro versions**, see [Upgrading React on Rails Pro](../../pro/updating.md) — Pro upgrades are coupled Ruby + JavaScript changes and need lockfile updates on both sides. For migrating from the `react-rails` gem, see [Migrating from react-rails](../migrating/migrating-from-react-rails.md). Check the [release notes](./release-notes/index.md) for version-specific breaking changes.
+
+## Need Help Migrating?
+
+If you would like help in migrating between React on Rails versions or help with implementing server rendering, please contact [justin@shakacode.com](mailto:justin@shakacode.com) for more information about our [React on Rails Pro Support](../../pro/react-on-rails-pro.md).
+
+We specialize in helping companies to quickly and efficiently upgrade. The older versions use the Rails asset pipeline to package client assets. The current and recommended way is to use Webpack 4+ for asset preparation. You may also need help migrating from the `rails/webpacker`'s Webpack configuration to a better setup ready for Server Side Rendering.
+
+## v15 Retraction Notice {#v15-retraction-notice}
+
+React on Rails v15.0.0 was retracted due to API design issues. When upgrading from v14 or earlier, skip v15 and upgrade directly to v16 or a later supported release. Historical v15 material remains available for maintaining older applications: [React on Rails 15.0.0 docs](https://github.com/shakacode/react_on_rails/tree/15.0.0/docs) and [React on Rails 15.0.0 code](https://github.com/shakacode/react_on_rails/tree/15.0.0).
+
+## General Upgrade Process
+
+After upgrading to any major version, always run the generator to get the latest defaults:
+
+```bash
+rails generate react_on_rails:install
+```
+
+**⚠️ Important**: Review generated changes carefully before applying to avoid overwriting custom configurations. The generator updates:
+
+- `bin/dev` (improved development workflow)
+- webpack configurations
+- `shakapacker.yml` settings
+- other configuration files
+
+## Pro Users: Coupled Ruby + JavaScript Upgrade
+
+React on Rails Pro versions are a **coupled Ruby + JavaScript upgrade**: the gem
+(`react_on_rails_pro`), the npm packages (`react-on-rails-pro`, optionally
+`react-on-rails-pro-node-renderer` and `react-on-rails-rsc`), **and** both
+lockfiles (`Gemfile.lock` plus `yarn.lock` / `package-lock.json` / `pnpm-lock.yaml`)
+must move together. The gem and the npm package also use different prerelease
+formats (`16.7.0.rc.0` on RubyGems vs `16.7.0-rc.0` on npm).
+
+See [Upgrading React on Rails Pro → Coupled Pro Upgrade Checklist](../../pro/updating.md#coupled-pro-upgrade-checklist)
+for the full step-by-step. Following that checklist is required for Pro upgrades
+to avoid PRs that pass loose installs locally and then fail CI under frozen-lockfile
+install.
+
+## Upgrade Preflight
+
+Before changing versions, check these first:
+
+1. **Ruby and Node requirements**: React on Rails v17 requires Ruby 3.3+ and Node 18+. The default React on Rails Pro Node renderer resolves Fastify 5 and requires Node 20+ at startup. Its `engines.node` floor of Node 18.19.0+ applies only when you use the documented Fastify 4-compatible dependency overrides. React on Rails v16 remains the upgrade path for apps that need older Ruby versions.
+2. **Bundler age**: legacy apps may have lockfiles created by Bundler 1.x. Those lockfiles can fail on modern Ruby before the React on Rails upgrade even starts.
+3. **Rails version**: current `react_on_rails` requires Ruby 3.3+, which is incompatible with Rails < 7.0. Older Rails apps need a Rails upgrade first.
+4. **Asset stack**: if the app still uses `webpacker`, upgrade to `shakapacker` first.
+5. **Version pinning**: use exact gem and npm package versions for React on Rails-related packages. Avoid `^`, `~`, or `*`.
+
+If your app is both Ruby/Bundler-old and Webpacker-old, do those upgrades first. Trying to jump directly from an older Rails / Webpacker 3 / Bundler 1 stack to current React on Rails is usually more than one migration.
+
+If the first failure is a Bundler 1.x lockfile, refresh that lockfile with Bundler 2.x before changing React on Rails:
+
+```bash
+gem install bundler   # if Bundler 2.x is not already available
+bundle lock --update
+bundle install
+```
+
+## Upgrading Precompile Hooks for SSR + HMR
+
+If your app uses server-side rendering with HMR, Shakapacker commonly runs two webpack processes during development (client HMR and server watcher). In that setup, direct-command precompile hooks are more fragile because each process can trigger the hook.
+
+Use a script-based hook with an explicit self-guard. This pattern is reliable across Shakapacker versions.
+
+### Recommended setup
+
+1. Create `bin/shakapacker-precompile-hook`:
+
+   ```ruby
+   #!/usr/bin/env ruby
+   # frozen_string_literal: true
+
+   exit 0 if ENV["SHAKAPACKER_SKIP_PRECOMPILE_HOOK"] == "true"
+   system("bundle", "exec", "rake", "react_on_rails:locale", exception: true)
+   ```
+
+2. Make it executable:
+
+   ```bash
+   chmod +x bin/shakapacker-precompile-hook
+   ```
+
+3. Configure `config/shakapacker.yml`:
+
+   ```yaml
+   default: &default
+     precompile_hook: 'bin/shakapacker-precompile-hook'
+   ```
+
+### Version guidance
+
+- **Shakapacker 9.4.0+**: Native support for `SHAKAPACKER_SKIP_PRECOMPILE_HOOK` exists.
+- **Shakapacker 9.0-9.3**: Prefer script-based hooks with the self-guard for reliable behavior.
+- **All supported versions**: Script-based hooks are the safest choice for SSR + HMR development.
+
+### CI recommendation
+
+In CI, run precompile preparation explicitly once before webpack compilation or test startup, rather than relying on hook timing in watch-like flows.
+
+## Upgrading to v17 (from v16)
+
+### Breaking Changes
+
+- **Ruby 3.3+ is required.** Upgrade Ruby before moving to React on Rails v17. React on Rails v16 remains the supported line for applications that must stay on Ruby 3.2 or older.
+- **React on Rails Pro already required Ruby 3.3+.** v17 aligns the open-source gem, Pro gem, create-app validator, and CI minimum matrix on the same Ruby floor.
+- **Four configuration options were removed.** Three were deprecated in v16, while `config.server_render_method` was inert. All four are gone in v17. Setting any of them in `config/initializers/react_on_rails.rb` now raises `NoMethodError` at boot. Run `bin/rake react_on_rails:doctor` to detect any that remain in your initializer.
+  - `config.generated_assets_dirs` — delete the line. Public asset paths are determined automatically from `public_output_path` in `config/shakapacker.yml`.
+  - `config.skip_display_none` — delete the line. It had no runtime effect.
+  - `config.defer_generated_component_packs` — replaced by `config.generated_component_packs_loading_strategy`:
+    - `config.defer_generated_component_packs = true` → `config.generated_component_packs_loading_strategy = :defer`
+    - `config.defer_generated_component_packs = false` → **delete the line.** The old option was truthy-gated — only `= true` did anything (it set `:defer`); `= false` was a no-op that fell through to the default strategy. Deleting the line preserves that behavior. Set `config.generated_component_packs_loading_strategy = :sync` explicitly only if you specifically relied on synchronous (blocking) pack loading.
+    - The default strategy (when you don't set one) is `:async` for Pro or `:defer` for non-Pro on Shakapacker 8.2.0+, and `:sync` on older Shakapacker.
+  - `config.server_render_method` — delete the line. The open-source gem always renders with ExecJS, so this option never selected a server render method — its validator only raised at boot for any non-blank, non-`"ExecJS"` value. Leaving it in place now raises `NoMethodError` at boot (`bin/rake react_on_rails:doctor` also flags the stale line). For a standalone Node rendering process, use React on Rails Pro's Node renderer, configured via `ReactOnRailsPro.configure`.
+- **[Pro] Removed the undocumented `ReactOnRailsPro::Cache.fetch_react_component` class API.** Pro apps should use the supported cached helper APIs (`cached_react_component`, `cached_react_component_hash`, and related helpers) instead of calling the low-level cache class directly.
+- **[Pro] React Server Components now require the stable React 19.2.x RSC line.** Pro RSC apps on v17 require `react-on-rails-rsc >= 19.2.1 < 19.3`, React >= 19.2.7, and matching React DOM. Non-RSC Pro apps retain React 18 support. Set `REACT_ON_RAILS_PRO_DISABLE_VERSION_CHECK=1` only as an emergency escape hatch.
+- **Removed the never-wired `RenderRequest` / `JsCodeBuilder` / `RenderingStrategy` rendering layer.** These internal classes were built for a strategy-pattern refactor that was never connected. Remove any application references to `ReactOnRails::RenderRequest`, `ReactOnRails::JsCodeBuilder`, `ReactOnRails::RenderingStrategy`, or Pro equivalents.
+- **Removed undocumented `ReactOnRails::Utils` helpers.** `ReactOnRails::Utils.server_rendering_is_enabled?` and `ReactOnRails::Utils.rails_version_less_than` are gone. Remove any application calls.
+- **[Pro] Node Renderer now requires Ruby 3.3+ for the async-http transport.** The `react-on-rails-pro` gem now requires Ruby >= 3.3 (raised from >= 3.0) because `async-http` depends on Ruby 3.3 features. Upgrade Ruby before moving to this release.
+- **[Pro] `config.renderer_http_pool_size` semantics changed.** Existing numeric values now cap concurrent async-http connections for each renderer client instead of sizing a persistent process-wide connection pool. HTTP/2 may multiplex request streams over those pooled connections. Setting `nil` keeps the default connection limit and does not make the async-http client unlimited. See the [Renderer Performance Tuning](../configuration/configuration-pro.md#renderer-performance-tuning-for-streamed-rsc) section.
+
+### Migration Steps
+
+1. Upgrade the app to Ruby 3.3 or newer and refresh the Ruby lockfile:
+
+   ```bash
+   ruby -v
+   bundle install
+   ```
+
+2. If you scaffold apps with `create-react-on-rails-app`, make sure your shell resolves Ruby 3.3+ before running the CLI.
+3. Update the `react_on_rails` gem and `react-on-rails` npm package pins to the same v17 release, then install both lockfiles together:
+
+   ```bash
+   bundle update react_on_rails
+   # then run your package manager's install command
+   npm install   # or: yarn install / pnpm install
+   ```
+
+4. Before booting, run the doctor task to find removed configuration options:
+
+   ```bash
+   bin/rake react_on_rails:doctor
+   ```
+
+   Remove or replace every option it reports in `config/initializers/react_on_rails.rb`. Any remaining option listed in the Breaking Changes above (`config.generated_assets_dirs`, `config.skip_display_none`, `config.defer_generated_component_packs`, `config.server_render_method`) raises `NoMethodError` at boot.
+
+5. Run RuboCop, your app's test suite, and asset build after the Ruby and package updates. The Ruby
+   baseline bump can activate cops that were previously inactive:
+
+   ```bash
+   bundle exec rubocop
+   ```
+
+## Upgrading to v16.6.0 (from v16.5.x)
+
+### Breaking Changes
+
+- **Removed `immediate_hydration` completely.** The `immediate_hydration` config option, helper parameter, `data-immediate-hydration` HTML attribute, and `redux_store` `immediate_hydration:` keyword argument have been removed. Immediate hydration is now always enabled for Pro users and disabled for non-Pro users, with no per-component override.
+
+### Migration Steps
+
+1. Remove `config.immediate_hydration` from `config/initializers/react_on_rails.rb` (or `react_on_rails_pro.rb`)
+2. Remove any `immediate_hydration:` keyword arguments from `react_component`, `react_component_hash`, `stream_react_component`, and `redux_store` calls in your views
+3. Update gem and npm package versions to 16.6.0, then run `bundle install` and your package manager's install command
+
+See the [v16.6.0 Release Notes](release-notes/16.6.0.md) for all changes.
+
+## Upgrading to v16.5.0 (from v16.4.0)
+
+### Breaking Changes
+
+- **[Pro] `RENDERER_PASSWORD` now required in production-like environments.** Existing staging/production deployments using NodeRenderer without a password will fail to start after upgrading. Set `RENDERER_PASSWORD` in the environment and configure `config.renderer_password = ENV.fetch("RENDERER_PASSWORD")` in your Rails initializer before upgrading.
+- **[Pro] Minimum `async` gem version bumped to 2.29.** The streaming helper now requires `async >= 2.29` (previously `>= 2.6`) due to the migration from `Async::Variable` to `Async::Promise`. Run `bundle update async` if your Gemfile pins below 2.29.
+
+### Changes
+
+- **[Pro] Canonical env var for worker count is now `RENDERER_WORKERS_COUNT`.** The previous `NODE_RENDERER_CONCURRENCY` is still supported as a fallback. Update deployment configs and documentation to use the new name.
+
+See the [v16.5.0 Release Notes](release-notes/16.5.0.md) for all changes.
+
+## Upgrading to v16.4.0 (from v16.3.x)
+
+This release includes major generator improvements, development workflow enhancements, and Pro stability fixes. See the [v16.4.0 Release Notes](release-notes/16.4.0.md) for full details.
+
+**Key actions required:**
+
+1. **Update gem and npm package versions** to 16.4.0
+2. **Pro users: remove legacy license key file** — `config/react_on_rails_pro_license.key` is no longer read. Move the token to the `REACT_ON_RAILS_PRO_LICENSE` environment variable
+3. **Pro RSC users: check `custom_rsc_payload_template` overrides** — the template is now rendered with `formats: [:text]`. If your override is `.html.erb`, rename it to `.text.erb`
+4. **Pro users upgrading from 3.x:** See the [Pro Upgrade Guide](../../pro/updating.md) for package rename steps, changed defaults, and version alignment notes
+
+## Upgrading to v16.3.0 (from v16.2.x)
+
+This is a minor release. Update your gem and npm package versions, then run `bundle install` and your package manager's install command. See the [v16.3.0 Release Notes](release-notes/16.3.0.md) for details.
+
+**Key changes:**
+
+1. **Simplified Shakapacker version handling** — obsolete minimum version checks removed
+2. **ShakaCode Trust-Based Commercial Licensing**: A subscription is only required for production use by organizations above the free line; see [The React on Rails Pro License](https://github.com/shakacode/react_on_rails/blob/main/REACT-ON-RAILS-PRO-LICENSE.md)
+
+## Upgrading to v16.2.x (from v16.1.x)
+
+This release focuses on clear separation between open-source and Pro features. See the [v16.2.x Release Notes](release-notes/16.2.0.md) for full details.
+
+**Key actions required:**
+
+1. **Remove `config.immediate_hydration`** from your initializer - this config option has been removed (automatic for Pro users)
+2. **Use exact versions** in `package.json` - semver wildcards (`^`, `~`, `*`) now cause boot failures
+3. **Pro users:** If importing Pro methods from `react-on-rails`, switch to `react-on-rails-pro`
+4. **RSC users:** Move RSC configurations from `ReactOnRails.configure` to `ReactOnRailsPro.configure`
+
+## Upgrading to v16.1.x (from v16.0.x)
+
+This is a minor release - update your gem and npm package versions, then run `bundle install` and your package manager's install command. See the [v16.1.x Release Notes](release-notes/16.1.0.md) for new features and bug fixes.
+
+**Deprecation:** Remove `config.generated_assets_dirs` from your configuration if present. Asset paths are now automatically determined from `public_output_path` in `config/shakapacker.yml`.
+
+## Upgrading to v16 (from v14/v15)
+
+### Breaking Changes
+
+- **Webpacker support completely removed**. Shakapacker >= 6.0 is now required.
+- **Updated runtime requirements**:
+  - Minimum Ruby version: 3.0 (v16 minimum; v17 requires 3.3+)
+  - Minimum Node.js version: 18 (the Pro Node renderer defaults to Fastify 5 and requires Node 20+; its
+    `engines.node` floor of >= 18.19.0 applies with documented Fastify 4-compatible dependency overrides)
+  - CI tests against newer Ruby and Node.js versions than these minimums; CI targets are not support floors
+- **Install generator now validates prerequisites** and requires at least one JavaScript package manager
+
+### Migration Steps
+
+1. **Update Dependencies**
+
+   > **Note**: The versions below are examples. Check the [changelog](https://github.com/shakacode/react_on_rails/blob/main/CHANGELOG.md) for the latest stable release and substitute accordingly.
+
+   ```ruby
+   # Gemfile
+   gem "react_on_rails", "16.6.0"
+   ```
+
+   ```json
+   // package.json — use the npm equivalent of the same release
+   {
+     "dependencies": {
+       "react-on-rails": "16.6.0"
+     }
+   }
+   ```
+
+2. **Install Updates**
+
+   ```bash
+   bundle update react_on_rails shakapacker
+   # then run your package manager's install command
+   npm install   # or: yarn install / pnpm install
+   ```
+
+3. **Run Generator**
+
+   ```bash
+   bundle exec rails generate react_on_rails:install
+   ```
+
+4. **Review and Apply Changes**
+   - If your app was still on `webpacker`, finish that migration first
+   - Check webpack configuration exports (function naming may have changed)
+   - Review `shakapacker.yml` settings
+   - Update `bin/dev` if needed
+
+5. **Test Your Application**
+
+   ```bash
+   # Test asset compilation
+   bundle exec rails assets:precompile
+
+   # Test development server
+   bin/dev
+
+   # Run your test suite
+   bundle exec rspec # or your test command
+   ```
+
+### Common Upgrade Issues
+
+#### Build Fails with Module Resolution Errors
+
+**Symptoms:** Webpack cannot find modules referenced in your configuration
+
+**Solutions:**
+
+1. Clear webpack cache: `rm -rf node_modules/.cache`
+2. Verify all ProvidePlugin modules exist
+3. Check webpack alias configuration
+
+For troubleshooting build errors, see the [build errors guide](../deployment/troubleshooting-build-errors.md).
+
+### Enhanced Features in v16
+
+- **Enhanced error handling** in `react_on_rails:generate_packs` task with detailed debugging guidance
+- **Improved development tooling** with better error messages and troubleshooting steps
+- **Better package manager detection** with multi-strategy validation
+
+## Upgrading to v13
+
+### Breaking Change
+
+Previously, the gem `webpacker` was a Gem dependency.
+
+v13 has changed slightly to switch to `shakapacker`.
+
+For details, see the Shakapacker guide to upgrading to [version 6](https://github.com/shakacode/shakapacker/blob/master/docs/v6_upgrade.md) and [version 7](https://github.com/shakacode/shakapacker/blob/master/docs/v7_upgrade.md)
+
+In summary:
+
+1. Change the gem reference from 'webpacker' to 'shakapacker'
+2. Change the npm reference from '@rails/webpacker' to 'shakapacker'
+3. Other updates, depending on what version of `rails/webpacker` that you had.
+
+## Upgrading to v12
+
+### Recent versions
+
+Make sure that you are on a relatively more recent version of Rails and Webpacker. Yes, the [rails/webpacker](https://github.com/rails/webpacker) gem is required!
+v12 is tested on Rails 6. It should work on Rails v5. If you're on any older version,
+and v12 doesn't work, please file an issue.
+
+### Removed Configuration config.symlink_non_digested_assets_regex
+
+Remove `config.symlink_non_digested_assets_regex` from your `config/initializers/react_on_rails.rb`.
+If you still need that feature, please file an issue.
+
+### i18n default format changed to JSON
+
+- If you're using the internationalization helper, then set `config.i18n_output_format = 'js'`. You can
+  later update to the default JSON format as you will need to update your usage of that file. A JSON
+  format is more efficient.
+
+### Updated API for `ReactOnRails.register()`
+
+In order to solve the issues regarding React Hooks compatibility, the number of parameters
+for functions is used to determine if you have a Render-Function that will get invoked to
+return a React component, or you are registering a React component defined by a function.
+Please see [Render-Functions and the Rails Context](../core-concepts/render-functions-and-railscontext.md) for
+more information on what a Render-Function is.
+
+##### Update required for registered functions taking exactly 2 params.
+
+Registered Objects are of the following type:
+
+1. **Function that takes only zero or one params and returns a React Element**, often JSX. If the function takes zero or one params, there is **no migration needed** for that function.
+
+   ```js
+   export default (props) => <Component {...props} />;
+   ```
+
+2. **Function that takes only zero or one params and returns an Object (_not a React Element_)**. If the function takes zero or one params, **you need to add one or two unused params so you have exactly 2 params** and then that function will be treated as a render function and it can return an Object rather than a React element. If you don't do this, you'll see this obscure error message:
+
+```text
+  [SERVER] message: Objects are not valid as a React child (found: object with keys {renderedHtml}). If you meant to render a collection of children, use an array instead.
+  in YourComponentRenderFunction
+```
+
+So look in `YourComponentRenderFunction` and do this change
+
+```js
+export default (props) => ({
+  renderedHTML: getRenderedHTML(),
+});
+```
+
+To have exactly 2 arguments:
+
+```js
+export default (props, _railsContext) => ({
+  renderedHTML: getRenderedHTML(),
+});
+```
+
+3. Function that takes **2 params** and returns **a React function or class component**. _Migration is needed as the older syntax returned a React Element._
+   A function component is a function that takes zero or one params and returns a React Element, like JSX. The correct syntax
+   looks like:
+   ```js
+   export default (props, railsContext) => () => <Component {...{ ...props, railsContext }} />;
+   ```
+   Note, you cannot return a React Element (JSX). See below for the migration steps. If your function that took **two params returned
+   an Object**, then no migration is required.
+4. Function that takes **3 params** and uses the 3rd param, `domNodeId`, to call `ReactDOM.hydrate`. If the function takes 3 params, there is **no migration needed** for that function.
+5. ES6 or ES5 class. There is **no migration needed**.
+
+Previously, with case number 2, you could return a React Element.
+
+The fix is simple. Here is an example of the change you'll do:
+
+![2020-07-07_09-43-51 (1)](https://user-images.githubusercontent.com/1118459/86927351-eff79e80-c0ce-11ea-9172-d6855c45e2bb.png)
+
+##### Broken, as this function takes two params and it returns a React Element from a JSX Literal
+
+```js
+export default (props, _railsContext) => <Component {...props} />;
+```
+
+If you make this mistake, you'll get this warning
+`Warning: React.createElement: type is invalid -- expected a string (for built-in components) or a class/function (for composite components) but got: <Fragment />. Did you accidentally export a JSX literal instead of a component?`
+
+And this error:
+`react-dom.development.js:23965 Uncaught Error: Element type is invalid: expected a string (for built-in components) or a class/function (for composite components) but got: object.`
+
+In this example, you need to wrap the `<Component {...props} />` in a function call like this which
+results in the return value being a React function component.
+
+```js
+export default (props, _railsContext) => () => <Component {...props} />;
+```
+
+If you have a pure component, taking one or zero parameters, and you have an unnecessary function
+wrapper such that you're returning a function rather than a React Element, then:
+
+1. You won't see anything render.
+2. You will see this warning in development mode: `Warning: Functions are not valid as a React child. This may happen if you return a Component instead of <Component /> from render. Or maybe you meant to call this function rather than return it.`
+
+---
+
+## Upgrading rails/webpacker from v3 to v4
+
+### Custom Webpack build file
+
+The default value for `extract_css` is **false** in `config/webpack.yml`. Custom Webpack builds should set this value to true, or else no CSS link tags are generated. You have a custom Webpack build if you are not using [rails/webpacker](https://github.com/rails/webpacker) to set up your Webpack configuration.
+
+```yml
+default: &default # other stuff
+  extract_css: true
+  # by default, extract and emit a css file. The default is false
+```
+
+## Upgrading to version 11
+
+- Remove `server_render_method` from config/initializers/react_on_rails.rb. Alternate server rendering methods are part of React on Rails Pro. If you want to use a custom renderer, contact justin@shakacode.com. We have a custom node rendering solution in production for egghead.io.
+- Remove your usage of ENV["TRACE_REACT_ON_RAILS"] usage. You can get all tracing with either specifying **`trace`** at your component or in your config/initializers/react_on_rails.rb file.
+- ReactOnRails::Utils.server_bundle_file_name and ReactOnRails::Utils.bundle_file_name were removed. React on Rails Pro contains upgrades to enable component and other types caching with React on Rails.
+
+## Upgrading to version 10
+
+Pretty simple:
+
+- Follow the steps to migrate to version 9 (except installing 10.x instead of 9.x)
+- If you have `react_component` returning hashes, then switch to `react_component_hash` instead
+
+## Upgrading to version 9
+
+### Why Webpacker?
+
+Webpacker provides areas of value:
+
+- View helpers that support bypassing the asset pipeline, which allows you to avoid double minification and enable source maps in production. This is 100% a best practice, as source maps in production greatly increases the value of services such as HoneyBadger or Sentry.
+- A default Webpack config so that you only need to do minimal modifications and customizations. However, if you're doing server rendering, you may not want to give up control. Since Webpacker's default Webpack config is changing often, we at Shakacode can give you definitive advice on Webpack configuration best practices. In general, if you're happy with doing your own Webpack configuration, then we suggest using the `client` strategy discussed below. Most corporate projects will prefer having more control than direct dependence on webpacker easily allows.
+
+### Integrating Webpacker
+
+Reason for doing this: This enables your Webpack bundles to bypass the Rails asset pipeline and its extra minification, enabling you to use source-maps in production, while still maintaining total control over everything in the client directory.
+
+#### From version 7 or lower
+
+##### ...while keeping your `client` directory
+
+- `.gitignore`: add `/public/webpack/*`.
+- `Gemfile`: bump `react_on_rails` and add `webpacker`.
+- layout views: anything bundled by Webpack will need to be requested by a `javascript_pack_tag` or `stylesheet_pack_tag`.
+- Search your codebase for javascript_include_tag. Use the
+- `config/initializers/assets.rb`: we no longer need to modify `Rails.application.config.assets.paths` or append anything to `Rails.application.config.assets.precompile`.
+- `config/initializers/react_on_rails.rb`:
+  - Delete `config.generated_assets_dir`. Webpacker's config now supplies this information.
+  - Replace `config.npm_build_(test|production)_command` with `config.build_(test|production)_command`.
+- `config/webpacker.yml`: start with our [example config](https://github.com/shakacode/react-on-rails-v9-rc-generator/blob/master/config/webpacker.yml) (feel free to modify it as needed). I recommend setting dev_server.hmr to false however since HMR is currently broken.
+- `client/package.json`: bump `react_on_rails` (I recommend bumping `webpack` as well). You'll also need `js-yaml` if you're not already using `eslint` and `webpack-manifest-plugin` regardless.
+
+###### Client Webpack config
+
+- You'll need the following code to read data from the webpacker config:
+
+```javascript
+const path = require('path');
+const ManifestPlugin = require('webpack-manifest-plugin'); // we'll use this later
+
+const webpackConfigLoader = require('react-on-rails/webpackConfigLoader');
+const configPath = path.resolve('..', 'config');
+const { output } = webpackConfigLoader(configPath);
+```
+
+- That output variable will be used for Webpack's `output` rules:
+
+```javascript
+  output: {
+    filename: '[name]-[chunkhash].js', // [chunkhash] because we've got to do our own cache-busting now
+    path: output.path,
+    publicPath: output.publicPath,
+  },
+```
+
+- ...as well as for the output of plugins like `webpack-manifest-plugin`:
+
+```javascript
+
+      new ManifestPlugin({
+        publicPath: output.publicPath,
+        writeToFileEmit: true
+      }),
+```
+
+- If you're using referencing files or images with `url-loader` & `file-loader`, their publicpaths will have to change as well: `publicPath: '/webpack/',`
+- If you're using `css-loader`, `webpack.optimize.CommonsChunkPlugin`, or `extract-text-webpack-plugin`, they will also need cache-busting!
+
+...and you're finally done!
+
+##### ...while replacing your `client` directory
+
+- Make the same changes to `config/initializers/react_on_rails.rb as described above`
+- Upgrade RoR & add Webpacker in the Gemfile
+- Upgrade RoR in the `client/package.json`
+- Run `bundle`
+- Run `rails webpacker:install`
+- Run `rails webpacker:install:react`
+- Run `rails g react_on_rails:install`
+- Move your entry point files to `app/javascript/packs`
+- Either:
+  - Move all your source code to `app/javascript/bundles`, move your linter configs to the root directory, and then delete the `client` directory
+  - or just delete the Webpack config and remove Webpack, its loaders, and plugins from your `client/package.json`.
+
+...and you're done.
+
+#### From version 8
+
+For an example of upgrading, see [react-webpack-rails-tutorial/pull/416](https://github.com/shakacode/react-webpack-rails-tutorial/pull/416).
+
+- Breaking Configuration Changes
+  1. Added `config.node_modules_location` which defaults to `""` if Webpacker is installed. You may want to set this to `'client'` in `config/initializers/react_on_rails.rb` to keep your `node_modules` inside the `/client` directory.
+  2. Renamed
+     - config.npm_build_test_command ==> config.build_test_command
+     - config.npm_build_production_command ==> config.build_production_command
+
+- Update the gemfile. Switch over to using the webpacker gem.
+
+```rb
+gem "webpacker"
+```
+
+- Update for the renaming in the `WebpackConfigLoader` in your Webpack configuration.
+  You will need to rename the following object properties:
+  - webpackOutputPath ==> output.path
+  - webpackPublicOutputDir ==> output.publicPath
+  - hotReloadingUrl ==> output.publicPathWithHost
+  - hotReloadingHostname ==> settings.dev_server.host
+  - hotReloadingPort ==> settings.dev_server.port
+  - hmr ==> settings.dev_server.hmr
+  - manifest ==> Remove this one. We use the default for Webpack of manifest.json
+  - env ==> Use `const { env } = require('process');`
+  - devBuild ==> Use `const devBuild = process.env.NODE_ENV !== 'production';`
+
+- Edit your Webpack.config files:
+  - Change your Webpack output to be like this. **Be sure to have the hash or chunkhash in the filename,** unless the bundle is server side.:
+
+    ```javascript
+    const webpackConfigLoader = require('react-on-rails/webpackConfigLoader');
+    const configPath = resolve('..', 'config');
+    const { output, settings } = webpackConfigLoader(configPath);
+    const hmr = settings.dev_server.hmr;
+    const devBuild = process.env.NODE_ENV !== 'production';
+
+    output: {
+      filename: isHMR ? '[name]-[hash].js' : '[name]-[chunkhash].js',
+      chunkFilename: '[name]-[chunkhash].chunk.js',
+
+      publicPath: output.publicPath,
+      path: output.path,
+    },
+    ```
+
+  - Change your ManifestPlugin definition to something like the following
+
+    ```javascript
+    new ManifestPlugin({
+        publicPath: output.publicPath,
+        writeToFileEmit: true
+      }),
+
+    ```
+
+- Find your `webpacker_lite.yml` and rename it to `webpacker.yml`
+  - Consider copying a default webpacker.yml setup such as https://github.com/shakacode/react-on-rails-v9-rc-generator/blob/master/config/webpacker.yml
+  - If you are not using the webpacker Webpack setup, be sure to put in `compile: false` in the `default` section.
+  - Alternately, if you are updating from webpacker_lite, you can manually change these:
+  - Add a default setting
+    ```yaml
+    cache_manifest: false
+    ```
+  - For production, set:
+    ```yaml
+    cache_manifest: true
+    ```
+  - Add a section like this under your development env:
+    ```yaml
+    dev_server:
+      host: localhost
+      port: 3035
+      hmr: false
+    ```
+    Set hmr to your preference.
+  - See the example `react_on_rails/spec/dummy/config/webpacker.yml`.
+  - Remove keys `hot_reloading_host` and `hot_reloading_enabled_by_default`. These are replaced by the `dev_server` key.
+  - Rename `webpack_public_output_dir` to `public_output_path`.
+
+- Edit your Procfile.dev
+  - Remove the env value WEBPACKER_DEV_SERVER as it's not used
+  - For hot loading:
+    - Set the `hmr` key in your `webpacker.yml` to `true`.
+
+### Without integrating webpacker
+
+- Bump your ReactOnRails versions in `Gemfile` & `package.json`
+- In `/config/initializers/react_on_rails.rb`:
+  - Rename `config.npm_build_test_command` ==> `config.build_test_command`
+  - Rename `config.npm_build_production_command` ==> `config.build_production_command`
+  - Add `config.node_modules_location = "client"`
+
+...and you're done.

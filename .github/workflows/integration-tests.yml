@@ -1,0 +1,235 @@
+name: Integration Tests
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{
+      github.event.pull_request.number && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) ||
+      format('{0}-{1}', github.workflow, github.sha)
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/**'
+    # Always trigger on main/release branches; non-runtime detection handles skipping heavy jobs
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      force_full_hosted:
+        description: 'Force full hosted CI (bypass optimized detect-changes)'
+        required: false
+        type: boolean
+        default: false
+      pull_request_base_ref:
+        description: 'Pull request base branch for label/command dispatches'
+        required: false
+        type: string
+      pull_request_base_sha:
+        description: 'Pull request base SHA for label/command dispatches'
+        required: false
+        type: string
+
+jobs:
+  detect-changes:
+    # Branch deletion push events have no checkoutable release ref.
+    if: github.event_name != 'push' || github.event.deleted != true
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    runs-on: ubuntu-22.04
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+      non_runtime_only: ${{ steps.detect.outputs.non_runtime_only }}
+      run_lint: ${{ steps.detect.outputs.run_lint }}
+      run_js_tests: ${{ steps.detect.outputs.run_js_tests }}
+      run_ruby_tests: ${{ steps.detect.outputs.run_ruby_tests }}
+      run_dummy_tests: ${{ steps.detect.outputs.run_dummy_tests }}
+      run_generators: ${{ steps.detect.outputs.run_generators }}
+      should_run_hosted_ci: ${{ steps.hosted-ci.outputs.should_run_hosted_ci }}
+      should_force_full_hosted_ci: ${{ steps.hosted-ci.outputs.should_force_full_hosted_ci }}
+      should_use_full_matrix: ${{ steps.hosted-ci.outputs.should_use_full_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is only needed for workflow_dispatch base-SHA reruns.
+          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && '0' || '50' }}
+          persist-credentials: false
+      - name: Select hosted CI mode
+        id: hosted-ci
+        uses: ./.github/actions/hosted-ci-selectors
+        with:
+          force-full-hosted: ${{ inputs.force_full_hosted || false }}
+          base-ref: ${{ inputs.pull_request_base_ref || '' }}
+      - name: Detect relevant changes
+        id: detect
+        env:
+          PULL_REQUEST_BASE_SHA: ${{ inputs.pull_request_base_sha || '' }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'origin/main' }}
+        run: |
+          # Force-full hosted CI is the explicit escape hatch that bypasses
+          # optimized change selection. Hosted readiness alone stays path-based.
+          if [ "${{ steps.hosted-ci.outputs.should_force_full_hosted_ci }}" = "true" ]; then
+            {
+              echo "run_lint=true"
+              echo "run_js_tests=true"
+              echo "run_ruby_tests=true"
+              echo "run_dummy_tests=true"
+              echo "run_generators=true"
+              echo "docs_only=false"
+              echo "non_runtime_only=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            script/ci-required-diff-base
+          fi
+        shell: bash
+      - name: Guard docs-only main pushes
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'merge_group' &&
+           github.event.merge_group.base_ref == 'refs/heads/main')
+        uses: ./.github/actions/ensure-main-docs-safety
+        with:
+          docs-only: ${{ steps.detect.outputs.docs_only }}
+          previous-sha: ${{ github.event.before || github.event.merge_group.base_sha }}
+
+  setup-integration-matrix:
+    needs: detect-changes
+    runs-on: ubuntu-22.04
+    # Emit one matrix per independent build -> integration chain. Webpack latest keeps the
+    # existing webpack-dummy-app-tests caller; full-matrix runs add a separate webpack minimum
+    # caller so dependency-level build failures cannot skip each other's integration tests.
+    # Rspack remains a single latest-only caller. Refs #3593 / #3622 (follow-up to #3481 / #3581).
+    outputs:
+      webpack_matrix: ${{ steps.set-matrix.outputs.webpack_matrix }}
+      webpack_minimum_matrix: ${{ steps.set-matrix.outputs.webpack_minimum_matrix }}
+      rspack_matrix: ${{ steps.set-matrix.outputs.rspack_matrix }}
+      run_full_matrix: ${{ steps.set-matrix.outputs.run_full_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read runtime versions
+        id: tool-versions
+        uses: ./.github/actions/read-tool-versions
+      - id: set-matrix
+        env:
+          LATEST_RUBY_VERSION: ${{ steps.tool-versions.outputs.ruby-minor-version }}
+          LATEST_NODE_VERSION: ${{ steps.tool-versions.outputs.node-major-version }}
+          MINIMUM_RUBY_VERSION: ${{ steps.tool-versions.outputs.minimum-ruby-minor-version }}
+          MINIMUM_NODE_VERSION: ${{ steps.tool-versions.outputs.minimum-node-major-version }}
+          SHOULD_USE_FULL_MATRIX: ${{ needs.detect-changes.outputs.should_use_full_matrix }}
+        run: |
+          # Integration matrices float Node within each supported major; single-lane
+          # workflows use exact patch versions when exercising the minimum floor.
+          latest_ruby_version="$LATEST_RUBY_VERSION"
+          latest_node_version="$LATEST_NODE_VERSION"
+          minimum_ruby_version="$MINIMUM_RUBY_VERSION"
+          minimum_node_version="$MINIMUM_NODE_VERSION"
+
+          # Full matrices run only on main, merge queue, release targets, or
+          # explicit force-full hosted CI. Normal hosted PR CI stays optimized.
+          if [[ "$SHOULD_USE_FULL_MATRIX" == "true" ]]; then
+            run_full_matrix=true
+          else
+            run_full_matrix=false
+          fi
+          # Legs are built with `jq -nc` so the JSON stays readable/diffable (one leg per line) while
+          # still emitting compact single-line output for $GITHUB_OUTPUT. Refs #3481.
+          # Primary Webpack leg: test latest versions in both full and PR modes.
+          webpack_matrix="$(jq -nc \
+            --arg latest_ruby_version "$latest_ruby_version" \
+            --arg latest_node_version "$latest_node_version" \
+            '{
+            "include": [
+              {
+                "ruby-version": $latest_ruby_version,
+                "node-version": $latest_node_version,
+                "dependency-level": "latest",
+                "bundler": "webpack"
+              }
+            ]
+          }')"
+          # Full matrix only: test minimum supported versions for Webpack in its own reusable-workflow
+          # call so its build -> integration chain is independent from Webpack latest. Refs #3622.
+          webpack_minimum_matrix="$(jq -nc \
+            --arg minimum_ruby_version "$minimum_ruby_version" \
+            --arg minimum_node_version "$minimum_node_version" \
+            '{
+            "include": [
+              {
+                "ruby-version": $minimum_ruby_version,
+                "node-version": $minimum_node_version,
+                "dependency-level": "minimum",
+                "bundler": "webpack"
+              }
+            ]
+          }')"
+          # Rspack runs the latest leg in both full and PR modes (it has no minimum-version leg yet).
+          rspack_matrix="$(jq -nc \
+            --arg latest_ruby_version "$latest_ruby_version" \
+            --arg latest_node_version "$latest_node_version" \
+            '{
+            "include": [
+              {
+                "ruby-version": $latest_ruby_version,
+                "node-version": $latest_node_version,
+                "dependency-level": "latest",
+                "bundler": "rspack"
+              }
+            ]
+          }')"
+          {
+            echo "webpack_matrix=${webpack_matrix}"
+            echo "webpack_minimum_matrix=${webpack_minimum_matrix}"
+            echo "rspack_matrix=${rspack_matrix}"
+            echo "run_full_matrix=${run_full_matrix}"
+          } >> "$GITHUB_OUTPUT"
+
+  # One reusable-workflow call per independent bundler/dependency-level chain. Each call owns its
+  # own build -> integration job chain (see dummy-app-bundler-tests.yml), so a build failure in one
+  # chain no longer skips another chain's integration tests. Refs #3593 / #3622.
+  # The shared gating keeps regular PR updates cheap while allowing optimized
+  # hosted CI only after an explicit hosted request or for release/main/queue.
+  webpack-dummy-app-tests:
+    needs: [detect-changes, setup-integration-matrix]
+    if: |
+      needs.detect-changes.outputs.should_run_hosted_ci == 'true' &&
+      needs.detect-changes.outputs.run_dummy_tests == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dummy-app-bundler-tests.yml
+    with:
+      matrix: ${{ needs.setup-integration-matrix.outputs.webpack_matrix }}
+
+  webpack-minimum-dummy-app-tests:
+    needs: [detect-changes, setup-integration-matrix]
+    if: |
+      needs.setup-integration-matrix.outputs.run_full_matrix == 'true' &&
+      needs.detect-changes.outputs.should_run_hosted_ci == 'true' &&
+      needs.detect-changes.outputs.run_dummy_tests == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dummy-app-bundler-tests.yml
+    with:
+      matrix: ${{ needs.setup-integration-matrix.outputs.webpack_minimum_matrix }}
+
+  rspack-dummy-app-tests:
+    needs: [detect-changes, setup-integration-matrix]
+    if: |
+      needs.detect-changes.outputs.should_run_hosted_ci == 'true' &&
+      needs.detect-changes.outputs.run_dummy_tests == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dummy-app-bundler-tests.yml
+    with:
+      matrix: ${{ needs.setup-integration-matrix.outputs.rspack_matrix }}

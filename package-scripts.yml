@@ -1,0 +1,65 @@
+scripts:
+  test:
+    default:
+      description: Run all JS tests
+      script: jest
+    ci:
+      description: Run all JS tests in CI mode
+      # https://circleci.com/docs/collect-test-data/#jest
+      script: jest --ci --runInBand --reporters=default --reporters=jest-junit
+    debug:
+      description: Debug all JS tests
+      script: ndb jest --runInBand
+  check:
+    description: Run all checks
+    script: nps lint && nps format.listDifferent && nps test && nps check-typescript
+  check-typescript:
+    description: Check for TypeScript errors
+    script: pnpm --filter react-on-rails run type-check && pnpm --filter react-on-rails-pro run type-check && pnpm --filter react-on-rails-pro-node-renderer run type-check
+
+  lint:
+    description: Run all linters (eslint, tsc)
+    script: nps eslint
+
+  eslint:
+    default:
+      description: Run eslint.
+      script: eslint
+    fix:
+      description: Run eslint and auto-fix.
+      script: nps "eslint --fix"
+    debug:
+      description: Run eslint in debug mode.
+      script: DEBUG=eslint:cli-engine nps eslint
+
+  build:
+    prepack:
+      description: Build the project in the prepack script.
+      # This is necessary when used as a Git dependency since we don't have the dist directory in the repo.
+      # Depending on the package manager, `prepack`, `prepare`, or both may be run.
+      # They may also be run when publishing or in other cases, so we want to cover all of them.
+      # 1. If the project is already built, do nothing;
+      # 2. Build the project but ignore TypeScript errors from missing devDependencies;
+      # 3. Check if the project is built now;
+      # 4. If it failed, print an error message (still follow https://docs.npmjs.com/cli/v8/using-npm/scripts#best-practices).
+      script: >
+        ([ -f packages/react-on-rails/lib/ReactOnRails.full.js ] && [ -f packages/react-on-rails-pro/lib/ReactOnRails.full.js ] && [ -f packages/react-on-rails-pro-node-renderer/lib/ReactOnRailsProNodeRenderer.js ]) ||
+          (npm run build >/dev/null 2>&1 || true) &&
+          ([ -f packages/react-on-rails/lib/ReactOnRails.full.js ] && [ -f packages/react-on-rails-pro/lib/ReactOnRails.full.js ] && [ -f packages/react-on-rails-pro-node-renderer/lib/ReactOnRailsProNodeRenderer.js ]) ||
+          { echo 'Building this package seems to have failed!'; }
+
+  format:
+    default:
+      description: Format files using prettier.
+      script: prettier --write .
+    listDifferent:
+      description: Check that all files were formatted using prettier.
+      script: prettier --check .
+
+  autofix:
+    description: Auto-fix all linting violations (eslint --fix, prettier --write, rubocop -A).
+    script: rake autofix
+
+  renderer:
+    description: Starts the node renderer.
+    script: node renderer.js

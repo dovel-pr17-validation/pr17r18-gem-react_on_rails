@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Check for trailing newlines on all changed files
+set -euo pipefail
+
+CONTEXT="${1:-staged}"
+files="$(bin/lefthook/get-changed-files "$CONTEXT" '.*')"
+
+if [ -z "$files" ]; then
+  echo "✅ No files to check for trailing newlines"
+  exit 0
+fi
+
+if [ "$CONTEXT" = "all-changed" ]; then
+  echo "🔍 Checking trailing newlines on all changed files..."
+else
+  echo "🔍 Checking trailing newlines on $CONTEXT files..."
+fi
+
+for file in $files; do
+  if [ -f "$file" ] && [ -s "$file" ]; then
+    if ! grep -Iq . "$file"; then
+      continue
+    fi
+
+    if ! tail -c 1 "$file" | grep -q '^$'; then
+      echo "🔧 Adding trailing newline to: $file"
+      echo >> "$file"
+    fi
+  fi
+done
+
+echo "✅ All files have proper trailing newlines"

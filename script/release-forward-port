@@ -1,0 +1,2446 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require "open3"
+require "digest"
+
+# rubocop:disable Metrics/ClassLength
+class ReleaseForwardPort
+  CHECK_ERROR_STATUS = 3
+  VERSION_FILE = "react_on_rails/lib/react_on_rails/version.rb"
+  CHANGELOG_FILE = "CHANGELOG.md"
+  # Project convention is `X.Y.Z.rc.N`, but a release branch can still contain a
+  # bare `X.Y.Z.rc` bump. Treat both as release-only version bumps.
+  RC_VERSION_BUMP_SUBJECT = /
+    \Abump\s+version\s+to\s+v?\d+\.\d+\.\d+[.-]rc(?:[.-]?\d+)?\b
+  /ix
+  VERSION_BUMP_SUBJECT = /
+    \Abump\s+version\s+to\s+v?
+    (?<version>\d+\.\d+\.\d+(?:(?:[.-])(?:alpha|beta|rc|pre|dev|test)(?:[.-]?\d+)?)?)\b
+  /ix
+  PRERELEASE_PACKAGE_PIN_SUBJECT = %r{
+    (?<![A-Za-z0-9@._\/-])(?<package>[A-Za-z0-9@._\/-]+)\s+package\s+pin\s+to\s+v?
+    (?<stable_version>\d+\.\d+\.\d+)[.-](?:alpha|beta|rc|pre|dev|test)(?:[.-]?\d+)?\b
+  }ix
+  PR_NUMBER_LIST_PATTERN = /#\d+(?:\s*,\s*#\d+)*(?:\s*,?\s+and\s+#\d+)?/i
+  EXPLICIT_BACKPORT_PATTERN =
+    /\A\s*backports?\s+(?<prs>#{PR_NUMBER_LIST_PATTERN})\s+(?:to|onto)\b/io
+  FROM_BACKPORT_PATTERN =
+    /\A\s*backports?\s+(?:the|this|these)\b.*?\bfrom\s+(?<prs>#{PR_NUMBER_LIST_PATTERN})\s+(?:to|onto)\b/io
+  MERGED_REPLACEMENT_PATTERN = /
+    \A\s*-\s+replaces?\b.*?\bwith\b.*?\balready\s+reviewed\s+and\s+merged\s+in\s+
+    (?<prs>#{PR_NUMBER_LIST_PATTERN})
+  /iox
+  COMPOSITE_BACKPORT_PATTERN =
+    /\A\s*backports?\s+(?<prs>#{PR_NUMBER_LIST_PATTERN})\s+and\s+includes\s+the\s+reviewed\b/io
+  PROVENANCE_NEGATION_PATTERN = /
+    \b(?:
+      not|never|no|none|nothing|neither|nor|nowhere|cannot|without|unlike|
+      except(?:\s+for)?|rather\s+than|instead\s+of|other\s+than|
+      (?:ain|aren|can|couldn|didn|doesn|don|hadn|hasn|haven|isn|mightn|mustn|
+      needn|shan|shouldn|wasn|weren|won|wouldn)['’]?t
+    )\b
+  /ix
+  PRERELEASE_RANKS = {
+    "dev" => 0,
+    "test" => 1,
+    "alpha" => 2,
+    "beta" => 3,
+    "pre" => 4,
+    "rc" => 5
+  }.freeze
+  EMPTY_PATCH_ID = "__empty_patch__"
+  HUNKLESS_PATCH_ID_PREFIX = "__hunkless_patch__:"
+  GENERATED_LLM_FILES = %w[llms-full.txt llms-full-pro.txt].freeze
+  CHERRY_PICK_FOOTER_FORMAT = "(cherry picked from commit %s)"
+  CHERRY_PICK_FOOTER_PATTERN = /^\(cherry picked from commit (?<sha>[0-9a-f]{40})\)$/
+  NARRATED_CHERRY_PICK_PATTERN =
+    /\A(?:-\s+)?cherry-picked\s+(?:main\s+)?(?:squash\s+)?commit\s+
+      `?(?<sha>[0-9a-f]{40})`?\s+with\s+`?-x`?\.?\z/ix
+  NARRATED_FORWARD_PORT_PATTERN =
+    /^\s*-\s+cherry-picked\b.*\bwith\s+`?(?:git\s+)?cherry-pick\s+-x`?\s*$/i
+  NARRATED_SOURCE_PR_FORWARD_PORT_PATTERN =
+    /\A-\s+forward-ports?\s+the\s+(?:complete\s+)?reviewed\b.*\bfrom\s+
+      (?:release|source)\s+PR\s+#\d+[.;]?\z/ix
+  NARRATED_SOURCE_SHA_PROVENANCE_PATTERN = /
+    \A(?:the|this)\s+(?:forward-port\s+)?commit\s+(?:retains|records)\s+
+    `?(?:git\s+)?cherry-pick\s+-x`?\s+provenance\s+from\s+
+    source(?:\s+squash)?\s+commit\s+`?(?<sha>[0-9a-f]{12,40})`?\.?\z
+  /ix
+  NARRATED_REVIEW_FIX_FORWARD_PORT_PATTERN =
+    /\Aforward-port\s+the\s+review\s+fix\s+from\s+release\s+PR\s+#(?<pr>\d+)\b/i
+  SOURCE_PR_TRAILER_PATTERN = /\(#(?<pr>\d+)\)\z/
+  ASCII_WHITESPACE_BYTES = [9, 10, 11, 12, 13, 32].freeze
+
+  PlanEntry = Struct.new(:sha, :subject, :action, :reason, :manual, keyword_init: true) do
+    def short_sha
+      sha[0, 12]
+    end
+
+    def manual?
+      !!manual
+    end
+  end
+
+  ManualSkipReason = Struct.new(:message, keyword_init: true)
+
+  class UsageError < StandardError; end
+  class GitError < StandardError; end
+
+  def initialize(argv)
+    @argv = argv.dup
+    @explicit_options = { source: false, target: false }
+    @options = {
+      dry_run: false,
+      check: false,
+      ack_manual: [],
+      only: nil,
+      all: false,
+      target: "main",
+      changelog: false,
+      ack_final_changelog_source: nil
+    }
+    @parser = build_parser
+  end
+
+  def run
+    parse_options!
+
+    source = @options.fetch(:source)
+    target = @options.fetch(:target)
+
+    verify_ref!(source, label: "source")
+    verify_ref!(target, label: "target")
+    validate_mode_options!
+    normalize_selected_sha!
+    normalize_acknowledged_manual_shas!
+    normalize_acknowledged_changelog_source_sha!
+    ensure_local_target_branch!(target) unless read_only_mode?
+    ensure_no_cherry_pick_in_progress! if @options[:check]
+
+    return run_changelog_reconciliation(source, target) if @options[:changelog]
+
+    # This final expression is the process exit status.
+    run_cherry_pick_forward_port(source, target)
+  rescue OptionParser::ParseError, UsageError => e
+    warn "ERROR: #{e.message}"
+    warn @parser
+    2
+  rescue GitError => e
+    warn "ERROR: #{e.message}"
+    @options[:check] ? CHECK_ERROR_STATUS : 1
+  end
+
+  private
+
+  # Default mode: cherry-pick -x the source-only commits onto the target. Called
+  # within run's begin block, so its UsageError/GitError raises are caught there.
+  def run_cherry_pick_forward_port(source, target)
+    commits = source_only_commits(source, target)
+    equiv_commits = patch_equivalent_candidates(source, target)
+    target_version = version_at(target)
+
+    # Build the operator-facing plan before the normal-mode dirty-worktree
+    # guard, so normal mode and dry-run report the same plan before refusing to
+    # checkout or cherry-pick.
+    plan = build_plan(commits, target, target_version, equiv_commits)
+    plan = selected_plan(plan, source, target)
+    validate_acknowledged_manual_shas!(plan)
+
+    print_plan(source, target, target_version, plan)
+
+    return check_code_plan(plan) if @options[:check]
+
+    if @options[:dry_run]
+      puts "\nDRY RUN: no branches were checked out and no commits were cherry-picked."
+      return 0
+    end
+
+    return finish_no_action_plan(plan, target) unless actionable_plan?(plan)
+
+    enforce_single_forward_port!(plan)
+    ensure_clean_worktree!
+    checkout_target!(target)
+    apply_plan(plan)
+  end
+
+  def finish_no_action_plan(plan, target)
+    if acknowledged_manual_entries?(plan)
+      ensure_clean_worktree!
+      checkout_target!(target)
+    else
+      ensure_no_cherry_pick_in_progress!
+    end
+
+    puts "\nNothing to cherry-pick."
+    0
+  end
+
+  def check_code_plan(plan)
+    if actionable_plan?(plan)
+      warn "CHECK FAILED: release source still has code or manual items that need their own forward-port PRs."
+      return 1
+    end
+
+    puts "\nCHECK PASSED: the release source has no remaining code forward-port work."
+    0
+  end
+
+  def parse_options!
+    argv = @argv.dup
+    @parser.parse!(argv)
+
+    # Only consume positional source/target when the corresponding flag was not
+    # supplied. A leftover positional after an explicit flag is an error, not a
+    # silent override of the flagged value.
+    @options[:source] = argv.shift unless @explicit_options[:source]
+    raise UsageError, "too many arguments: #{argv.join(' ')}" if @explicit_options[:target] && argv.any?
+
+    @options[:target] = argv.shift if argv.any?
+
+    raise UsageError, "source ref is required" if @options[:source].nil? || @options[:source].empty?
+    raise UsageError, "too many arguments: #{argv.join(' ')}" unless argv.empty?
+  end
+
+  def build_parser
+    OptionParser.new do |parser|
+      parser.banner = usage_banner
+
+      parser.on("--source REF", "Release branch or ref to forward-port from") do |source|
+        @options[:source] = source
+        @explicit_options[:source] = true
+      end
+      parser.on("--target REF", "Target local branch to forward-port onto (default: main)") do |target|
+        @options[:target] = target
+        @explicit_options[:target] = true
+      end
+      add_execution_options(parser)
+      add_changelog_option(parser)
+      add_ack_manual_option(parser)
+      add_ack_final_changelog_source_option(parser)
+      parser.on("-h", "--help", "Show this help") do
+        puts parser
+        exit 0
+      end
+    end
+  end
+
+  def add_execution_options(parser)
+    parser.on("--dry-run", "Print the plan without checking out or cherry-picking") do
+      @options[:dry_run] = true
+    end
+    parser.on("--check", "Exit nonzero unless the complete source plan is already satisfied") do
+      @options[:check] = true
+    end
+    parser.on("--only SHA", "Restrict the plan to one source commit for a one-change forward-port PR") do |sha|
+      @options[:only] = sha
+    end
+    parser.on("--all", "Apply every actionable commit (explicit batch override)") do
+      @options[:all] = true
+    end
+  end
+
+  def usage_banner
+    <<~BANNER
+      Usage: script/release-forward-port --source release/X.Y.Z [--target main] [--dry-run]
+             script/release-forward-port --source release/X.Y.Z --check [--target main]
+             script/release-forward-port --source release/X.Y.Z --only SHA [--target main] [--dry-run]
+             script/release-forward-port release/X.Y.Z [main] [--dry-run]
+             script/release-forward-port --source release/X.Y.Z --changelog [--target main] [--dry-run]
+
+      Default mode forward-ports commits that are on a release branch but not on the target
+      branch. The helper cherry-picks with -x, skips commits already forward-ported with -x
+      evidence or patches present in the target tree, and excludes RC version bump and
+      changelog-only commits. Normal mode refuses to apply more than one actionable commit
+      unless --all is explicit; use --only SHA for one-change-at-a-time forward-port PRs.
+      --check evaluates the complete plan without changing the worktree and exits nonzero
+      while any code or manual item remains.
+
+      --changelog mode runs a separate CHANGELOG.md reconciliation pass instead of the
+      cherry-pick loop: it collapses every release-branch entry (each rc.N section plus
+      [Unreleased]) into the target's [Unreleased] section, de-duplicates by PR number against
+      the target's existing entries, and drops any RC-header section a prior cherry-pick left
+      on the target. It is mutually exclusive with the --only and --all code-selection flags.
+    BANNER
+  end
+
+  def add_changelog_option(parser)
+    parser.on(
+      "--changelog",
+      "Re-home release-branch CHANGELOG.md entries (rc.N + [Unreleased]) into the target's",
+      "[Unreleased] section instead of cherry-picking commits. De-duplicates by PR number",
+      "against existing target entries and drops stray RC-header sections on the target.",
+      "Compose with --dry-run to preview the [Unreleased] additions and removals."
+    ) do
+      @options[:changelog] = true
+    end
+  end
+
+  def add_ack_manual_option(parser)
+    parser.on(
+      "--ack-manual SHA",
+      "Acknowledge an inspected MANUAL commit and skip it in normal mode (repeatable)"
+    ) do |sha|
+      @options[:ack_manual] << sha
+    end
+  end
+
+  def add_ack_final_changelog_source_option(parser)
+    parser.on(
+      "--ack-final-changelog-source SHA",
+      "Acknowledge the current source CHANGELOG.md commit for a legacy authoritative changelog PR"
+    ) do |sha|
+      @options[:ack_final_changelog_source] = sha
+    end
+  end
+
+  def validate_mode_options!
+    validate_read_only_options!
+    validate_code_selection_options!
+  end
+
+  def validate_read_only_options!
+    raise UsageError, "--check and --dry-run cannot be used together" if @options[:check] && @options[:dry_run]
+    return unless @options[:check] && code_selection_requested?
+
+    raise UsageError, "--check evaluates the complete plan and cannot be scoped with --only/--all"
+  end
+
+  def validate_code_selection_options!
+    raise UsageError, "--only and --all cannot be used together" if @options[:only] && @options[:all]
+    if @options[:ack_final_changelog_source] && !@options[:changelog]
+      raise UsageError, "--ack-final-changelog-source requires --changelog"
+    end
+    return unless @options[:changelog] && code_selection_requested?
+
+    raise UsageError, "--only/--all select code commits and cannot be combined with --changelog"
+  end
+
+  def code_selection_requested?
+    @options[:only] || @options[:all]
+  end
+
+  def normalize_selected_sha!
+    return unless @options[:only]
+
+    @selected_sha = git("rev-parse", "--verify", "#{@options[:only]}^{commit}").strip
+  rescue GitError => e
+    raise UsageError, "--only #{@options[:only].inspect} is not a commit: #{e.message}"
+  end
+
+  def selected_plan(plan, source, target)
+    return plan unless @selected_sha
+
+    entry = plan.find { |candidate| candidate.sha == @selected_sha }
+    return [entry] if entry
+
+    raise UsageError,
+          "--only #{@options[:only].inspect} is not in the current #{target}..#{source} plan; rerun --dry-run"
+  end
+
+  def read_only_mode?
+    @options[:dry_run] || @options[:check]
+  end
+
+  def source_only_commits(source, target)
+    git_lines("rev-list", "--reverse", "#{target}..#{source}")
+  end
+
+  def patch_equivalent_candidates(source, target)
+    # git cherry uses patch-id, which covers content hunks but not mode-only
+    # changes. Mode-only commit idempotency is covered by the -x footer path.
+    git_lines("cherry", target, source).each_with_object({}) do |line, commits|
+      marker, sha = line.split(/\s+/, 2)
+      commits[sha] = true if marker == "-"
+    end
+  end
+
+  def build_plan(commits, target, target_version, patch_equivalent_commits)
+    @source_plan_commits = commits
+    @source_plan_positions = commits.each_with_index.to_h
+    commits.map do |sha|
+      subject = git("log", "-1", "--format=%s", sha).strip
+      skip_decision = skip_reason(sha, subject, target, target_version, patch_equivalent_commits)
+      reason = skip_reason_message(skip_decision)
+
+      PlanEntry.new(
+        sha:,
+        subject:,
+        action: reason ? :skip : :pick,
+        reason:,
+        manual: manual_skip_reason?(skip_decision)
+      )
+    end
+  end
+
+  def skip_reason(sha, subject, target, target_version, patch_equivalent_commits)
+    special_reason = special_skip_reason(sha, subject, target, target_version)
+    return special_reason if special_reason
+
+    version_bump_reason = version_bump_skip_reason(subject, target, target_version)
+    return version_bump_reason if version_bump_reason
+
+    return "empty commit; cherry-picking would only create a no-op commit on #{target}" if
+      patch_id_for_commit(sha) == EMPTY_PATCH_ID
+
+    return active_source_revert_skip_reason(subject, target, target_version) if
+      source_standard_revert_on_target?(sha, target)
+
+    return "already forward-ported to #{target} via cherry-pick -x evidence with no later target revert" if
+      already_forward_ported_with_x?(sha, target)
+
+    # Origin was reverted on target: the fix was applied and then undone, so
+    # re-apply it even if git cherry reports a patch match.
+    return if source_cherry_pick_origin_reverted_on_target?(sha, target)
+
+    patch_or_narrated_manual_reason(sha, subject, target, patch_equivalent_commits)
+  end
+
+  def patch_or_narrated_manual_reason(sha, subject, target, patch_equivalent_commits)
+    patch_reason = patch_equivalent_skip_reason(sha, subject, target, patch_equivalent_commits)
+    return patch_reason if patch_reason
+
+    return unless source_narrated_pr_reference_on_target?(sha, target)
+
+    manual_skip_reason(
+      "source commit names a live upstream PR on #{target}, but does not prove whole-commit equivalence; " \
+      "inspect its release-specific hunks before acknowledging it"
+    )
+  end
+
+  def patch_equivalent_skip_reason(sha, subject, target, patch_equivalent_commits)
+    targeted_reason = targeted_patch_equivalent_skip_reason(sha, subject, target)
+    return targeted_reason if targeted_reason
+
+    return unless patch_equivalent_commits[sha] ||
+                  target_has_renamed_source_paths?(target, sha) ||
+                  generated_llm_artifact_changed?(sha)
+    return unless patch_equivalent_commit_present_on_target?(sha, target)
+
+    patch_equivalent_skip_reason_message(target)
+  end
+
+  def targeted_patch_equivalent_skip_reason(sha, subject, target)
+    identity_candidates = target_history_source_identity_candidates(sha, subject, target)
+    return "already forward-ported to #{target} via source-bound forward-port narration with no later target revert" if
+      identity_candidates.any? do |target_sha|
+        narrated_forward_port_commit_live?(target_sha, target, source_sha: sha, source_subject: subject)
+      end
+
+    provenance_candidates = target_history_source_provenance_candidates(sha, target)
+    return patch_equivalent_skip_reason_message(target) if
+      identity_candidates.any? &&
+      patch_equivalent_commit_present_on_target?(sha, target, candidates: identity_candidates)
+
+    patch_equivalent_skip_reason_message(target) if
+      provenance_candidates.any? &&
+      patch_equivalent_commit_present_on_target?(sha, target, candidates: provenance_candidates, zero_context: true)
+  end
+
+  def patch_equivalent_skip_reason_message(target)
+    "patch already exists on #{target} according to target history with no later standard revert"
+  end
+
+  def target_history_source_identity_candidates(sha, subject, target)
+    ([sha, sha[0, 12], subject] + subject.scan(/#\d+/)).uniq.flat_map do |source_identity|
+      target_history_commits_mentioning(source_identity, target)
+    end.uniq
+  end
+
+  def target_history_commits_mentioning(source_identity, target)
+    @target_identity_mention_cache ||= {}
+    cache_key = [source_identity, target]
+    return @target_identity_mention_cache.fetch(cache_key) if @target_identity_mention_cache.key?(cache_key)
+
+    @target_identity_mention_cache[cache_key] =
+      git_lines("log", target, "--fixed-strings", "--grep", source_identity, "--format=%H")
+  end
+
+  def target_history_source_provenance_candidates(sha, target)
+    body = git("log", "-1", "--format=%B", sha)
+    source_identities = body.each_line.filter_map do |line|
+      next unless line.match?(/\b(?:backports?|source\s+PR|main\s+PR|merged\s+in)\b/i)
+
+      line.scan(/#\d+/)
+    end.flatten.uniq
+
+    source_identities.flat_map do |source_identity|
+      target_history_commits_mentioning(source_identity, target)
+    end.uniq
+  end
+
+  def narrated_forward_port_commit_live?(sha, target, source_sha:, source_subject:)
+    body = git("log", "-1", "--format=%B", sha)
+    target_subject = subject_for_commit(sha)
+    exact_source_provenance = exact_source_sha_provenance?(body, source_sha)
+    narrated = source_pr_narration_present?(body, target_subject, source_sha, source_subject)
+    (exact_source_provenance || narrated) && target_commit_live_on_target?(sha, target)
+  end
+
+  def exact_source_sha_provenance?(body, source_sha)
+    body.split(/\n\s*\n/).any? do |paragraph|
+      match = paragraph.gsub(/\s+/, " ").strip.match(NARRATED_SOURCE_SHA_PROVENANCE_PATTERN)
+      match && source_sha.start_with?(match[:sha])
+    end
+  end
+
+  def source_pr_narration_present?(body, target_subject, source_sha, source_subject)
+    narration_segments = forward_port_narration_segments(body).select do |segment|
+      next false unless authoritative_provenance_segment?(segment)
+
+      segment.match?(NARRATED_FORWARD_PORT_PATTERN) ||
+        (target_subject&.match?(/\AForward-port\b/i) &&
+          segment.match?(NARRATED_SOURCE_PR_FORWARD_PORT_PATTERN))
+    end
+    narration_segments.any? do |segment|
+      narrated_line_names_source?(segment, source_sha, source_subject)
+    end
+  end
+
+  def forward_port_narration_segments(body)
+    segments = []
+    current_bullet = nil
+
+    body.each_line do |line|
+      stripped = line.strip
+      if line.match?(/^\s*-\s+/)
+        segments << current_bullet if current_bullet
+        current_bullet = stripped
+      elsif current_bullet && !stripped.empty?
+        current_bullet = "#{current_bullet} #{stripped}"
+      else
+        segments << current_bullet if current_bullet
+        current_bullet = nil
+        segments << stripped unless stripped.empty?
+      end
+    end
+    segments << current_bullet if current_bullet
+    segments
+  end
+
+  def narrated_line_names_source?(line, source_sha, source_subject)
+    return true if line.include?(source_sha) || line.include?(source_sha[0, 12])
+
+    source_pr_number = source_pr_number_from_subject(source_subject)
+    source_pr_number && line.match?(/(?<!\d)##{Regexp.escape(source_pr_number)}(?!\d)/)
+  end
+
+  def source_pr_number_from_subject(subject)
+    match = subject.to_s.match(SOURCE_PR_TRAILER_PATTERN)
+    match && match[:pr]
+  end
+
+  def active_source_revert_skip_reason(subject, target, target_version)
+    # A target-side `git revert <source-sha>` names the release commit rather
+    # than the earlier target cherry-pick, so do not trust either -x footer or
+    # patch-equivalence evidence while that source revert is still active.
+    # Version-bump guards still win because reapplying release-only version files
+    # to the target branch is never an automatic forward-port.
+    version_bump_skip_reason(subject, target, target_version)
+  end
+
+  def special_skip_reason(sha, subject, target, target_version)
+    root_reason = unrelated_root_commit_skip_reason(sha, target)
+    return root_reason if root_reason
+
+    changed_paths = changed_paths_for_commit(sha)
+    artifact_reason = generated_artifact_skip_reason(changed_paths)
+    return artifact_reason if artifact_reason
+
+    superseded_pin_reason = superseded_prerelease_package_pin_reason(sha, subject, target)
+    return superseded_pin_reason if superseded_pin_reason
+
+    return "rc version bump commit; release train forward-ports must keep prerelease bumps off #{target}" if
+      rc_version_bump?(subject)
+
+    if merge_commit?(sha)
+      return manual_skip_reason(
+        "merge commit; inspect manually for conflict-resolution hunks before marking forward-port complete"
+      )
+    end
+
+    skipped_version_bump_revert_skip_reason(sha, subject, target, target_version) ||
+      reverse_pick_revert_skip_reason(sha, target)
+  end
+
+  def unrelated_root_commit_skip_reason(sha, target)
+    return unless root_commit?(sha)
+
+    manual_skip_reason(
+      "root commit from unrelated history; inspect the source seed manually instead of applying a full-repository " \
+      "snapshot onto #{target}"
+    )
+  end
+
+  def generated_artifact_skip_reason(changed_paths)
+    return "changelog-only commit; use --changelog reconciliation to re-home release entries under [Unreleased]" if
+      changed_paths == [CHANGELOG_FILE]
+
+    if changed_paths.any? && (changed_paths - GENERATED_LLM_FILES).empty?
+      return "generated LLM artifact-only commit; regenerate from current target documentation instead of replaying " \
+             "stale release output"
+    end
+
+    return unless changed_paths.include?(CHANGELOG_FILE) &&
+                  (changed_paths - [CHANGELOG_FILE] - GENERATED_LLM_FILES).empty?
+
+    "changelog/generated artifact-only commit; use --changelog reconciliation and regenerate LLM files " \
+      "from current target documentation"
+  end
+
+  def rc_version_bump?(subject)
+    subject.match?(RC_VERSION_BUMP_SUBJECT)
+  end
+
+  def superseded_prerelease_package_pin_reason(sha, subject, target)
+    match = subject.match(PRERELEASE_PACKAGE_PIN_SUBJECT)
+    return unless match
+
+    stable_sha = later_stable_package_pin_commit(sha, match[:package], match[:stable_version], target)
+    return unless stable_sha
+
+    unless cumulative_prerelease_package_state_present_on_target?(sha, stable_sha, target)
+      return manual_skip_reason(
+        "later stable source commit #{stable_sha[0, 12]} is present on #{target}, but the cumulative state of the " \
+        "prerelease commit's paths differs; inspect those paths before acknowledging this supersession"
+      )
+    end
+
+    "prerelease package pin is superseded by later stable source commit #{stable_sha[0, 12]} already present on " \
+      "#{target}"
+  end
+
+  def later_stable_package_pin_commit(sha, package, stable_version, target)
+    position = @source_plan_positions&.fetch(sha, nil)
+    return unless position
+
+    superseded_paths = changed_paths_for_commit(sha) - [CHANGELOG_FILE] - GENERATED_LLM_FILES
+    @source_plan_commits.drop(position + 1).find do |later_sha|
+      later_subject = subject_for_commit(later_sha).to_s
+      next unless later_subject.match?(/\bstable\b/i) && later_subject.include?(stable_version)
+      next unless later_subject.match?(%r{(?<![A-Za-z0-9@._/-])#{Regexp.escape(package)}(?![A-Za-z0-9@._/-])}i)
+
+      later_paths = changed_paths_for_commit(later_sha) - [CHANGELOG_FILE] - GENERATED_LLM_FILES
+      (superseded_paths - later_paths).empty? && source_commit_provenance_present_on_target?(later_sha, target)
+    end
+  end
+
+  def cumulative_prerelease_package_state_present_on_target?(sha, stable_sha, target)
+    paths = changed_paths_for_commit(sha) - [CHANGELOG_FILE] - GENERATED_LLM_FILES
+    return false if paths.empty?
+
+    !diff_changes_paths?(stable_sha, target, paths)
+  end
+
+  def source_commit_provenance_present_on_target?(sha, target)
+    subject = subject_for_commit(sha).to_s
+    already_forward_ported_with_x?(sha, target) ||
+      !targeted_patch_equivalent_skip_reason(sha, subject, target).nil?
+  end
+
+  def merge_commit?(sha)
+    git("rev-list", "--parents", "-n", "1", sha).split.length > 2
+  end
+
+  def root_commit?(sha)
+    git("rev-list", "--parents", "-n", "1", sha).split.length == 1
+  end
+
+  def manual_skip_reason?(reason)
+    reason.is_a?(ManualSkipReason)
+  end
+
+  def skip_reason_message(reason)
+    reason.is_a?(ManualSkipReason) ? reason.message : reason
+  end
+
+  def manual_skip_reason(message)
+    ManualSkipReason.new(message:)
+  end
+
+  def skipped_version_bump_revert_skip_reason(sha, subject, target, target_version)
+    return unless standard_revert_subject?(subject)
+
+    reverted_sha = standard_revert_target(sha)
+    return unless reverted_sha
+
+    reverted_subject = subject_for_commit(reverted_sha)
+    return unless reverted_subject
+
+    return unless skipped_version_bump_subject?(reverted_subject, target, target_version)
+
+    "reverts a release-only version bump that is skipped for #{target}; skipping this revert avoids " \
+      "an empty or target-regressing cherry-pick"
+  end
+
+  def skipped_version_bump_subject?(subject, target, target_version)
+    !!(rc_version_bump?(subject) || version_bump_skip_reason(subject, target, target_version))
+  end
+
+  def version_bump_skip_reason(subject, target, target_version)
+    version = version_from_bump_subject(subject)
+    return unless version
+
+    parsed_version = parse_version(version)
+    return stable_version_bump_skip_reason(target) if stable_version_bump?(parsed_version)
+
+    if prerelease_version_bump?(parsed_version) && target_version.nil?
+      return unknown_target_prerelease_skip_reason(target)
+    end
+
+    return unless target_version
+
+    comparison = compare_versions(target_version, version)
+    return unless comparison && comparison >= 0
+
+    "target #{target} is already at #{target_version}; skipping version bump to #{version} to avoid " \
+      "regressing or duplicating the target version. If this commit also contains CHANGELOG changes, " \
+      "use the runbook's manual fallback to take only the CHANGELOG hunks."
+  end
+
+  def stable_version_bump?(parsed_version)
+    parsed_version && parsed_version.fetch(:prerelease).nil?
+  end
+
+  def prerelease_version_bump?(parsed_version)
+    parsed_version&.fetch(:prerelease)
+  end
+
+  def stable_version_bump_skip_reason(target)
+    manual_skip_reason(
+      "stable release version bump commit; use the runbook's manual fallback to take only " \
+      "the CHANGELOG hunks and keep release branch version changes off #{target}"
+    )
+  end
+
+  def unknown_target_prerelease_skip_reason(target)
+    "prerelease version bump commit with target version UNKNOWN; use the runbook's manual fallback " \
+      "to take only the CHANGELOG hunks and keep release branch version changes off #{target}"
+  end
+
+  def version_from_bump_subject(subject)
+    match = subject.match(VERSION_BUMP_SUBJECT)
+    match && match[:version].tr("-", ".")
+  end
+
+  def reverse_pick_revert_skip_reason(sha, target)
+    reverted_sha = standard_revert_target(sha)
+    return unless reverted_sha && commit_exists?(reverted_sha)
+    return merge_revert_skip_reason(target) if merge_commit?(reverted_sha)
+    return unless reverted_commit_live_on_target?(reverted_sha, target)
+
+    manual_skip_reason(
+      "reverts a release-only application of a commit already live on #{target}; inspect manually " \
+      "before applying this rollback to #{target}"
+    )
+  end
+
+  def merge_revert_skip_reason(target)
+    manual_skip_reason(
+      "reverts a release-branch merge commit; inspect manually before applying this rollback to #{target}"
+    )
+  end
+
+  def standard_revert_target(sha)
+    body = git("log", "-1", "--format=%B", sha)
+    match = body.match(/This reverts commit (?<sha>[0-9a-f]{40})[.,]/)
+    match && match[:sha]
+  end
+
+  def standard_revert_subject?(subject)
+    subject.start_with?("Revert ")
+  end
+
+  def already_forward_ported_with_x?(sha, target)
+    return true if source_cherry_pick_origin_on_target?(sha, target)
+    return false if source_standard_revert_on_target?(sha, target)
+
+    forwarded_shas = forwarded_shas_with_x(sha, target)
+    return false if forwarded_shas.empty?
+
+    # True if at least one copy of the cherry-pick is still live on the target.
+    # Multiple copies are fine: pick -> revert -> re-pick is handled because the
+    # re-pick copy passes.
+    forwarded_shas.any? { |forwarded_sha| target_commit_live_on_target?(forwarded_sha, target) }
+  end
+
+  def source_cherry_pick_origin_on_target?(sha, target)
+    origin_sha = cherry_pick_origin(sha)
+    origin_sha && commit_on_target?(origin_sha, target) && target_commit_live_on_target?(origin_sha, target)
+  end
+
+  def source_cherry_pick_origin_reverted_on_target?(sha, target)
+    origin_sha = cherry_pick_origin(sha)
+    origin_sha && commit_on_target?(origin_sha, target) && !target_commit_live_on_target?(origin_sha, target)
+  end
+
+  def source_narrated_pr_reference_on_target?(sha, target)
+    subject = subject_for_commit(sha).to_s
+    release_pr_number = source_pr_number_from_subject(subject)
+    release_pr_numbers = release_pr_number ? [release_pr_number] : []
+    body = git("log", "-1", "--format=%B", sha)
+    composite_pr_numbers = composite_backport_pr_numbers(body)
+    narrated_pr_numbers = narrated_upstream_pr_numbers(body)
+    if composite_pr_numbers.any?
+      upstream_pr_numbers = (composite_pr_numbers + narrated_pr_numbers - release_pr_numbers).uniq
+      review_fix_shas = review_fix_forward_port_shas_from_release_pr(release_pr_numbers, target)
+      return upstream_pr_numbers.any? &&
+             target_pr_numbers_live?(upstream_pr_numbers, target) &&
+             review_fix_shas.any?
+    end
+
+    upstream_pr_numbers = narrated_pr_numbers - release_pr_numbers
+
+    upstream_pr_numbers.any? && target_pr_numbers_live?(upstream_pr_numbers, target)
+  end
+
+  def composite_backport_pr_numbers(body)
+    forward_port_narration_segments(body).flat_map do |segment|
+      next [] unless authoritative_provenance_segment?(segment)
+
+      match = segment.match(COMPOSITE_BACKPORT_PATTERN)
+      match ? match[:prs].scan(/#(\d+)/).flatten : []
+    end.uniq
+  end
+
+  def target_pr_numbers_live?(pr_numbers, target)
+    pr_numbers.all? do |pr_number|
+      target_pr_commit_shas(pr_number, target).any? { |target_sha| target_commit_live_on_target?(target_sha, target) }
+    end
+  end
+
+  def review_fix_forward_port_shas_from_release_pr(release_pr_numbers, target)
+    release_pr_numbers.flat_map do |pr_number|
+      target_history_commits_mentioning("release PR ##{pr_number}", target).select do |target_sha|
+        next false unless subject_for_commit(target_sha)&.match?(/\bforward-port\b/i)
+
+        body = git("log", "-1", "--format=%B", target_sha)
+        narrated = body.split(/\n\s*\n/).any? { |paragraph| narrated_review_fix_matches?(paragraph, pr_number) }
+        narrated && target_commit_live_on_target?(target_sha, target)
+      end
+    end.uniq
+  end
+
+  def narrated_review_fix_matches?(paragraph, pr_number)
+    segment = paragraph.gsub(/\s+/, " ").strip
+    return false unless authoritative_provenance_segment?(segment)
+
+    match = segment.match(NARRATED_REVIEW_FIX_FORWARD_PORT_PATTERN)
+    match && match[:pr] == pr_number
+  end
+
+  def narrated_upstream_pr_numbers(body)
+    forward_port_narration_segments(body).flat_map do |segment|
+      next [] unless authoritative_provenance_segment?(segment)
+
+      explicit_backport = segment.match(EXPLICIT_BACKPORT_PATTERN)
+      from_backport = segment.match(FROM_BACKPORT_PATTERN)
+      merged_replacement = segment.match(MERGED_REPLACEMENT_PATTERN)
+      numbers = []
+      numbers.concat(explicit_backport[:prs].scan(/#(\d+)/).flatten) if explicit_backport
+      numbers.concat(from_backport[:prs].scan(/#(\d+)/).flatten) if from_backport
+      numbers.concat(merged_replacement[:prs].scan(/#(\d+)/).flatten) if merged_replacement
+      numbers
+    end.uniq
+  end
+
+  def authoritative_provenance_segment?(segment)
+    !segment.match?(PROVENANCE_NEGATION_PATTERN)
+  end
+
+  def target_pr_commit_shas(pr_number, target)
+    suffix = "(##{pr_number})"
+    target_history_commits_mentioning(suffix, target).select do |sha|
+      subject_for_commit(sha)&.end_with?(suffix)
+    end
+  end
+
+  def source_standard_revert_on_target?(sha, target)
+    active_revert_shas =
+      standard_revert_shas_on_target(sha, target)
+      .select { |revert_sha| target_commit_live_on_target?(revert_sha, target) }
+      .select { |revert_sha| revert_changes_source_paths?(revert_sha, sha) }
+    return false if active_revert_shas.empty?
+
+    active_revert_shas.any? do |revert_sha|
+      !source_revert_superseded_on_target?(sha, target, revert_sha)
+    end
+  end
+
+  def revert_changes_source_paths?(revert_sha, sha)
+    parents = git("rev-list", "--parents", "-n", "1", revert_sha).split.drop(1)
+    return false if parents.empty?
+
+    paths = source_paths_for_target_diff(parents.first, sha)
+    return false if paths.empty?
+
+    diff_changes_paths?(parents.first, revert_sha, paths)
+  end
+
+  def source_revert_superseded_on_target?(sha, target, revert_sha)
+    source_reapplied_with_x_after_revert?(sha, target, revert_sha) ||
+      source_reapplied_without_x_after_revert?(sha, target, revert_sha) ||
+      source_reapplied_by_merge_after_revert?(sha, target, revert_sha)
+  end
+
+  def source_reapplied_with_x_after_revert?(sha, target, revert_sha)
+    forwarded_shas_with_x(sha, target).any? do |forwarded_sha|
+      target_commit_introduced_after_revert?(forwarded_sha, target, revert_sha) &&
+        target_commit_live_on_target?(forwarded_sha, target)
+    end
+  end
+
+  def source_reapplied_without_x_after_revert?(sha, target, revert_sha)
+    source_patch_id = patch_id_for_commit(sha)
+
+    patch_equivalent_target_candidates(sha, target).any? do |target_sha|
+      target_commit_introduced_after_revert?(target_sha, target, revert_sha) &&
+        target_commit_live_on_target?(target_sha, target) &&
+        patch_id_for_target_candidate(target_sha, sha) == source_patch_id
+    end
+  end
+
+  def source_reapplied_by_merge_after_revert?(sha, target, revert_sha)
+    source_patch_id = patch_id_for_commit(sha)
+
+    target_first_parent_merges_after(revert_sha, target).any? do |merge_sha|
+      target_commit_live_on_target?(merge_sha, target) &&
+        patch_id_for_merge_source_paths(merge_sha, sha) == source_patch_id
+    end
+  end
+
+  def target_first_parent_merges_after(sha, target)
+    git_lines("log", target, "--first-parent", "--merges", "#{sha}..#{target}", "--format=%H")
+  end
+
+  def patch_id_for_merge_source_paths(merge_sha, sha)
+    parents = git("rev-list", "--parents", "-n", "1", merge_sha).split.drop(1)
+    return if parents.length < 2
+
+    first_parent = parents.first
+    target_to_source_paths = target_to_source_path_map(first_parent, sha)
+    return if target_to_source_paths.empty?
+
+    patch_id_for_diff(first_parent, merge_sha, target_to_source_paths.keys, target_to_source_paths:)
+  end
+
+  def target_commit_introduced_after_revert?(sha, target, revert_sha)
+    commit_descends_from?(sha, revert_sha) ||
+      target_merge_descendants(sha, target).any? { |merge_sha| commit_descends_from?(merge_sha, revert_sha) }
+  end
+
+  def forwarded_shas_with_x(sha, target)
+    footer = format(CHERRY_PICK_FOOTER_FORMAT, sha)
+    # This history search can false-positive if a later target commit quotes the
+    # footer verbatim. The live-target check by callers mitigates reverted target
+    # copies; the runbook documents the remaining quoted-footer boundary.
+    git_lines("log", target, "--fixed-strings", "--grep", footer, "--format=%H")
+  end
+
+  def reverted_commit_live_on_target?(sha, target)
+    source_cherry_pick_origin_on_target?(sha, target) || patch_equivalent_commit_present_on_target?(sha, target)
+  end
+
+  def cherry_pick_origin(sha)
+    body = git("log", "-1", "--format=%B", sha)
+    match = body.match(CHERRY_PICK_FOOTER_PATTERN) || narrated_cherry_pick_match(body)
+    match && match[:sha]
+  end
+
+  def narrated_cherry_pick_match(body)
+    paragraph_segments = body.split(/\n\s*\n/).map { |paragraph| paragraph.gsub(/\s+/, " ").strip }
+    (paragraph_segments + forward_port_narration_segments(body)).uniq.filter_map do |segment|
+      next unless authoritative_provenance_segment?(segment)
+
+      segment.match(NARRATED_CHERRY_PICK_PATTERN)
+    end.first
+  end
+
+  def commit_on_target?(sha, target)
+    _stdout, _stderr, status = capture_git("merge-base", "--is-ancestor", sha, target)
+    status.success?
+  end
+
+  def commit_descends_from?(descendant_sha, ancestor_sha)
+    _stdout, _stderr, status = capture_git("merge-base", "--is-ancestor", ancestor_sha, descendant_sha)
+    status.success?
+  end
+
+  def standard_revert_on_target?(sha, target)
+    @standard_revert_cache ||= {}
+    cache_key = [sha, target]
+    return @standard_revert_cache.fetch(cache_key) if @standard_revert_cache.key?(cache_key)
+
+    revert_shas = standard_revert_shas_on_target(sha, target)
+    # Seed the cache before recursive descent so mutual-revert cycles terminate.
+    @standard_revert_cache[cache_key] = false
+    @standard_revert_cache[cache_key] =
+      revert_shas.any? do |revert_sha|
+        commit_descends_from?(revert_sha, sha) && !standard_revert_on_target?(revert_sha, target)
+      end
+  end
+
+  def standard_revert_shas_on_target(sha, target)
+    # Git writes simple reverts as "sha." and merge reverts as "sha, reversing...".
+    [".", ","].flat_map do |suffix|
+      revert_message = "This reverts commit #{sha}#{suffix}"
+      git_lines("log", target, "--fixed-strings", "--grep", revert_message, "--format=%H")
+    end.uniq
+  end
+
+  def patch_equivalent_commit_present_on_target?(sha, target, candidates: nil, zero_context: false)
+    source_paths = changed_paths_for_commit(sha) - [CHANGELOG_FILE] - GENERATED_LLM_FILES
+    source_patch_id = patch_id_for_commit(sha, paths: source_paths, zero_context:)
+
+    (candidates || patch_equivalent_target_candidates(sha, target)).any? do |target_sha|
+      patch_id_for_target_candidate(target_sha, sha, source_paths:, zero_context:) == source_patch_id &&
+        target_commit_live_on_target?(target_sha, target)
+    end
+  end
+
+  def target_commit_live_on_target?(sha, target)
+    return false if standard_revert_on_target?(sha, target)
+    return false if target_commit_reverted_through_merge?(sha, target)
+
+    commit_on_first_parent?(sha, target) || target_merge_descendants(sha, target).any?
+  end
+
+  def commit_on_first_parent?(sha, target)
+    @first_parent_commits ||= {}
+    @first_parent_commits[target] ||= git_lines("rev-list", "--first-parent", target).to_h { |commit| [commit, true] }
+    @first_parent_commits[target].key?(sha)
+  end
+
+  def target_commit_reverted_through_merge?(sha, target)
+    # Only merge reverts that introduced this commit can make it non-live. Later
+    # unrelated merges often descend from already-forward-ported fixes through
+    # first-parent history; their reverts should not make an older fix look absent.
+    @target_merge_revert_cache ||= {}
+    cache_key = [sha, target]
+    return @target_merge_revert_cache.fetch(cache_key) if @target_merge_revert_cache.key?(cache_key)
+
+    @target_merge_revert_cache[cache_key] =
+      target_merge_descendants(sha, target).any? { |merge_sha| standard_revert_on_target?(merge_sha, target) }
+  end
+
+  def target_merge_descendants(sha, target)
+    git_lines("log", target, "--merges", "--ancestry-path", "#{sha}..#{target}", "--format=%H").select do |merge_sha|
+      merge_introduces_commit?(merge_sha, sha)
+    end
+  end
+
+  def merge_introduces_commit?(merge_sha, sha)
+    parents = git("rev-list", "--parents", "-n", "1", merge_sha).split.drop(1)
+    return false if parents.length < 2
+
+    first_parent, *merged_side_parents = parents
+    return false if commit_descends_from?(first_parent, sha)
+    return false unless merged_side_parents.any? { |parent| commit_descends_from?(parent, sha) }
+
+    merge_changes_commit_paths?(first_parent, merge_sha, sha)
+  end
+
+  def merge_changes_commit_paths?(first_parent, merge_sha, sha)
+    paths = source_paths_for_target_diff(first_parent, sha)
+    return false if paths.empty?
+
+    diff_changes_paths?(first_parent, merge_sha, paths)
+  end
+
+  def diff_changes_paths?(from_ref, to_ref, paths)
+    args = ["diff", "--quiet", from_ref, to_ref, "--", *paths]
+    stdout, stderr, status = capture_git(*args)
+    return true if status.exitstatus == 1
+    raise GitError, git_error(args, stdout, stderr, status) unless status.success?
+
+    false
+  end
+
+  def patch_equivalent_target_candidates(sha, target)
+    paths = source_paths_for_target_diff(target, sha)
+    return [] if paths.empty?
+
+    # This path-history walk can be broad for high-churn files, but it only runs
+    # for no-footer patch-equivalent candidates after git cherry marks a commit
+    # equivalent or when target-side renames need a path-aware fallback. Normal
+    # helper reruns use the faster -x footer path.
+    git_lines("log", target, "--format=%H", "--no-merges", "--", *paths)
+  end
+
+  def target_has_renamed_source_paths?(target, sha)
+    (source_paths_for_target_diff(target, sha) - changed_paths_for_commit(sha)).any?
+  end
+
+  def patch_id_for_target_candidate(target_sha, source_sha, source_paths: changed_paths_for_commit(source_sha),
+                                    zero_context: false)
+    parents = git("rev-list", "--parents", "-n", "1", target_sha).split.drop(1)
+    return patch_id_for_commit(target_sha, paths: source_paths, zero_context:) if parents.empty?
+
+    target_to_source_paths = target_to_source_path_map(target_sha, source_sha).select do |_target_path, source_path|
+      source_paths.include?(source_path)
+    end
+    patch_id_for_commit(target_sha, target_to_source_paths:, paths: target_to_source_paths.keys, zero_context:)
+  end
+
+  def source_paths_for_target_diff(first_parent, sha)
+    target_to_source_path_map(first_parent, sha).keys
+  end
+
+  def target_to_source_path_map(first_parent, sha)
+    paths = changed_paths_for_commit(sha)
+    return {} if paths.empty?
+
+    path_map = paths.to_h { |path| [path, path] }
+    renamed_target_path_pairs_for_source_paths(first_parent, sha, paths).each do |source_path, target_path|
+      path_map[target_path] = source_path
+    end
+
+    path_map
+  end
+
+  def renamed_target_path_pairs_for_source_paths(first_parent, sha, paths)
+    @renamed_target_path_pairs_cache ||= {}
+    cache_key = [first_parent, sha]
+    return @renamed_target_path_pairs_cache.fetch(cache_key) if @renamed_target_path_pairs_cache.key?(cache_key)
+
+    source_paths = paths.to_h { |path| [path, true] }
+    rename_base_refs = [optional_merge_base(first_parent, sha), sha].compact.uniq
+
+    @renamed_target_path_pairs_cache[cache_key] =
+      rename_base_refs.flat_map do |from_ref|
+        renamed_target_path_pairs_from_ref(from_ref, first_parent, source_paths)
+      end.uniq
+  end
+
+  def optional_merge_base(left_ref, right_ref)
+    args = ["merge-base", left_ref, right_ref]
+    stdout, stderr, status = capture_git(*args)
+    return stdout.strip if status.success?
+
+    if status.exitstatus == 1 && stdout.empty? && stderr.empty?
+      raise UsageError, shallow_history_message(left_ref, right_ref) if shallow_repository?
+
+      return
+    end
+
+    raise GitError, git_error(args, stdout, stderr, status)
+  end
+
+  def shallow_repository?
+    git("rev-parse", "--is-shallow-repository").strip == "true"
+  end
+
+  def shallow_history_message(left_ref, right_ref)
+    <<~MESSAGE.chomp
+      cannot find a merge base between #{left_ref} and #{right_ref} because repository history is shallow;
+      run `git fetch --unshallow` (or deepen the relevant refs), then rerun the forward-port
+    MESSAGE
+  end
+
+  def renamed_target_path_pairs_from_ref(from_ref, first_parent, source_paths)
+    git_lines("diff", "--name-status", "--find-renames=20%", from_ref, first_parent).filter_map do |line|
+      status, old_path, new_path = line.split("\t", 3)
+      [old_path, new_path] if status.start_with?("R") && new_path && source_paths.key?(old_path)
+    end
+  end
+
+  def changed_paths_for_commit(sha)
+    @changed_paths_cache ||= {}
+    @changed_paths_cache[sha] ||= git_lines("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha)
+  end
+
+  def generated_llm_artifact_changed?(sha)
+    changed_paths_for_commit(sha).intersect?(GENERATED_LLM_FILES)
+  end
+
+  def patch_id_for_commit(sha, target_to_source_paths: {}, paths: nil, zero_context: false)
+    # git show --format= emits diff-only output. git patch-id still hashes the
+    # hunk content and emits a commit field we discard; the first token is the
+    # content hash used for comparisons.
+    args = [
+      "show",
+      "--no-ext-diff",
+      "--format=",
+      "--full-index",
+      rename_detection_option(target_to_source_paths),
+      sha
+    ]
+    args << "--unified=0" if zero_context
+    args.push("--", *paths) if paths
+    patch = git(*args).b
+    patch = normalize_patch_paths(patch, target_to_source_paths)
+    patch_id_for_patch(patch, sha)
+  end
+
+  def patch_id_for_diff(from_ref, to_ref, paths, target_to_source_paths: {})
+    patch =
+      git(
+        "diff",
+        "--no-ext-diff",
+        "--full-index",
+        rename_detection_option(target_to_source_paths),
+        from_ref,
+        to_ref,
+        "--",
+        *paths
+      ).b
+    patch = normalize_patch_paths(patch, target_to_source_paths)
+    patch_id_for_patch(patch, "#{from_ref}..#{to_ref}")
+  end
+
+  def rename_detection_option(target_to_source_paths)
+    return "--find-renames=20%" if target_to_source_paths.any? { |target_path, source_path| target_path != source_path }
+
+    "--find-renames"
+  end
+
+  def normalize_patch_paths(patch, target_to_source_paths)
+    changed_paths = target_to_source_paths.reject { |target_path, source_path| target_path == source_path }
+    return patch if changed_paths.empty?
+
+    patch.each_line.map { |line| normalize_patch_path_line(line, changed_paths) }.join.b
+  end
+
+  def normalize_patch_path_line(line, target_to_source_paths)
+    return normalize_patch_diff_header(line, target_to_source_paths) if line.start_with?("diff --git ")
+    return normalize_prefixed_patch_path_line(line, target_to_source_paths) if line.start_with?("--- ", "+++ ")
+
+    normalize_unprefixed_patch_path_line(line, target_to_source_paths)
+  end
+
+  def normalize_patch_diff_header(line, target_to_source_paths)
+    trailing_newline = line.end_with?("\n") ? "\n" : ""
+    header = line.delete_prefix("diff --git ").delete_suffix("\n")
+
+    sorted_paths = target_to_source_paths.sort_by { |target_path, _source_path| -target_path.length }
+    sorted_paths.each do |target_path, source_path|
+      next if target_path == source_path
+
+      mapped_headers = [
+        "a/#{target_path} b/#{target_path}",
+        "a/#{source_path} b/#{target_path}"
+      ]
+      next unless mapped_headers.include?(header)
+
+      return "diff --git a/#{source_path} b/#{source_path}#{trailing_newline}"
+    end
+
+    line
+  end
+
+  def normalize_prefixed_patch_path_line(line, target_to_source_paths)
+    trailing_newline = line.end_with?("\n") ? "\n" : ""
+    prefix = line[0, 4]
+    path, separator, metadata = line[4..].delete_suffix("\n").partition("\t")
+    return line if path == "/dev/null"
+
+    normalized_path = normalize_prefixed_patch_path(path, path[0, 2], target_to_source_paths)
+    "#{prefix}#{normalized_path}#{separator}#{metadata}#{trailing_newline}"
+  end
+
+  def normalize_unprefixed_patch_path_line(line, target_to_source_paths)
+    return "" if line.start_with?("similarity index ", "dissimilarity index ")
+
+    path_headers = ["rename from ", "rename to ", "copy from ", "copy to "]
+    path_header = path_headers.find { |header| line.start_with?(header) }
+    return line unless path_header
+
+    trailing_newline = line.end_with?("\n") ? "\n" : ""
+    path = line.delete_prefix(path_header).delete_suffix("\n")
+    return "" if path_header.start_with?("rename ") &&
+                 (target_to_source_paths.key?(path) || target_to_source_paths.value?(path))
+
+    "#{path_header}#{target_to_source_paths.fetch(path, path)}#{trailing_newline}"
+  end
+
+  def normalize_prefixed_patch_path(path, prefix, target_to_source_paths)
+    return path unless path.start_with?(prefix)
+
+    target_path = path.delete_prefix(prefix)
+    "#{prefix}#{target_to_source_paths.fetch(target_path, target_path)}"
+  end
+
+  def patch_id_for_patch(patch, label)
+    # Empty commits carry no file changes; cherry-picking them would only create
+    # a no-op commit, so treat the patch as already present.
+    return EMPTY_PATCH_ID if empty_patch?(patch)
+
+    stdout, stderr, status = capture_git("patch-id", "--stable", stdin_data: patch)
+    raise GitError, "#{git_error(['patch-id', '--stable'], stdout, stderr, status)} for #{label}" unless status.success?
+
+    patch_id = stdout.split.first
+    return hunkless_patch_id(patch) if patch_id.nil?
+
+    patch_id
+  end
+
+  def version_at(ref)
+    version_file = git("show", "#{ref}:#{VERSION_FILE}").strip
+    match = version_file.match(/VERSION\s*=\s*["'](?<version>[^"']+)["']/)
+    unless match
+      warn "WARNING: VERSION constant not found in #{VERSION_FILE} at #{ref}; " \
+           "version-drift guard is disabled for non-RC version bump commits."
+      return nil
+    end
+
+    match[:version]
+  rescue GitError
+    warn "WARNING: unable to read #{VERSION_FILE} at #{ref}; " \
+         "version-drift guard is disabled for non-RC version bump commits."
+    nil
+  end
+
+  def compare_versions(left, right)
+    left_version = parse_version(left)
+    right_version = parse_version(right)
+    return unless left_version && right_version
+
+    base_comparison = left_version.fetch(:base) <=> right_version.fetch(:base)
+    return base_comparison unless base_comparison.zero?
+
+    compare_prerelease(left_version.fetch(:prerelease), right_version.fetch(:prerelease))
+  end
+
+  def parse_version(version)
+    normalized = version.to_s.delete_prefix("v").tr("-", ".")
+    match = normalized.match(
+      /\A(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:\.(?<label>[A-Za-z]+)(?:\.?(?<number>\d+))?)?\z/
+    )
+    return unless match
+
+    {
+      base: [match[:major].to_i, match[:minor].to_i, match[:patch].to_i],
+      prerelease: prerelease_from_match(match)
+    }
+  end
+
+  def prerelease_from_match(match)
+    return nil unless match[:label]
+
+    {
+      label: match[:label].downcase,
+      number: match[:number] ? match[:number].to_i : 0
+    }
+  end
+
+  def compare_prerelease(left, right)
+    return 0 if left.nil? && right.nil?
+    return 1 if left.nil?
+    return -1 if right.nil?
+
+    left_rank = prerelease_rank(left.fetch(:label))
+    right_rank = prerelease_rank(right.fetch(:label))
+    return unless left_rank && right_rank
+
+    label_comparison = left_rank <=> right_rank
+    return label_comparison unless label_comparison.zero?
+
+    left.fetch(:number) <=> right.fetch(:number)
+  end
+
+  def prerelease_rank(label)
+    # Unknown labels disable version-bump skipping. Picking an uncertain bump is
+    # safer than silently dropping a version commit that may still be needed.
+    PRERELEASE_RANKS[label]
+  end
+
+  def print_plan(source, target, target_version, plan)
+    puts "Release forward-port plan"
+    puts "  source: #{source}"
+    puts "  target: #{target}"
+    puts "  target version: #{target_version || 'UNKNOWN'}"
+    puts
+
+    if plan.empty?
+      puts "No commits found in #{target}..#{source}."
+      return
+    end
+
+    plan.each { |entry| print_plan_entry(entry) }
+
+    puts
+    puts plan_summary(plan)
+  end
+
+  def plan_summary(plan)
+    counts = plan_counts(plan)
+    parts = [
+      "#{commit_count(counts.fetch(:picks))} to cherry-pick",
+      "#{commit_count(counts.fetch(:skips))} skipped"
+    ]
+    parts << "#{commit_count(counts.fetch(:acknowledged_manual))} acknowledged manual skipped" if
+      counts.fetch(:acknowledged_manual).positive?
+    parts << manual_inspection_summary(counts.fetch(:manual)) if counts.fetch(:manual).positive?
+    "Summary: #{parts.join(', ')}."
+  end
+
+  def plan_counts(plan)
+    picks = plan.count { |entry| entry.action == :pick }
+    acknowledged_manual = plan.count { |entry| acknowledged_manual_entry?(entry) }
+    manual = plan.count { |entry| entry.manual? && !acknowledged_manual_entry?(entry) }
+
+    {
+      picks:,
+      acknowledged_manual:,
+      manual:,
+      skips: plan.length - picks - manual - acknowledged_manual
+    }
+  end
+
+  def commit_count(count)
+    "#{count} commit#{'s' unless count == 1}"
+  end
+
+  def manual_inspection_summary(count)
+    "#{commit_count(count)} #{count == 1 ? 'needs' : 'need'} manual inspection"
+  end
+
+  def print_plan_entry(entry)
+    case entry.action
+    when :pick
+      puts "PICK #{entry.short_sha} #{entry.subject}"
+    when :skip
+      puts "#{plan_entry_label(entry)} #{entry.short_sha} #{entry.subject}"
+      puts "     #{entry.reason}"
+      puts "     acknowledged by --ack-manual; skipping after operator inspection" if
+        acknowledged_manual_entry?(entry)
+    else
+      raise GitError, "unexpected plan entry action: #{entry.action.inspect}"
+    end
+  end
+
+  def ensure_clean_worktree!
+    ensure_no_cherry_pick_in_progress!
+
+    return if git("status", "--porcelain").strip.empty?
+
+    raise GitError, "working tree is not clean; commit, stash, or discard local changes before normal mode"
+  end
+
+  def ensure_no_cherry_pick_in_progress!
+    return unless cherry_pick_in_progress?
+
+    raise GitError, "a cherry-pick is already in progress; run git cherry-pick --continue, --skip, or --abort first"
+  end
+
+  def ensure_local_target_branch!(target)
+    run_git("show-ref", "--verify", "--quiet", "refs/heads/#{target}") do |_stdout, stderr, status|
+      unless status.success?
+        raise GitError,
+              "normal mode target must be a local branch (got #{target.inspect}): #{stderr.strip}"
+      end
+    end
+  end
+
+  def checkout_target!(target)
+    puts "\nChecking out #{target}..."
+    git("checkout", target)
+  end
+
+  # --changelog mode entry point. Reads CHANGELOG.md from both refs, reconciles
+  # the release-branch entries into the target's [Unreleased] section, and either
+  # previews the change (--dry-run) or rewrites the working-tree CHANGELOG.md on
+  # the checked-out target branch.
+  def run_changelog_reconciliation(source, target)
+    source_changelog = changelog_at(source, label: "source")
+    target_changelog = changelog_at(target, label: "target")
+
+    release_version = release_version_from_ref(source)
+    reconciler = ChangelogReconciler.new(source_changelog:, target_changelog:, release_version:)
+    return 1 if missing_source_release_section_check?(source, release_version, reconciler)
+
+    authoritative_sha =
+      authoritative_final_changelog_commit(
+        source,
+        target,
+        target_changelog,
+        release_version,
+        source_ready: reconciler.authoritative_source_ready?
+      )
+    if authoritative_sha
+      residue = reconciler.reconcile_authoritative_residue
+      unless residue.changed?
+        return finish_authoritative_changelog_plan(source, target, release_version, authoritative_sha)
+      end
+
+      return finish_changelog_reconciliation(source, target, residue)
+    end
+
+    result = reconciler.reconcile
+    finish_changelog_reconciliation(source, target, result)
+  rescue ChangelogReconciler::ReconcileError => e
+    # Map the reconciler's own error onto the shared GitError exit path.
+    raise GitError, e.message
+  end
+
+  def finish_changelog_reconciliation(source, target, result)
+    print_changelog_reconciliation_plan(source, target, result)
+
+    return check_changelog_plan(result) if @options[:check]
+
+    if @options[:dry_run]
+      puts "\nDRY RUN: CHANGELOG.md was not modified and no branch was checked out."
+      return 0
+    end
+
+    apply_changelog_reconciliation(target, result)
+  end
+
+  def missing_source_release_section_check?(source, release_version, reconciler)
+    return false unless @options[:check] && release_version
+    return false if reconciler.source_release_section_present?
+
+    warn "CHECK FAILED: #{source} has no matching stable or prerelease #{release_version} changelog section."
+    true
+  end
+
+  def check_changelog_plan(result)
+    if result.changed?
+      warn "CHECK FAILED: release changelog reconciliation still needs its own squash PR."
+      return 1
+    end
+
+    puts "\nCHECK PASSED: the release changelog is already reconciled on the target."
+    0
+  end
+
+  def release_version_from_ref(ref)
+    ref.match(%r{(?:\A|/)release/(?<version>\d+\.\d+\.\d+)\z})&.[](:version)
+  end
+
+  def authoritative_final_changelog_commit(source, target, target_changelog, release_version, source_ready:)
+    return unless release_version && source_ready
+
+    source_changelog_sha = latest_changelog_commit(source)
+    validate_acknowledged_changelog_source!(source_changelog_sha)
+    subject_pattern =
+      /\ARecord the final React on Rails #{Regexp.escape(release_version)} changelog \(#\d+\)\z/
+    candidates =
+      git_lines(
+        "log",
+        target,
+        "--fixed-strings",
+        "--grep",
+        "final React on Rails #{release_version} changelog",
+        "--format=%H"
+      )
+    context = {
+      target:,
+      target_changelog:,
+      release_version:,
+      source_changelog_sha:,
+      subject_pattern:
+    }
+
+    candidates.find { |sha| authoritative_changelog_candidate?(sha, context) }
+  end
+
+  def authoritative_changelog_candidate?(sha, context)
+    subject_for_commit(sha)&.match?(context.fetch(:subject_pattern)) &&
+      changed_paths_for_commit(sha) == [CHANGELOG_FILE] &&
+      target_commit_live_on_target?(sha, context.fetch(:target)) &&
+      authoritative_changelog_source_bound?(sha, context.fetch(:source_changelog_sha)) &&
+      authoritative_changelog_section_unchanged?(
+        sha,
+        context.fetch(:target_changelog),
+        context.fetch(:release_version)
+      )
+  end
+
+  def latest_changelog_commit(source)
+    sha = git("log", "-1", "--format=%H", source, "--", CHANGELOG_FILE).strip
+    raise GitError, "#{source} has no #{CHANGELOG_FILE} history to bind the final changelog authority" if sha.empty?
+
+    sha
+  end
+
+  def authoritative_changelog_source_bound?(authoritative_sha, source_changelog_sha)
+    return true if @acknowledged_changelog_source_sha == source_changelog_sha
+
+    exact_sentence =
+      "The final changelog records source CHANGELOG.md commit `#{source_changelog_sha}`."
+    git("show", "-s", "--format=%B", authoritative_sha).lines.any? { |line| line.strip == exact_sentence }
+  end
+
+  def validate_acknowledged_changelog_source!(source_changelog_sha)
+    return unless @acknowledged_changelog_source_sha
+    return if @acknowledged_changelog_source_sha == source_changelog_sha
+
+    raise UsageError,
+          "--ack-final-changelog-source resolves to #{@acknowledged_changelog_source_sha}, but the current source " \
+          "CHANGELOG.md commit is #{source_changelog_sha}; inspect the newer changelog before acknowledging it"
+  end
+
+  def authoritative_changelog_section_unchanged?(sha, target_changelog, release_version)
+    recorded_changelog = changelog_at(sha, label: "authoritative final changelog")
+    recorded_section = changelog_section(recorded_changelog, release_version)
+    recorded_section && recorded_section == changelog_section(target_changelog, release_version)
+  end
+
+  def changelog_section(changelog, version)
+    lines = changelog.lines
+    start_index = lines.index { |line| line.match?(/^### \[#{Regexp.escape(version)}\](?:\s|$)/) }
+    return unless start_index
+
+    end_index =
+      ((start_index + 1)...lines.length).find { |index| lines[index].match?(/^### \[/) } || lines.length
+    lines[start_index...end_index].join
+  end
+
+  def finish_authoritative_changelog_plan(source, target, release_version, authoritative_sha)
+    puts "Release forward-port CHANGELOG.md reconciliation plan"
+    puts "  source: #{source}"
+    puts "  target: #{target}"
+    puts
+    puts "Authoritative final #{release_version} changelog is unchanged on #{target}."
+    puts "  commit: #{authoritative_sha[0, 12]}"
+    puts "  superseded prerelease entries intentionally omitted by the dedicated final changelog PR"
+
+    if @options[:check]
+      puts "\nCHECK PASSED: the release changelog is already reconciled on the target."
+    else
+      puts "\nNothing to reconcile; the dedicated final changelog PR is authoritative."
+    end
+    0
+  end
+
+  def apply_changelog_reconciliation(target, result)
+    unless result.changed?
+      puts "\nNothing to reconcile; #{CHANGELOG_FILE} on #{target} already has every release-branch entry."
+      return 0
+    end
+
+    ensure_clean_worktree!
+    checkout_target!(target)
+    # Write UTF-8 explicitly so the ⚠️-carrying changelog round-trips byte-for-byte
+    # under a C/POSIX-locale runner where the default external encoding is US-ASCII.
+    File.write(changelog_path, result.reconciled_changelog, encoding: Encoding::UTF_8)
+    puts "\nReconciled #{CHANGELOG_FILE} [Unreleased] on #{target}: " \
+         "#{changelog_count(result.added_entries.length, 'entry', 'entries')} added, " \
+         "#{changelog_count(result.removed_entries.length, 'stale entry', 'stale entries')} removed."
+    puts "Review and commit #{CHANGELOG_FILE} (this mode does not commit)."
+    0
+  end
+
+  def print_changelog_reconciliation_plan(source, target, result)
+    puts "Release forward-port CHANGELOG.md reconciliation plan"
+    puts "  source: #{source}"
+    puts "  target: #{target}"
+    puts
+
+    print_changelog_added_entries(result)
+    print_changelog_removed_entries(result)
+    print_changelog_removed_sections(result)
+    print_changelog_already_present(result)
+
+    puts
+    puts changelog_reconciliation_summary(result)
+  end
+
+  def print_changelog_added_entries(result)
+    if result.added_entries.empty?
+      puts "No new release-branch entries to add under [Unreleased]."
+      return
+    end
+
+    puts "Entries to ADD under [Unreleased]:"
+    result.added_entries.each { |entry| puts indent_changelog_entry("+", entry) }
+  end
+
+  def print_changelog_removed_sections(result)
+    return if result.removed_sections.empty?
+
+    puts
+    puts "RC-header sections to DROP from the target (cherry-pick residue):"
+    result.removed_sections.each { |version| puts "  - ### [#{version}]" }
+  end
+
+  def print_changelog_removed_entries(result)
+    return if result.removed_entries.empty?
+
+    puts
+    puts "Stale target [Unreleased] entries to DROP in favor of final release wording:"
+    result.removed_entries.each { |entry| puts indent_changelog_entry("-", entry) }
+  end
+
+  def print_changelog_already_present(result)
+    return if result.skipped_entries.empty?
+
+    puts
+    puts "Entries already present on the target (skipped, de-duplicated by PR number):"
+    result.skipped_entries.each { |entry| puts indent_changelog_entry("=", entry) }
+  end
+
+  def indent_changelog_entry(marker, entry)
+    first, *rest = entry.text.lines
+    pr = entry.pr_number ? " (PR ##{entry.pr_number})" : ""
+    lines = ["  #{marker} #{first.to_s.rstrip}#{pr}"]
+    rest.each { |line| lines << "      #{line.rstrip}" }
+    lines.join("\n")
+  end
+
+  def changelog_reconciliation_summary(result)
+    parts = [
+      "#{changelog_count(result.added_entries.length, 'entry', 'entries')} to add",
+      "#{changelog_count(result.skipped_entries.length, 'entry', 'entries')} already present"
+    ]
+    parts << "#{changelog_count(result.removed_entries.length, 'stale entry', 'stale entries')} to drop" if
+      result.removed_entries.any?
+    parts << "#{changelog_count(result.removed_sections.length, 'RC section', 'RC sections')} to drop" if
+      result.removed_sections.any?
+    "Summary: #{parts.join(', ')}."
+  end
+
+  def changelog_count(count, singular, plural)
+    "#{count} #{count == 1 ? singular : plural}"
+  end
+
+  def changelog_at(ref, label:)
+    git("show", "#{ref}:#{CHANGELOG_FILE}")
+  rescue GitError => e
+    raise GitError, "unable to read #{CHANGELOG_FILE} at #{label} ref #{ref.inspect}: #{e.message}"
+  end
+
+  def changelog_path
+    git_toplevel = git("rev-parse", "--show-toplevel").strip
+    File.join(git_toplevel, CHANGELOG_FILE)
+  end
+
+  def apply_plan(plan)
+    unless actionable_plan?(plan)
+      puts "\nNothing to cherry-pick."
+      return 0
+    end
+
+    completed_picks = 0
+    plan.each_with_index do |entry, index|
+      next if entry.action == :skip && !entry.manual?
+      next if acknowledged_manual_entry?(entry)
+
+      if entry.manual?
+        warn_manual_entry(entry, completed: completed_picks, remaining: remaining_picks(plan, index))
+        return 1
+      end
+
+      if cherry_pick_entry(entry)
+        completed_picks += 1
+        next
+      end
+
+      warn_cherry_pick_failure(entry, completed: completed_picks, remaining: remaining_picks(plan, index))
+      return 1
+    end
+
+    puts "\nForward-port complete."
+    0
+  end
+
+  def enforce_single_forward_port!(plan)
+    return if @options[:all]
+
+    actionable_entries = plan.select { |entry| actionable_entry?(entry) }
+    return if actionable_entries.length <= 1
+
+    shas = actionable_entries.map(&:short_sha).join(", ")
+    raise UsageError,
+          "normal mode found #{actionable_entries.length} actionable commits (#{shas}); " \
+          "create a fresh branch and rerun with --only SHA for one forward-port PR at a time"
+  end
+
+  def actionable_plan?(plan)
+    plan.any? { |entry| actionable_entry?(entry) }
+  end
+
+  def actionable_entry?(entry)
+    entry.action == :pick || (entry.manual? && !acknowledged_manual_entry?(entry))
+  end
+
+  def acknowledged_manual_entries?(plan)
+    plan.any? { |entry| entry.manual? && acknowledged_manual_entry?(entry) }
+  end
+
+  def remaining_picks(plan, index)
+    plan[index + 1..].count { |entry| entry.action == :pick }
+  end
+
+  def cherry_pick_entry(entry)
+    puts "\nCherry-picking #{entry.short_sha} #{entry.subject}"
+    stdout, stderr, status = capture_git("cherry-pick", "-x", entry.sha)
+    puts stdout unless stdout.empty?
+    warn stderr unless stderr.empty?
+    status.success?
+  end
+
+  def warn_cherry_pick_failure(entry, completed:, remaining:)
+    warn "Cherry-pick failed for #{entry.sha}."
+
+    if cherry_pick_in_progress?
+      warn "Resolve the conflict and run git cherry-pick --continue to finish THIS commit."
+      warn_later_commits(remaining, "after continuing to apply the rest", continue_context: true)
+      warn "If you run git cherry-pick --abort, only the current conflicting commit is abandoned."
+    else
+      warn "Git did not leave a cherry-pick in progress; fix the git error above and rerun " \
+           "script/release-forward-port."
+      warn_later_commits(remaining, "after fixing the failed pick", continue_context: false)
+    end
+
+    warn "Earlier successful picks from this run are already committed and safe." if completed.positive?
+  end
+
+  def warn_manual_entry(entry, completed:, remaining:)
+    warn "Manual inspection required for #{entry.sha}."
+    warn entry.reason
+    warn "After inspection, apply any needed manual hunks so a rerun can skip this commit, or rerun with " \
+         "--ack-manual #{entry.sha} to record a no-hunks-needed decision and continue."
+    warn_later_commits(remaining, "after acknowledging the manual item", continue_context: false)
+    warn "Earlier successful picks from this run are already committed and safe." if completed.positive?
+  end
+
+  def warn_later_commits(remaining, rerun_after, continue_context:)
+    return unless remaining.positive?
+
+    queue_note = continue_context ? "not queued by --continue" : "not attempted after this failure"
+    warn "Note: #{remaining} later eligible commit#{'s' unless remaining == 1} in this plan " \
+         "#{remaining == 1 ? 'is' : 'are'} #{queue_note}. Rerun " \
+         "script/release-forward-port #{rerun_after} " \
+         "(it is idempotent and skips commits already applied)."
+  end
+
+  def cherry_pick_in_progress?
+    git_dir = git("rev-parse", "--git-dir").strip
+    path = File.expand_path("CHERRY_PICK_HEAD", git_dir)
+    File.exist?(path)
+  rescue GitError
+    false
+  end
+
+  def normalize_acknowledged_manual_shas!
+    @acknowledged_manual_shas = @options.fetch(:ack_manual).map do |sha|
+      git("rev-parse", "--verify", "#{sha}^{commit}").strip
+    rescue GitError => e
+      raise UsageError, "--ack-manual #{sha.inspect} is not a commit: #{e.message}"
+    end.uniq
+  end
+
+  def normalize_acknowledged_changelog_source_sha!
+    sha = @options[:ack_final_changelog_source]
+    return unless sha
+
+    @acknowledged_changelog_source_sha = git("rev-parse", "--verify", "#{sha}^{commit}").strip
+  rescue GitError => e
+    raise UsageError, "--ack-final-changelog-source #{sha.inspect} is not a commit: #{e.message}"
+  end
+
+  def validate_acknowledged_manual_shas!(plan)
+    return if @acknowledged_manual_shas.empty?
+
+    manual_shas = plan.select(&:manual?).map(&:sha)
+    unmatched = @acknowledged_manual_shas - manual_shas
+    return if unmatched.empty?
+
+    raise UsageError, "--ack-manual only accepts commits currently marked MANUAL in the plan; " \
+                      "unmatched: #{unmatched.join(', ')}"
+  end
+
+  def acknowledged_manual_entry?(entry)
+    entry.manual? && @acknowledged_manual_shas&.include?(entry.sha)
+  end
+
+  def plan_entry_label(entry)
+    return "ACK-MANUAL" if acknowledged_manual_entry?(entry)
+
+    entry.manual? ? "MANUAL" : "SKIP"
+  end
+
+  def subject_for_commit(sha)
+    git("log", "-1", "--format=%s", sha).strip
+  rescue GitError
+    nil
+  end
+
+  def commit_exists?(sha)
+    _stdout, _stderr, status = capture_git("cat-file", "-e", "#{sha}^{commit}")
+    status.success?
+  end
+
+  def empty_patch?(patch)
+    patch.each_byte.all? { |byte| ASCII_WHITESPACE_BYTES.include?(byte) }
+  end
+
+  def hunkless_patch_id(patch)
+    "#{HUNKLESS_PATCH_ID_PREFIX}#{Digest::SHA256.hexdigest(patch)}"
+  end
+
+  def verify_ref!(ref, label:)
+    git("rev-parse", "--verify", "#{ref}^{commit}")
+  rescue GitError => e
+    raise GitError, "#{label} ref #{ref.inspect} is not a commit: #{e.message}"
+  end
+
+  # The repo requires Ruby >= 3.3, so anonymous forwarding is valid and keeps
+  # these small git wrappers aligned with RuboCop's preferred style. git raises
+  # on failure; capture_git/run_git are the non-raising escape hatches.
+  def git_lines(*)
+    output = git(*)
+    output.lines.map(&:strip).reject(&:empty?)
+  end
+
+  def git(*args)
+    stdout, stderr, status = capture_git(*args)
+    raise GitError, git_error(args, stdout, stderr, status) unless status.success?
+
+    stdout.force_encoding(Encoding::UTF_8)
+  end
+
+  def capture_git(*, stdin_data: "")
+    git_env = { "GIT_TERMINAL_PROMPT" => "0", "GIT_PAGER" => "cat" }
+    Open3.capture3(git_env, "git", *, stdin_data:)
+  end
+
+  def run_git(*)
+    raise ArgumentError, "run_git requires a block" unless block_given?
+
+    stdout, stderr, status = capture_git(*)
+    yield(stdout, stderr, status)
+  end
+
+  def git_error(args, stdout, stderr, status)
+    message = ["git #{args.join(' ')} failed with status #{status.exitstatus}"]
+    message << stderr.strip unless stderr.strip.empty?
+    message << stdout.strip unless stdout.strip.empty?
+    message.join(": ")
+  end
+end
+# rubocop:enable Metrics/ClassLength
+
+# Re-homes release-branch CHANGELOG.md entries into the target's [Unreleased]
+# section. On a release branch a fix's entry lives under an RC header
+# (### [17.0.0.rc.1]) or, after final stamping, the matching stable header
+# (### [17.0.0]); on main it belongs under ### [Unreleased]. A plain
+# cherry-pick -x of the fix commit drags the RC-header context and either
+# conflicts or lands the entry in the wrong section. This reconciler is the
+# changelog restructure half of the forward-port: it collapses every entry from
+# the release branch's matching stable/rc.N sections plus its own [Unreleased]
+# into the target's [Unreleased], de-duplicated by PR number against the target's
+# existing entries, and drops any RC-header section a prior pick left on the target.
+#
+# The parsing approach intentionally mirrors react_on_rails/rakelib/update_changelog.rake
+# (parse_changelog_sections / changelog_section_blocks / consolidate_changelog_blocks)
+# but is reimplemented self-contained here so this script has no rake dependency.
+# rubocop:disable Metrics/ClassLength
+class ChangelogReconciler
+  # Raised for changelog structures the reconciler cannot operate on (e.g. a target
+  # with no [Unreleased] section). Kept local so the reconciler does not depend on
+  # ReleaseForwardPort's error types; the caller maps it to the same exit status.
+  class ReconcileError < StandardError; end
+
+  UNRELEASED = "Unreleased"
+  DEFAULT_HEADING = "#### Changed"
+  CHANGELOG_FILE = "CHANGELOG.md"
+  SECTION_HEADER = /^### \[([^\]]+)\].*$/
+  BLOCK_HEADING = /^####+\s+/
+  PRERELEASE_SUFFIX = /\.(?:test|beta|alpha|rc|pre)(?:\.\d+)?\z/i
+  # An entry's OWN PR is, by changelog convention, the "[PR NNNN](...) by [author]"
+  # trailer at the end. Many entries also reference OTHER PRs mid-text ("Follow-up
+  # to [PR 4227]... [PR 4234] by [author]"), so this trailer anchor is matched first
+  # to avoid de-duplicating on a referenced PR instead of the entry's own.
+  PR_TRAILER_PATTERN = /\[PR\s*#?(\d+)\]\([^)]*\)\s*by\b/i
+  # Fallbacks when there is no "... by [author]" trailer: a /pull/NNNN link, the
+  # "PR NNNN" / "#NNNN" shorthand. The LAST occurrence wins, since the entry's own
+  # PR conventionally comes after any PRs it references.
+  PR_REFERENCE_PATTERNS = [
+    %r{/pull/(\d+)\b},
+    /\bPR\s*\[?#?(\d+)\b/i,
+    %r{(?<![\w/])#(\d+)\b}
+  ].freeze
+
+  Entry = Struct.new(:text, :pr_number, :heading, keyword_init: true)
+
+  Result = Struct.new(
+    :reconciled_changelog,
+    :added_entries,
+    :skipped_entries,
+    :removed_entries,
+    :removed_sections,
+    :original_changelog,
+    keyword_init: true
+  ) do
+    # Semantic change only: adding/removing an entry or dropping at least one
+    # stray RC section. Skipped (already-present) entries do not count, so the
+    # reconciler never reformats the target's existing [Unreleased] for nothing.
+    def changed?
+      added_entries.any? || removed_entries.any? || removed_sections.any?
+    end
+  end
+
+  def initialize(source_changelog:, target_changelog:, release_version: nil)
+    @source_changelog = source_changelog
+    @target_changelog = target_changelog
+    @release_version = release_version
+  end
+
+  def reconcile
+    target = parse_sections(@target_changelog)
+    source = parse_sections(@source_changelog)
+
+    base_version = source_release_base_version(source)
+    removed_sections = stray_rc_sections(target, base_version)
+
+    target_entries, added, skipped, removed_entries =
+      reconcile_entries(target, source, removed_sections, base_version)
+
+    # Only re-render when there is a real change; otherwise return the target
+    # changelog byte-for-byte so a no-op run never reflows existing entries.
+    reconciled = if added.any? || removed_entries.any? || removed_sections.any?
+                   rebuild_changelog(target, target_entries + added, removed_sections)
+                 else
+                   @target_changelog
+                 end
+
+    Result.new(
+      reconciled_changelog: reconciled,
+      added_entries: added,
+      skipped_entries: skipped,
+      removed_entries:,
+      removed_sections: removed_sections.map { |section| section[:version] },
+      original_changelog: @target_changelog
+    )
+  end
+
+  # A dedicated final changelog PR may intentionally consolidate or omit
+  # prerelease wording, so its stable section is authoritative. It is only safe
+  # to use that fast path when the named release section exists on the source and
+  # the source has no later [Unreleased] entries.
+  def authoritative_source_ready?
+    return false unless @release_version
+
+    source = parse_sections(@source_changelog)
+    source_release_section_present?(source) &&
+      section_entries(find_unreleased(source)).empty?
+  end
+
+  def source_release_section_present?(source = parse_sections(@source_changelog))
+    source_release_base_version(source) == @release_version
+  end
+
+  # Even after a final changelog PR, a later mixed cherry-pick can reintroduce an
+  # RC section or duplicate one of the release entries under target [Unreleased].
+  # Remove only that residue; never re-add source wording that the authoritative
+  # final PR intentionally consolidated or omitted.
+  def reconcile_authoritative_residue
+    target = parse_sections(@target_changelog)
+    source = parse_sections(@source_changelog)
+    base_version = source_release_base_version(source)
+    removed_sections = stray_rc_sections(target, base_version)
+    target_entries, removed_entries = authoritative_residue_entries(target, source, base_version)
+    retained_entries = target_entries - removed_entries
+
+    reconciled = if removed_entries.any? || removed_sections.any?
+                   rebuild_changelog(target, retained_entries, removed_sections)
+                 else
+                   @target_changelog
+                 end
+
+    Result.new(
+      reconciled_changelog: reconciled,
+      added_entries: [],
+      skipped_entries: [],
+      removed_entries:,
+      removed_sections: removed_sections.map { |section| section[:version] },
+      original_changelog: @target_changelog
+    )
+  end
+
+  private
+
+  def authoritative_residue_entries(target, source, base_version)
+    target_entries = section_entries(find_unreleased(target))
+    source_entries = stamped_source_entries(source, base_version)
+    source_pr_numbers = source_entries.filter_map(&:pr_number).to_set
+    source_texts = source_entries.to_set { |entry| normalize_text(entry.text) }
+    removed_entries = target_entries.select do |entry|
+      (entry.pr_number && source_pr_numbers.include?(entry.pr_number)) ||
+        source_texts.include?(normalize_text(entry.text))
+    end
+    [target_entries, removed_entries]
+  end
+
+  def reconcile_entries(target, source, removed_sections, base_version)
+    target_entries = section_entries(find_unreleased(target))
+    source_entries = collect_source_entries(source, base_version)
+    replacement_prs = authoritative_replacement_pr_numbers(source, base_version, target_entries)
+
+    # De-duplicate against every section that will remain on main, not only the
+    # current [Unreleased]. A maintained release branch retains its stable
+    # section, whose entries may already live in main's history. Exclude RC
+    # sections being removed so their entries can still be re-homed before the
+    # section headers disappear.
+    retained_target_entries =
+      retained_target_entries(
+        target,
+        removed_sections,
+        replacement_prs,
+        base_version,
+        exclude_release_section: authoritative_source_ready?
+      )
+    seen_pr_numbers = retained_target_entries.filter_map(&:pr_number).to_set
+    target_entry_texts = retained_target_entries.to_set { |entry| normalize_text(entry.text) }
+
+    added, skipped = partition_source_entries(source_entries, seen_pr_numbers, target_entry_texts)
+    removed_entries = target_entries.select { |entry| replacement_prs.include?(entry.pr_number) }
+    retained_unreleased_entries = target_entries - removed_entries
+    [retained_unreleased_entries, added, skipped, removed_entries]
+  end
+
+  def retained_target_entries(target, removed_sections, replacement_prs, base_version, exclude_release_section:)
+    retained_sections = target[:sections].reject do |section|
+      removed_sections.include?(section) ||
+        (exclude_release_section && section[:version] == base_version)
+    end
+    retained_sections.flat_map do |section|
+      entries = section_entries(section)
+      next entries unless section[:version] == UNRELEASED
+
+      entries.reject { |entry| replacement_prs.include?(entry.pr_number) }
+    end
+  end
+
+  # Final stamping can consolidate an earlier entry with a follow-up PR while
+  # main still has narrower prerelease wording for that same own PR. The final
+  # stable entry is authoritative, so remove the narrower [Unreleased] copy and
+  # let the normal partition pass add the final wording and heading.
+  def authoritative_replacement_pr_numbers(source, base_version, target_entries)
+    stable_entries = stable_sections(source, base_version).flat_map { |section| section_entries(section) }
+    stable_entries_by_pr = stable_entries.select(&:pr_number).group_by(&:pr_number)
+    target_entries_by_pr = target_entries.select(&:pr_number).group_by(&:pr_number)
+
+    target_entries_by_pr.each_with_object(Set.new) do |(pr_number, entries), replacements|
+      stable_group = stable_entries_by_pr[pr_number]
+      replacements << pr_number if authoritative_entry_group?(stable_group, entries)
+    end
+  end
+
+  def authoritative_entry_group?(stable_group, target_group)
+    stable_group && entry_group_fingerprint(stable_group) != entry_group_fingerprint(target_group)
+  end
+
+  def entry_group_fingerprint(entries)
+    entries.map do |entry|
+      [normalize_heading_key(entry.heading), normalize_text(entry.text)]
+    end.sort
+  end
+
+  # Collapse every release-branch source section that belongs in main's
+  # [Unreleased]: the branch's own [Unreleased] first (so it wins "first seen"
+  # ordering), then the final stable section and each prerelease section for the
+  # active base version.
+  def collect_source_entries(source, base_version)
+    sections = [find_unreleased(source)].compact
+    sections += stamped_source_sections(source, base_version)
+    blocks = sections.flat_map { |section| section_blocks(section[:body]) }
+    entries_from_blocks(consolidate_blocks(blocks))
+  end
+
+  def stamped_source_entries(source, base_version)
+    blocks = stamped_source_sections(source, base_version).flat_map { |section| section_blocks(section[:body]) }
+    entries_from_blocks(consolidate_blocks(blocks))
+  end
+
+  def stamped_source_sections(source, base_version)
+    stable_sections(source, base_version) + prerelease_sections(source, base_version)
+  end
+
+  # Split the collapsed source entries into those to add to main's [Unreleased]
+  # and those already present. De-duplication rules (matching update_changelog.rake
+  # deduplicate_block_entries semantics):
+  #   - Against the TARGET: skip when the PR number already appears on main, OR
+  #     the entry text already appears on main (PR-number match catches reworded
+  #     entries the release branch and main phrase differently).
+  #   - Within the source itself: skip only exact text duplicates, so two distinct
+  #     entries that share one (new) PR number both carry over.
+  def partition_source_entries(entries, seen_pr_numbers, target_entry_texts)
+    added = []
+    skipped = []
+    added_texts = Set.new
+
+    entries.each do |entry|
+      normalized = normalize_text(entry.text)
+      if entry_present_on_target?(entry, seen_pr_numbers, target_entry_texts) || added_texts.include?(normalized)
+        skipped << entry
+      else
+        added_texts << normalized
+        added << entry
+      end
+    end
+
+    [added, skipped]
+  end
+
+  def entry_present_on_target?(entry, seen_pr_numbers, target_entry_texts)
+    return true if entry.pr_number && seen_pr_numbers.include?(entry.pr_number)
+
+    target_entry_texts.include?(normalize_text(entry.text))
+  end
+
+  # Rebuild the target changelog: rewrite [Unreleased]'s body from the merged
+  # entry list (grouped under their #### headings) and drop the stray RC-header
+  # sections a prior cherry-pick introduced.
+  def rebuild_changelog(target, entries, removed_sections)
+    sections = target[:sections].reject { |section| removed_sections.include?(section) }
+    unreleased = sections.find { |section| section[:version] == UNRELEASED }
+    raise ReconcileError, "target #{CHANGELOG_FILE} has no ### [#{UNRELEASED}] section" unless unreleased
+
+    unreleased = unreleased.dup
+    unreleased[:body] = render_unreleased_body(entries)
+    sections = sections.map { |section| section[:version] == UNRELEASED ? unreleased : section }
+
+    render_sections(target[:prefix], sections)
+  end
+
+  def render_unreleased_body(entries)
+    return "\n" if entries.empty?
+
+    blocks = consolidate_blocks(blocks_from_entries(entries))
+    "\n#{blocks.join("\n\n").strip}\n\n"
+  end
+
+  # Group entries back under their #### headings (Added / Changed / Fixed / ...),
+  # preserving first-seen heading order, so the rebuilt body keeps the keepachangelog
+  # structure rather than a flat bullet list. Every entry carries its owning heading
+  # from the parsing pass; a defensive default covers any heading-less entry.
+  def blocks_from_entries(entries)
+    blocks = []
+    index_by_heading = {}
+
+    entries.each do |entry|
+      heading = entry.heading || DEFAULT_HEADING
+      if index_by_heading.key?(heading)
+        blocks[index_by_heading[heading]] << "\n#{entry.text}"
+      else
+        index_by_heading[heading] = blocks.length
+        # Blank line after the #### heading matches the CHANGELOG.md house style.
+        blocks << "#{heading}\n\n#{entry.text}"
+      end
+    end
+
+    blocks
+  end
+
+  def collect_pr_number(text)
+    trailer = text.scan(PR_TRAILER_PATTERN).last
+    return trailer.first.to_i if trailer
+
+    # No "... by [author]" trailer: take the last match of the first pattern that
+    # matches at all (last-ref-wins).
+    PR_REFERENCE_PATTERNS.each do |pattern|
+      last = text.scan(pattern).last
+      return last.first.to_i if last
+    end
+    nil
+  end
+
+  def normalize_text(text)
+    text.to_s.gsub(/\s+/, " ").strip
+  end
+
+  # Prefer the version named by release/X.Y.Z. Final stamping removes RC headers,
+  # so the source ref is the durable way to identify the stable section to re-home.
+  # For arbitrary source refs, retain the prerelease-section inference fallback.
+  # Never infer from the target: an unrelated target RC section must stay intact.
+  def source_release_base_version(source)
+    if @release_version
+      return @release_version if stamped_source_sections(source, @release_version).any?
+
+      return nil
+    end
+
+    highest_prerelease_base(source)
+  end
+
+  def highest_prerelease_base(parsed)
+    bases = parsed[:sections].filter_map do |section|
+      next unless section[:version].match?(PRERELEASE_SUFFIX)
+
+      section[:version].sub(PRERELEASE_SUFFIX, "")
+    end.uniq
+    highest_version(bases)
+  end
+
+  # Order version strings, tolerating a malformed base that Gem::Version rejects
+  # (only the parse is rescued, not the surrounding section scan).
+  def highest_version(bases)
+    bases.max_by { |base| Gem::Version.new(base) }
+  rescue ArgumentError
+    bases.max
+  end
+
+  # Sections on the TARGET that a cherry-pick introduced: prerelease-headed
+  # sections whose base matches the active release line. These are the residue the
+  # reconciliation must drop so entries live only under [Unreleased] on main.
+  def stray_rc_sections(target, base_version)
+    prerelease_sections(target, base_version)
+  end
+
+  def stable_sections(parsed, base_version)
+    return [] unless base_version
+
+    parsed[:sections].select { |section| section[:version] == base_version }
+  end
+
+  # Prerelease (rc.N / beta.N / ...) sections in `parsed` whose base equals
+  # base_version. Empty base (source had no prerelease sections) selects nothing.
+  def prerelease_sections(parsed, base_version)
+    return [] unless base_version
+
+    parsed[:sections].select do |section|
+      section[:version].match?(PRERELEASE_SUFFIX) &&
+        section[:version].sub(PRERELEASE_SUFFIX, "") == base_version
+    end
+  end
+
+  def find_unreleased(parsed)
+    parsed[:sections].find { |section| section[:version] == UNRELEASED }
+  end
+
+  # --- Self-contained changelog parsing (mirrors update_changelog.rake) ---
+
+  def parse_sections(changelog)
+    lines = changelog.lines
+    headers = []
+    lines.each_with_index do |line, index|
+      match = line.match(SECTION_HEADER)
+      headers << { index:, version: match[1], header: line } if match
+    end
+
+    return { prefix: changelog, sections: [] } if headers.empty?
+
+    prefix = lines[0...headers.first[:index]].join
+    sections = headers.each_with_index.map do |header, position|
+      section_end = position + 1 < headers.length ? headers[position + 1][:index] : lines.length
+      {
+        version: header[:version],
+        header: header[:header],
+        body: lines[(header[:index] + 1)...section_end].join
+      }
+    end
+
+    { prefix:, sections: }
+  end
+
+  def render_sections(prefix, sections)
+    "#{prefix}#{sections.map { |section| "#{section[:header]}#{section[:body]}" }.join}"
+  end
+
+  def section_blocks(section_body)
+    block_lines = []
+    blocks = []
+
+    section_body.lines.each do |line|
+      normalized = line.rstrip
+      if normalized.match?(BLOCK_HEADING) && !block_lines.empty?
+        blocks << normalize_block(block_lines)
+        block_lines = [normalized]
+      else
+        block_lines << normalized
+      end
+    end
+
+    blocks << normalize_block(block_lines) unless block_lines.empty?
+    blocks.reject(&:empty?)
+  end
+
+  def normalize_block(lines)
+    normalized = lines.map(&:rstrip)
+    normalized.shift while normalized.first == ""
+    normalized.pop while normalized.last == ""
+    normalized.join("\n")
+  end
+
+  def normalize_heading_key(line)
+    normalized = line.to_s.strip
+    level = normalized[/\A(#+)/, 1] || ""
+    text = normalized.sub(/\A#+\s+/, "")
+                     .gsub(/\A(?:⚠️|⚠)\s*/, "")
+                     .downcase
+                     .gsub(/\s+/, " ")
+    "#{level} #{text}".strip
+  end
+
+  # Merge blocks that share a heading into one, in first-seen order.
+  def consolidate_blocks(blocks)
+    consolidated = []
+    heading_indices = {}
+
+    blocks.each do |block|
+      cleaned = block.strip
+      next if cleaned.empty?
+
+      heading_match = cleaned.lines.first.to_s.rstrip.match(/\A(####+\s+.+)/)
+      if heading_match
+        merge_heading_block(consolidated, heading_indices, cleaned, heading_match[1])
+      else
+        consolidated << cleaned
+      end
+    end
+
+    consolidated
+  end
+
+  def merge_heading_block(consolidated, heading_indices, cleaned, heading_line)
+    key = normalize_heading_key(heading_line)
+    if heading_indices.key?(key)
+      index = heading_indices[key]
+      tail = cleaned.lines.drop(1).join.gsub(/\A\n+/, "").rstrip
+      consolidated[index] = "#{consolidated[index].rstrip}\n#{tail}" unless tail.empty?
+    else
+      heading_indices[key] = consolidated.length
+      consolidated << cleaned
+    end
+  end
+
+  # Turn consolidated #### blocks into individual Entry structs, carrying the
+  # owning heading on each entry so they can be regrouped after de-duplication.
+  def entries_from_blocks(blocks)
+    blocks.flat_map { |block| block_to_entries(block) }
+  end
+
+  def section_entries(section)
+    return [] unless section
+
+    entries_from_blocks(consolidate_blocks(section_blocks(section[:body])))
+  end
+
+  def block_to_entries(block)
+    lines = block.lines
+    heading = lines.first.to_s.rstrip
+    return [] unless heading.match?(BLOCK_HEADING)
+
+    split_entries(lines.drop(1)).map do |text|
+      Entry.new(text:, pr_number: collect_pr_number(text), heading:)
+    end
+  end
+
+  # Group body lines into logical entries: a top-level "- " bullet starts a new
+  # entry; nested bullets and continuation lines belong to the current entry.
+  def split_entries(body_lines)
+    entries = []
+    current = nil
+
+    body_lines.each do |line|
+      stripped = line.rstrip
+      if stripped.start_with?("- ")
+        entries << current if current
+        current = stripped.dup
+      elsif current
+        current << "\n#{stripped}"
+      end
+    end
+
+    entries << current if current
+    entries.map(&:strip).reject(&:empty?)
+  end
+end
+# rubocop:enable Metrics/ClassLength
+
+exit ReleaseForwardPort.new(ARGV).run if $PROGRAM_NAME == __FILE__

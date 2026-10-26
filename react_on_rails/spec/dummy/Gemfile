@@ -1,0 +1,7 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+Dir.chdir(__dir__) { eval_gemfile "../../Gemfile.development_dependencies" }
+
+gem "react_on_rails", path: "../.."

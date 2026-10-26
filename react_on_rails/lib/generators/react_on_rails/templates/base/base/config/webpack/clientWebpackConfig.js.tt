@@ -1,0 +1,35 @@
+<%= add_documentation_reference(config[:message], "// https://github.com/shakacode/react-on-rails-demo-ssr-hmr/blob/master/config/webpack/clientWebpackConfig.js") %>
+
+const commonWebpackConfig = require('./commonWebpackConfig');
+<% if use_rsc? -%>
+const { config } = require('shakapacker');
+const { resolve } = require('path');
+const { <%= rsc_plugin_class_name %> } = require('<%= rsc_plugin_import_path %>');
+
+const rscClientReferences = {
+  directory: resolve(config.source_path),
+  recursive: true,
+  include: /\.(js|mjs|cjs|ts|mts|cts|jsx|tsx)$/,
+};
+<% end -%>
+
+const configureClient = () => {
+  const clientConfig = commonWebpackConfig();
+
+  // server-bundle is special and should ONLY be built by the serverConfig
+  // In case this entry is not deleted, a very strange "window" not found
+  // error shows referring to window["webpackJsonp"]. That is because the
+  // client config is going to try to load chunks.
+  delete clientConfig.entry['server-bundle'];
+
+<% if use_rsc? -%>
+  // Add React Server Components plugin for client bundle
+  clientConfig.plugins.push(
+    new <%= rsc_plugin_class_name %>({ isServer: false, clientReferences: rscClientReferences }),
+  );
+
+<% end -%>
+  return clientConfig;
+};
+
+module.exports = configureClient;

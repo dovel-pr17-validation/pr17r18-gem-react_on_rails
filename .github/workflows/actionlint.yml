@@ -1,0 +1,93 @@
+name: Lint GitHub Actions
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Targeted fetch below handles unreachable bases; ordinary runs stay shallow.
+          fetch-depth: 1
+          persist-credentials: false
+      # We only download and run Actionlint if there is any difference in GitHub Action workflows
+      # https://github.com/rhysd/actionlint/blob/main/docs/usage.md#on-github-actions
+      - name: Check GitHub Action changes
+        id: check-workflows
+        run: |
+          # For PRs, diff against base; for pushes, use before commit
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            DIFF_BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            DIFF_BASE="${{ github.event.before }}"
+          fi
+
+          # Handle manual runs or initial commits where the base is absent or all zeros.
+          if [ -z "$DIFF_BASE" ] || [[ "$DIFF_BASE" =~ ^0+$ ]]; then
+            DIFF_BASE="origin/main"
+          fi
+
+          if ! git cat-file -e "$DIFF_BASE^{commit}"; then
+            if [ "$DIFF_BASE" = "origin/main" ]; then
+              fetch_ref="main:refs/remotes/origin/main"
+            else
+              fetch_ref="$DIFF_BASE"
+            fi
+
+            if ! git fetch origin "$fetch_ref"; then
+              echo "::error::Unable to fetch workflow diff base $DIFF_BASE"
+              exit 1
+            fi
+          fi
+
+          if ! changed_files="$(git diff --name-only "$DIFF_BASE" ${{ github.sha }})"; then
+            echo "::error::Unable to diff workflow changes between $DIFF_BASE and ${{ github.sha }}"
+            exit 1
+          fi
+
+          if printf '%s\n' "$changed_files" | grep -q '^\.github/workflows/'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            # Pinned fallback used when the GitHub API call fails (rate limit / outage)
+            # so the cache key stays stable and the download step still has a version to pin to.
+            fallback_version="v1.7.7"
+            if response=$(curl -sf -H "Authorization: token ${{ github.token }}" https://api.github.com/repos/rhysd/actionlint/releases/latest); then
+              actionlint_version=$(echo "$response" | jq -r .tag_name)
+              if [ -z "$actionlint_version" ] || [ "$actionlint_version" = "null" ]; then
+                echo "::warning::Failed to parse Actionlint version; using pinned fallback $fallback_version"
+                actionlint_version="$fallback_version"
+              fi
+            else
+              echo "::warning::GitHub API unavailable; falling back to pinned actionlint $fallback_version. Consider updating this pin."
+              actionlint_version="$fallback_version"
+            fi
+            echo "actionlint_version=$actionlint_version" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Setup Actionlint
+        if: steps.check-workflows.outputs.changed == 'true'
+        uses: actions/cache@v4
+        id: cache-actionlint
+        with:
+          path: ./actionlint
+          key: ${{ runner.os }}-actionlint-${{ steps.check-workflows.outputs.actionlint_version }}
+      - name: Download Actionlint
+        if: steps.check-workflows.outputs.changed == 'true' && steps.cache-actionlint.outputs.cache-hit != 'true'
+        run: bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+      - name: Lint GitHub Actions
+        if: steps.check-workflows.outputs.changed == 'true'
+        run: |
+          echo "::add-matcher::.github/actionlint-matcher.json"
+          SHELLCHECK_OPTS="-S warning" ./actionlint -color
+        shell: bash

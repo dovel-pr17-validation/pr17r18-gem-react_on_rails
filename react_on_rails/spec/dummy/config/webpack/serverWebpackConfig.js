@@ -1,0 +1,138 @@
+const { config } = require('shakapacker');
+const commonWebpackConfig = require('./commonWebpackConfig');
+
+const usingRspack = config.assets_bundler === 'rspack';
+const bundler = usingRspack ? require('@rspack/core') : require('webpack');
+const { RspackManifestPlugin } = usingRspack ? require('rspack-manifest-plugin') : {};
+
+const isRspackClientOnlyPlugin = (plugin) =>
+  usingRspack &&
+  ((RspackManifestPlugin && plugin instanceof RspackManifestPlugin) ||
+    (bundler.CssExtractRspackPlugin && plugin instanceof bundler.CssExtractRspackPlugin));
+
+const configureServer = () => {
+  const serverWebpackConfig = commonWebpackConfig();
+
+  // We just want the single server bundle entry
+  const serverEntry = {
+    'server-bundle': serverWebpackConfig.entry['server-bundle'],
+  };
+
+  if (!serverEntry['server-bundle']) {
+    throw new Error(
+      "Create a pack named 'server-bundle' containing all the server rendering files, for example 'server-bundle.js' or 'server-bundle.ts'",
+    );
+  }
+
+  serverWebpackConfig.entry = serverEntry;
+
+  // Remove the mini-css-extract-plugin from the style loaders because
+  // the client build will handle exporting CSS.
+  // replace file-loader with null-loader
+  serverWebpackConfig.module.rules.forEach((loader) => {
+    if (loader.use && loader.use.filter) {
+      // eslint-disable-next-line no-param-reassign
+      loader.use = loader.use.filter((item) => {
+        let testValue = '';
+        if (typeof item === 'string') {
+          testValue = item;
+        } else if (item && typeof item.loader === 'string') {
+          testValue = item.loader;
+        }
+        return !(
+          testValue.includes('mini-css-extract-plugin') ||
+          testValue.includes('cssExtractLoader') // Rspack uses this path
+        );
+      });
+    }
+  });
+
+  // No splitting of chunks for a server bundle
+  serverWebpackConfig.optimization = {
+    minimize: false,
+  };
+  serverWebpackConfig.plugins.unshift(new bundler.optimize.LimitChunkCountPlugin({ maxChunks: 1 }));
+
+  // Custom output for the server-bundle that matches the config in
+  // config/initializers/react_on_rails.rb
+  serverWebpackConfig.output = {
+    filename: 'server-bundle.js',
+    globalObject: 'this',
+    // If using the React on Rails Pro node server renderer, uncomment the next line
+    // libraryTarget: 'commonjs2',
+    path: config.outputPath,
+    publicPath: config.publicPath,
+    // https://webpack.js.org/configuration/output/#outputglobalobject
+  };
+
+  // Don't hash the server bundle b/c would conflict with the client manifest
+  // And no need for the MiniCssExtractPlugin
+  serverWebpackConfig.plugins = serverWebpackConfig.plugins.filter(
+    (plugin) =>
+      !isRspackClientOnlyPlugin(plugin) &&
+      plugin.constructor.name !== 'WebpackAssetsManifest' &&
+      plugin.constructor.name !== 'MiniCssExtractPlugin' &&
+      plugin.constructor.name !== 'ForkTsCheckerWebpackPlugin',
+  );
+
+  // Configure loader rules for SSR
+  // Remove the mini-css-extract-plugin from the style loaders because
+  // the client build will handle exporting CSS.
+  // replace file-loader with null-loader
+  const { rules } = serverWebpackConfig.module;
+  rules.forEach((rule) => {
+    if (Array.isArray(rule.use)) {
+      // remove the mini-css-extract-plugin and style-loader
+      // eslint-disable-next-line no-param-reassign
+      rule.use = rule.use.filter((item) => {
+        let testValue = '';
+        if (typeof item === 'string') {
+          testValue = item;
+        } else if (item && typeof item.loader === 'string') {
+          testValue = item.loader;
+        }
+        return !(
+          testValue.includes('mini-css-extract-plugin') ||
+          testValue.includes('cssExtractLoader') || // Rspack uses this path
+          testValue === 'style-loader'
+        );
+      });
+      const cssLoader = rule.use.find((item) => {
+        let testValue = '';
+
+        if (typeof item === 'string') {
+          testValue = item;
+        } else if (item && typeof item.loader === 'string') {
+          testValue = item.loader;
+        }
+
+        return testValue.includes('css-loader');
+      });
+      if (cssLoader && cssLoader.options && cssLoader.options.modules) {
+        cssLoader.options.modules = {
+          ...(typeof cssLoader.options.modules === 'object' ? cssLoader.options.modules : {}),
+          exportOnlyLocals: true,
+        };
+      }
+
+      // Skip writing image files during SSR by setting emitFile to false
+    } else if (rule.use && (rule.use.loader === 'url-loader' || rule.use.loader === 'file-loader')) {
+      rule.use.options.emitFile = false; // eslint-disable-line no-param-reassign
+    }
+  });
+
+  // Avoid the webpack eval devtool, which triggers a webpack 5.106+ regression
+  // with ESM default exports (ReferenceError: __WEBPACK_DEFAULT_EXPORT__ is not defined).
+  // In development, cheap-module-source-map provides original line numbers in SSR error traces.
+  // In production, devtool is disabled to avoid generating .map files.
+  serverWebpackConfig.devtool = process.env.NODE_ENV === 'production' ? false : 'cheap-module-source-map';
+
+  // If using the default 'web', then libraries like Emotion and loadable-components
+  // break with SSR. The fix is to use a node renderer and change the target.
+  // If using the React on Rails Pro node server renderer, uncomment the next line
+  // serverWebpackConfig.target = 'node'
+
+  return serverWebpackConfig;
+};
+
+module.exports = configureServer;

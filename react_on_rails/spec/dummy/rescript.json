@@ -1,0 +1,18 @@
+{
+  "name": "react_on_rails",
+  "sources": [
+    {
+      "dir": "client/app/components",
+      "subdirs": true
+    }
+  ],
+  "jsx": { "version": 4 },
+  "suffix": ".res.js",
+  "package-specs": [
+    {
+      "module": "esmodule",
+      "in-source": true
+    }
+  ],
+  "bs-dependencies": ["@rescript/react"]
+}

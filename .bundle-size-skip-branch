@@ -1,0 +1,7 @@
+# Audited intentional growth for PR 5094 (react-on-rails-rsc 19.3.1-rc.0 soak):
+# Pro RSC client entries pull Flight 19.3 (`react-server-dom-webpack@19.3.0`) and exceed
+# the dynamic base+512 B budget vs the 19.2 baseline. Hosted CI on 86fff7bd6:
+# - registerServerComponent/client gzip/brotli ~6-12% over limit
+# - wrapServerComponentRenderer/client gzip/brotli ~7-13% over limit
+# OSS client bundles stayed at 0%. Clear this file after the soak merges.
+jg/rsc-19-3-1-rc0-candidate-pin

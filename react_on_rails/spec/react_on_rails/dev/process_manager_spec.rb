@@ -1,0 +1,405 @@
+# frozen_string_literal: true
+
+require_relative "../spec_helper"
+require "react_on_rails/dev/process_manager"
+
+RSpec.describe ReactOnRails::Dev::ProcessManager do
+  describe ".installed?" do
+    it "returns true when process is available in current context" do
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).and_yield
+      expect(described_class).to receive(:system)
+        .with("overmind", "--version", out: File::NULL, err: File::NULL).and_return(true)
+      expect(described_class).to be_installed("overmind")
+    end
+
+    it "returns false when process is not available in current context" do
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).and_raise(Errno::ENOENT)
+      expect(described_class.installed?("nonexistent")).to be false
+    end
+
+    it "returns false when all version flags fail" do
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).exactly(3).times.and_yield
+      expect(described_class).to receive(:system)
+        .with("failing_process", "--version", out: File::NULL, err: File::NULL).and_return(false)
+      expect(described_class).to receive(:system)
+        .with("failing_process", "-v", out: File::NULL, err: File::NULL).and_return(false)
+      expect(described_class).to receive(:system)
+        .with("failing_process", "-V", out: File::NULL, err: File::NULL).and_return(false)
+      expect(described_class.installed?("failing_process")).to be false
+    end
+
+    it "returns true when second version flag succeeds" do
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).twice.and_yield
+      expect(described_class).to receive(:system)
+        .with("foreman", "--version", out: File::NULL, err: File::NULL).and_return(false)
+      expect(described_class).to receive(:system)
+        .with("foreman", "-v", out: File::NULL, err: File::NULL).and_return(true)
+      expect(described_class.installed?("foreman")).to be true
+    end
+
+    it "returns false when version check times out" do
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).and_raise(Timeout::Error)
+      expect(described_class.installed?("hanging_process")).to be false
+    end
+  end
+
+  describe ".ensure_procfile" do
+    it "does nothing when Procfile exists" do
+      allow(File).to receive(:exist?).with("Procfile.dev").and_return(true)
+      expect { described_class.ensure_procfile("Procfile.dev") }.not_to raise_error
+    end
+
+    it "exits with error when Procfile does not exist" do
+      allow(File).to receive(:exist?).with("Procfile.dev").and_return(false)
+      expect(described_class).to receive(:exit).with(1)
+      described_class.ensure_procfile("Procfile.dev")
+    end
+  end
+
+  describe ".run_with_process_manager" do
+    before do
+      allow(ReactOnRails::Dev::FileManager).to receive(:cleanup_stale_files)
+      allow(described_class).to receive(:system).and_return(true)
+      allow(File).to receive(:readable?).and_return(true)
+    end
+
+    it "uses overmind when available" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(true)
+
+      described_class.run_with_process_manager("Procfile.dev")
+    end
+
+    it "uses foreman when overmind not available and foreman is available" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(nil)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(true)
+
+      described_class.run_with_process_manager("Procfile.dev")
+    end
+
+    it "exits silently when overmind is installed but exits with error (foreman not found)" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(false)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(nil)
+      expect(described_class).not_to receive(:show_process_manager_installation_help)
+      expect(described_class).to receive(:exit).with(1).and_raise(SystemExit)
+
+      expect { described_class.run_with_process_manager("Procfile.dev") }.to raise_error(SystemExit)
+    end
+
+    it "exits silently when overmind fails but foreman succeeds" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(false)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(true)
+      expect(described_class).not_to receive(:show_process_manager_installation_help)
+      expect(described_class).not_to receive(:exit)
+
+      described_class.run_with_process_manager("Procfile.dev")
+    end
+
+    it "exits silently when overmind fails and foreman also fails" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(false)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(false)
+      expect(described_class).not_to receive(:show_process_manager_installation_help)
+      expect(described_class).to receive(:exit).with(1).and_raise(SystemExit)
+
+      expect { described_class.run_with_process_manager("Procfile.dev") }.to raise_error(SystemExit)
+    end
+
+    it "exits silently when overmind not found but foreman exits with error" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(nil)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(false)
+      expect(described_class).not_to receive(:show_process_manager_installation_help)
+      expect(described_class).to receive(:exit).with(1).and_raise(SystemExit)
+
+      expect { described_class.run_with_process_manager("Procfile.dev") }.to raise_error(SystemExit)
+    end
+
+    it "exits with error when no process manager available" do
+      expect(described_class).to receive(:run_process_if_available)
+        .with("overmind", ["start", "-f", "Procfile.dev"]).and_return(nil)
+      expect(described_class).to receive(:run_process_if_available)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(nil)
+      expect(described_class).to receive(:show_process_manager_installation_help)
+      expect(described_class).to receive(:exit).with(1)
+
+      described_class.run_with_process_manager("Procfile.dev")
+    end
+
+    it "cleans up stale files before starting" do
+      allow(described_class).to receive(:run_process_if_available).and_return(true)
+      expect(ReactOnRails::Dev::FileManager).to receive(:cleanup_stale_files)
+
+      described_class.run_with_process_manager("Procfile.dev")
+    end
+  end
+
+  describe ".run_process_if_available" do
+    it "returns true and runs process when available in current context" do
+      allow(described_class).to receive(:installed?).with("foreman").and_return(true)
+      expect(described_class).to receive(:system).with("foreman", "start", "-f", "Procfile.dev").and_return(true)
+
+      result = described_class.send(:run_process_if_available, "foreman", ["start", "-f", "Procfile.dev"])
+      expect(result).to be true
+    end
+
+    it "returns true when interrupted while waiting on the process manager" do
+      allow(described_class).to receive(:installed?).with("foreman").and_return(true)
+      expect(described_class).to receive(:system).with("foreman", "start", "-f", "Procfile.dev").and_raise(Interrupt)
+
+      result = described_class.send(:run_process_if_available, "foreman", ["start", "-f", "Procfile.dev"])
+      expect(result).to be true
+    end
+
+    it "tries system context when not available in current context" do
+      allow(described_class).to receive(:installed?).with("foreman").and_return(false)
+      allow(described_class).to receive(:process_available_in_system?).with("foreman").and_return(true)
+      expect(described_class).to receive(:run_process_outside_bundle)
+        .with("foreman", ["start", "-f", "Procfile.dev"]).and_return(true)
+
+      result = described_class.send(:run_process_if_available, "foreman", ["start", "-f", "Procfile.dev"])
+      expect(result).to be true
+    end
+
+    it "returns nil when process not available anywhere" do
+      allow(described_class).to receive(:installed?).with("nonexistent").and_return(false)
+      allow(described_class).to receive(:process_available_in_system?).with("nonexistent").and_return(false)
+
+      result = described_class.send(:run_process_if_available, "nonexistent", ["start"])
+      expect(result).to be_nil
+    end
+  end
+
+  describe ".exec_process_if_available" do
+    it "exposes a public API that execs a process available in the current context" do
+      allow(described_class).to receive(:installed?).with("overmind").and_return(true)
+      expect(described_class).to receive(:exec).with("overmind", "quit", "-s", "/tmp/overmind.sock").and_return(true)
+
+      result = described_class.exec_process_if_available("overmind", ["quit", "-s", "/tmp/overmind.sock"])
+
+      expect(result).to be true
+    end
+
+    it "preserves runtime environment when execing outside Bundler" do
+      env_overrides = { "PORT" => "4321" }
+      allow(described_class).to receive(:installed?).with("overmind").and_return(false)
+      allow(described_class).to receive(:process_available_in_system?).with("overmind").and_return(true)
+      allow(described_class).to receive(:preserve_runtime_env_vars).and_return(env_overrides)
+      allow(described_class).to receive(:with_unbundled_context).and_yield
+      expect(described_class).to receive(:exec)
+        .with(env_overrides, "overmind", "kill", "-s", "/tmp/overmind.sock").and_return(true)
+
+      result = described_class.exec_process_if_available("overmind", ["kill", "-s", "/tmp/overmind.sock"])
+
+      expect(result).to be true
+    end
+  end
+
+  describe ".run_process_outside_bundle" do
+    it "uses with_unbundled_context when Bundler is available" do
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(described_class).to receive(:system)
+        .with(a_kind_of(Hash), "foreman", "start", "-f", "Procfile.dev")
+
+      described_class.send(:run_process_outside_bundle, "foreman", ["start", "-f", "Procfile.dev"])
+    end
+
+    it "preserves PORT and SHAKAPACKER_DEV_SERVER_PORT in env hash" do
+      allow(ENV).to receive(:fetch).and_call_original
+      allow(ENV).to receive(:fetch).with("PORT", nil).and_return("3001")
+      allow(ENV).to receive(:fetch).with("SHAKAPACKER_DEV_SERVER_PORT", nil).and_return("3036")
+      allow(ENV).to receive(:fetch).with("RENDERER_PORT", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("REACT_RENDERER_URL", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("RENDERER_URL", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("SHAKAPACKER_SKIP_PRECOMPILE_HOOK", nil).and_return(nil)
+
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(described_class).to receive(:system)
+        .with(
+          { "PORT" => "3001", "SHAKAPACKER_DEV_SERVER_PORT" => "3036",
+            "RENDERER_PORT" => nil, "REACT_RENDERER_URL" => nil,
+            "RENDERER_URL" => nil,
+            "SHAKAPACKER_SKIP_PRECOMPILE_HOOK" => nil },
+          "foreman", "start", "-f", "Procfile.dev"
+        )
+
+      described_class.send(:run_process_outside_bundle, "foreman", ["start", "-f", "Procfile.dev"])
+    end
+
+    it "passes nil for unset keys so with_unbundled_env cannot resurrect them in the child" do
+      allow(ENV).to receive(:fetch).and_call_original
+      allow(ENV).to receive(:fetch).with("PORT", nil).and_return("3001")
+      allow(ENV).to receive(:fetch).with("SHAKAPACKER_DEV_SERVER_PORT", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("RENDERER_PORT", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("REACT_RENDERER_URL", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("RENDERER_URL", nil).and_return(nil)
+      allow(ENV).to receive(:fetch).with("SHAKAPACKER_SKIP_PRECOMPILE_HOOK", nil).and_return(nil)
+
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(described_class).to receive(:system)
+        .with(
+          { "PORT" => "3001", "SHAKAPACKER_DEV_SERVER_PORT" => nil,
+            "RENDERER_PORT" => nil, "REACT_RENDERER_URL" => nil,
+            "RENDERER_URL" => nil,
+            "SHAKAPACKER_SKIP_PRECOMPILE_HOOK" => nil },
+          "foreman", "start", "-f", "Procfile.dev"
+        )
+
+      described_class.send(:run_process_outside_bundle, "foreman", ["start", "-f", "Procfile.dev"])
+    end
+
+    it "falls back to direct system call when Bundler is not available" do
+      hide_const("Bundler")
+      expect(described_class).to receive(:system).with("foreman", "start", "-f", "Procfile.dev")
+
+      described_class.send(:run_process_outside_bundle, "foreman", ["start", "-f", "Procfile.dev"])
+    end
+  end
+
+  describe ".process_available_in_system?" do
+    it "checks process availability outside bundle context with version flags" do
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).and_yield
+      expect(described_class).to receive(:system)
+        .with("foreman", "--version", out: File::NULL, err: File::NULL).and_return(true)
+
+      expect(described_class.send(:process_available_in_system?, "foreman")).to be true
+    end
+
+    it "returns false when Bundler is not available" do
+      hide_const("Bundler")
+
+      expect(described_class.send(:process_available_in_system?, "foreman")).to be false
+    end
+
+    it "tries multiple version flags before failing" do
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).twice.and_yield
+      expect(described_class).to receive(:system)
+        .with("foreman", "--version", out: File::NULL, err: File::NULL).and_return(false)
+      expect(described_class).to receive(:system)
+        .with("foreman", "-v", out: File::NULL, err: File::NULL).and_return(true)
+
+      expect(described_class.send(:process_available_in_system?, "foreman")).to be true
+    end
+
+    it "returns false when version check times out in system context" do
+      expect(described_class).to receive(:with_unbundled_context).and_yield
+      expect(Timeout).to receive(:timeout).with(described_class::VERSION_CHECK_TIMEOUT).and_raise(Timeout::Error)
+
+      expect(described_class.send(:process_available_in_system?, "hanging_process")).to be false
+    end
+  end
+
+  describe ".version_flags_for" do
+    it "returns specific flags for overmind" do
+      expect(described_class.send(:version_flags_for, "overmind")).to eq(["--version"])
+    end
+
+    it "returns multiple flags for foreman" do
+      expect(described_class.send(:version_flags_for, "foreman")).to eq(["--version", "-v"])
+    end
+
+    it "returns generic flags for unknown processes" do
+      expect(described_class.send(:version_flags_for, "unknown")).to eq(["--version", "-v", "-V"])
+    end
+  end
+
+  describe ".with_unbundled_context" do
+    it "uses with_unbundled_env when available" do
+      bundler_double = class_double(Bundler)
+      stub_const("Bundler", bundler_double)
+      allow(bundler_double).to receive(:respond_to?).with(:with_unbundled_env).and_return(true)
+      expect(bundler_double).to receive(:with_unbundled_env).and_yield
+
+      yielded = false
+      described_class.send(:with_unbundled_context) { yielded = true }
+      expect(yielded).to be true
+    end
+
+    it "falls back to with_clean_env when with_unbundled_env not available" do
+      bundler_double = class_double(Bundler)
+      stub_const("Bundler", bundler_double)
+      allow(bundler_double).to receive(:respond_to?).with(:with_unbundled_env).and_return(false)
+      allow(bundler_double).to receive(:respond_to?).with(:with_clean_env).and_return(true)
+      expect(bundler_double).to receive(:with_clean_env).and_yield
+
+      yielded = false
+      described_class.send(:with_unbundled_context) { yielded = true }
+      expect(yielded).to be true
+    end
+
+    it "yields directly when neither method is available" do
+      bundler_double = class_double(Bundler)
+      stub_const("Bundler", bundler_double)
+      allow(bundler_double).to receive(:respond_to?).with(:with_unbundled_env).and_return(false)
+      allow(bundler_double).to receive(:respond_to?).with(:with_clean_env).and_return(false)
+
+      yielded = false
+      described_class.send(:with_unbundled_context) { yielded = true }
+      expect(yielded).to be true
+    end
+  end
+
+  describe ".show_process_manager_installation_help" do
+    it "displays helpful error message with installation instructions" do
+      expect { described_class.send(:show_process_manager_installation_help) }
+        .to output(/ERROR: Process Manager Not Found/).to_stderr
+      expect { described_class.send(:show_process_manager_installation_help) }
+        .to output(/DO NOT add foreman to your Gemfile/).to_stderr
+      expect { described_class.send(:show_process_manager_installation_help) }
+        .to output(/Don't-Bundle-Foreman/).to_stderr
+    end
+  end
+
+  describe ".preserve_runtime_env_vars" do
+    around do |example|
+      saved = described_class::ENV_KEYS_TO_PRESERVE.to_h { |k| [k, ENV.fetch(k, nil)] }
+      described_class::ENV_KEYS_TO_PRESERVE.each { |k| ENV.delete(k) }
+      example.run
+    ensure
+      saved&.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+    end
+
+    it "returns nil for unset keys so the child shell clears them past with_unbundled_env" do
+      # This is the key invariant: a pre-Bundler invalid value (e.g.
+      # RENDERER_PORT=abc) that the parent deliberately deleted must not
+      # resurrect in the child via Bundler's env snapshot.
+      result = described_class.send(:preserve_runtime_env_vars)
+      described_class::ENV_KEYS_TO_PRESERVE.each do |key|
+        expect(result).to have_key(key)
+        expect(result[key]).to be_nil
+      end
+    end
+
+    it "forwards set keys to the child" do
+      ENV["PORT"] = "4200"
+      ENV["RENDERER_PORT"] = "3800"
+      ENV["SHAKAPACKER_SKIP_PRECOMPILE_HOOK"] = "true"
+      result = described_class.send(:preserve_runtime_env_vars)
+      expect(result["PORT"]).to eq("4200")
+      expect(result["RENDERER_PORT"]).to eq("3800")
+      expect(result["SHAKAPACKER_SKIP_PRECOMPILE_HOOK"]).to eq("true")
+    end
+
+    # Pro users mid-migration may still set the legacy RENDERER_URL alongside
+    # REACT_RENDERER_URL. apply_base_port_env rewrites both to the derived URL,
+    # so both must survive with_unbundled_env or foreman/overmind children will
+    # route SSR to the pre-Bundler (stale) renderer port.
+    it "forwards the legacy RENDERER_URL so mid-migration Pro users keep the derived URL" do
+      ENV["RENDERER_URL"] = "http://localhost:5002"
+      ENV["REACT_RENDERER_URL"] = "http://localhost:5002"
+      result = described_class.send(:preserve_runtime_env_vars)
+      expect(result["RENDERER_URL"]).to eq("http://localhost:5002")
+      expect(result["REACT_RENDERER_URL"]).to eq("http://localhost:5002")
+    end
+  end
+end

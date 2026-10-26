@@ -1,0 +1,3043 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "optparse"
+require "time"
+
+# Pipes and File.read inherit the default external encoding at creation time, so
+# this must run before any Open3 call or file read. Without it, a non-UTF-8
+# locale (e.g. LANG/LC_ALL unset) leaves GitHub's UTF-8 bytes tagged US-ASCII and
+# JSON.parse raises on the first multibyte sequence.
+Encoding.default_external = Encoding::UTF_8
+
+require_relative "pr_merge_ledger/closing_keyword_scanner"
+
+# rubocop:disable Metrics/ClassLength
+class PrMergeLedger
+  include ClosingKeywordScanner
+
+  SCHEMA_VERSION = "pr-merge-ledger/v1"
+  UNKNOWN = "UNKNOWN"
+  # Keep the schema URI on main until a versioned schema hosting policy exists.
+  SCHEMA_URI = "https://raw.githubusercontent.com/shakacode/react_on_rails/main/script/pr-merge-ledger.schema.json"
+  SCHEMA_PATH = File.expand_path("pr-merge-ledger.schema.json", __dir__)
+  CHANGELOG_CLASSIFICATIONS = %w[
+    changelog_present
+    changelog_missing
+    deferred_to_update_changelog
+    not_user_visible
+  ].freeze
+  CI_VERDICTS = %w[READY NOT_READY UNKNOWN].freeze
+  DISPOSITIONS = %w[fixed explicitly_waived follow_up_issue not_applicable].freeze
+  REVIEW_OBJECT_DECISION_STATES = %w[APPROVED CHANGES_REQUESTED].freeze
+  NON_BLOCKING_REVIEW_DECISION_STATES = %w[APPROVED NOT_REQUIRED].freeze
+  BLOCKING_REVIEW_DECISION_VIOLATIONS = {
+    "CHANGES_REQUESTED" => ["review_decision_changes_requested", "GitHub reviewDecision is CHANGES_REQUESTED"],
+    "REVIEW_REQUIRED" => ["review_decision_review_required", "GitHub reviewDecision is REVIEW_REQUIRED"]
+  }.freeze
+  UNKNOWN_VIOLATION_CODES = [
+    [/\Aci_readiness/, "unknown_ci_readiness"],
+    [/\Apr\.body_code_formatted_closing_keyword_scan/, "unknown_pr_body_closing_keyword_scan"],
+    [/\Apriority_finding_dispositions\.body_scan/, "unknown_priority_finding_body_scan"],
+    [/\Apriority_finding_dispositions/, "unknown_priority_finding_disposition"],
+    [/\Achangelog_classification/, "unknown_changelog_classification"],
+    [/\Alockfile_diff/, "unknown_lockfile_diff"],
+    [/\Areview_threads\.comments/, "unknown_review_thread_comments"],
+    [/\Apr\.head_sha/, "unknown_head_sha"],
+    # Missing and unsupported reviewDecision values share this gate code;
+    # unknown_fields[].message carries the precise diagnostic.
+    [/\Apr\.review_decision/, "unknown_review_decision"]
+  ].freeze
+  BLOCKING_REVIEW_DECISION_STATES = BLOCKING_REVIEW_DECISION_VIOLATIONS.keys.freeze
+  KNOWN_REVIEW_DECISION_STATES = (NON_BLOCKING_REVIEW_DECISION_STATES + BLOCKING_REVIEW_DECISION_STATES).freeze
+  INTERNAL_REVIEW_DECISION_RAW_KEY = "review_decision_raw"
+  INTERNAL_PULL_REQUEST_BODY_KEY = "body_text"
+  DEFAULT_BRANCH = "main"
+  HOSTED_CI_WORKFLOW_NAMES = [
+    "Lint JS and Ruby",
+    "JS unit tests for Renderer package",
+    "Rspec test for gem",
+    "Integration Tests",
+    "Assets Precompile Check",
+    "Generator tests",
+    "Playwright E2E Tests",
+    "React on Rails Pro - Integration Tests",
+    "React on Rails Pro - Package Tests"
+  ].freeze
+  HOSTED_CI_RUN_EVENTS = %w[workflow_dispatch pull_request].freeze
+  HOSTED_CI_START_COMMANDS = %w[+ci-run-hosted +ci-force-full].freeze
+  GITHUB_ACTIONS_ACTORS = %w[github-actions github-actions[bot]].freeze
+  DEPENDABOT_LOGINS = %w[dependabot dependabot[bot]].freeze
+  HOSTED_CI_COMMAND_AFTER_LABEL_ACTORS = DEPENDABOT_LOGINS
+  HOSTED_CI_AUTOMATION_ACTORS = (GITHUB_ACTIONS_ACTORS + HOSTED_CI_COMMAND_AFTER_LABEL_ACTORS).freeze
+  TRUSTED_HOSTED_CI_REQUEST_ASSOCIATIONS = %w[COLLABORATOR MEMBER OWNER].freeze
+  DEPENDABOT_HOSTED_CI_EXCLUSIONS = [
+    "React on Rails Pro - Integration Tests",
+    "React on Rails Pro - Package Tests"
+  ].freeze
+  HOSTED_CI_REQUEST_LABELS = %w[ready-for-hosted-ci force-full-hosted-ci].freeze
+  FINDING_REVIEW_STATES = %w[APPROVED CHANGES_REQUESTED COMMENTED].freeze
+  LOCKFILE_BASENAMES = %w[
+    Gemfile.lock
+    package-lock.json
+    pnpm-lock.yaml
+    yarn.lock
+    bun.lock
+    bun.lockb
+  ].freeze
+  DEFAULT_GITHUB_API_TIMEOUT_SECONDS = "30"
+  GITHUB_API_MAX_ATTEMPTS = 3
+  GITHUB_API_RETRY_BASE_DELAY_SECONDS = 0.25
+  MAX_GRAPHQL_PAGES = 500
+  GITHUB_REPO_NAME_PATTERN = /\A[A-Za-z0-9._-]+\z/
+  MAX_BODY_LINES = 1_000
+  MAX_DISPOSITION_REPLY_BODY_LENGTH = 16_384
+  MAX_EXCERPT_LENGTH = 180
+  LIST_MARKER_PATTERN = /(?:[-*]\s*(?:\[[ xX]\]\s*)?|\d+[.)]\s*)/
+  FINDING_LINE_PREFIX_PATTERN = /(?:#{LIST_MARKER_PATTERN.source})?(?:\#{1,6}\s+)?/
+  PRIORITY_MARKER_PATTERN = /MUST[- ]?FIX|\[?P[0-2]\]?/
+  STANDALONE_PRIORITY_MARKER_PATTERN = /
+    (?<![A-Za-z0-9])
+    (?:#{PRIORITY_MARKER_PATTERN.source})
+    (?![A-Za-z0-9])
+  /ix
+  FINDING_BADGE_PREFIX = %r{
+    \A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?
+    <sub><sub>!\[%<severity>s\s+Badge\]\([^)]+\)</sub></sub>
+    (?:\*\*)?(?:\s|:|-|$)
+  }ix
+  BADGE_FINDING_PATTERNS = %w[P0 P1 P2].to_h do |severity|
+    [
+      severity,
+      Regexp.new(format(FINDING_BADGE_PREFIX.source, severity:), Regexp::IGNORECASE | Regexp::EXTENDED)
+    ]
+  end.freeze
+  FINDING_PATTERNS = {
+    "MUST_FIX" => %r{\A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?MUST[- ]?FIX(?:\*\*)?(?:\s|:|-|/|$)}i,
+    "P0" => Regexp.union(
+      BADGE_FINDING_PATTERNS.fetch("P0"),
+      %r{\A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?\[?P0\]?(?:\*\*)?(?:\s|:|-|/|$)}i
+    ),
+    "P1" => Regexp.union(
+      BADGE_FINDING_PATTERNS.fetch("P1"),
+      %r{\A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?\[?P1\]?(?:\*\*)?(?:\s|:|-|/|$)}i
+    ),
+    "P2" => Regexp.union(
+      BADGE_FINDING_PATTERNS.fetch("P2"),
+      %r{\A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?\[?P2\]?(?:\*\*)?(?:\s|:|-|/|$)}i
+    )
+  }.freeze
+  FINDING_SUMMARY_PREFIX_PATTERN =
+    %r{\A\s*(?:#{FINDING_LINE_PREFIX_PATTERN.source})(?:\*\*)?(?:#{PRIORITY_MARKER_PATTERN.source})
+      (?:\s*/\s*(?:#{PRIORITY_MARKER_PATTERN.source}))*(?:\*\*)?(?:\s|:|-)+(?<summary>.*)\z}ix
+  FINDING_SUMMARY_SUBJECT_PATTERN = /\b(?:findings?|issues?|items?|main issue)\b/i
+  FINDING_SUMMARY_RESOLUTION_PATTERN = /
+    \bnone(?!\s+of\b)(?=\s*(?:$|[.;,)]|\b(?:open|remaining)\b)) |
+    \b(?:findings?|issues?|items?|main\s+issue)\b
+    (?:
+      \s*[:=-]\s* |
+      (?:\s+(?:were|was|are|is|has|have|been|got|now|already|previously))*\s+
+    )
+    (?:fixed|resolved|waived)
+    (?=\s*(?:$|[.;,)]|\bor\s+(?:fixed|resolved|waived)\b|
+      \b(?:by|in|with|via|from|after|before|on|because|through)\b)) |
+    \bno\s+(?:findings?|issues?|items?|main\s+issue)\b
+    (?=\s*(?:$|[.;,)]|\b(?:found|present|open|remaining|reported|detected)\b))
+  /ix
+  NEGATED_SUMMARY_RESOLUTION_PATTERN = Regexp.union(
+    /\bnot\s+(?:\S+\s+){0,3}?(?:fixed|resolved|waived)\b/i,
+    /\b(?:none|nothing)\s+(?:fixed|resolved|waived)\b/i,
+    /\bno\s+(?:\S+\s+){0,4}?(?:fixed|resolved|waived)\b/i
+  )
+  ADDITIONAL_SEVERITY_PATTERN = %r{
+    (?:(?<!\d)[.;,(:-]|(?<![A-Za-z0-9])/|\b(?:and|but|however|or|while|with)\b)\s*
+    (?:#{LIST_MARKER_PATTERN.source})?(?:\*\*)?(?<severity>MUST[- ]?FIX|\[?P[0-2]\]?)(?:\*\*)?
+    (?:\s|:|-|/|$)
+  }ix
+  SUMMARY_TRAILING_PRIORITY_PATTERN = %r{
+    \b(?:fixed|resolved|waived)\s+
+    (?:#{PRIORITY_MARKER_PATTERN.source})(?:\s|:|-|/|$)
+  }ix
+  FIXED_DISPOSITION_REPLY_PATTERN = /
+    \A\s*
+    (?:[*_]{1,2})?
+    (?:fixed|addressed)
+    (?:[*_]{1,2})?
+    \s+(?:in|by)
+    (?:[*_]{1,2})?
+    \s+\S
+  /ix
+  TRUSTED_DISPOSITION_REPLY_AUTHOR_ASSOCIATIONS = %w[COLLABORATOR MEMBER OWNER].freeze
+  BENIGN_REGRESSION_MODIFIER_PATTERN = /
+    any|more|other|functional|new|known|additional|observable|observed|reported|detected|found|introduced|
+    remaining|runtime|behavioral|user[- ]visible|ci|build|job|workflow|checks?|performance|visual|ui
+  /ix
+  BENIGN_REGRESSION_REPLY_PATTERN = /
+    \b(?:no|without)\s+(?:(?:#{BENIGN_REGRESSION_MODIFIER_PATTERN.source})\s+){0,4}regressions?\b|
+    \bnot\s+(?:an?\s+)?(?:(?:#{BENIGN_REGRESSION_MODIFIER_PATTERN.source})\s+){0,4}regressions?\b|
+    \bavoid(?:s|ed|ing)?\s+(?:(?:#{BENIGN_REGRESSION_MODIFIER_PATTERN.source})\s+){0,4}regressions?\b|
+    \bprevent(?:s|ed|ing)?\s+(?:(?:#{BENIGN_REGRESSION_MODIFIER_PATTERN.source})\s+){0,4}regressions?\b|
+    \bregression[- ]free\b|
+    \b(?:has|have|had|is|are|was|were)(?:\s+not|n't)\s+regressed\b|
+    \b(?:did|do|does)(?:\s+not|n't)\s+regress\b|
+    \bregression(?:s)?[-\s]+
+      (?:test|tests|testing|spec|specs|coverage|suite|suites|case|cases|ci|build|job|workflow|checks?)
+      (?:\s+\S+){0,4}\s+
+      \b(?:now|again|currently)?\s*(?:pass(?:es|ed|ing)?|green|succeed(?:s|ed|ing)?)\b|
+    \bregression(?:s)?[-\s]+
+      (?:test|tests|testing|spec|specs|coverage|suite|suites|case|cases|ci|build|job|workflow|checks?)
+      (?:\s+\S+){0,6}\s+
+      \b(?:fail(?:s|ed|ing)?|repro(?:s)?|reproduc(?:e[sd]?|ing)|occurs?|happens?)\s+
+      before\s+(?:the\s+)?fix\b|
+    \b(?:test|tests|spec|specs|case|coverage|ci|build|job|workflow|checks?)(?:\s+\S+){0,6}\s+
+      fail(?:s|ed|ing)?\s+
+      before\s+(?:the\s+)?fix\b|
+    \b(?:test|tests|spec|specs|case|coverage|ci|build|job|workflow|checks?)(?:\s+\S+){0,6}\s+
+      fail(?:s|ed|ing)?\s+
+      (?:\S+\s+){0,4}
+      \b(?:now|again|currently)?\s*(?:pass(?:es|ed|ing)?|green|succeed(?:s|ed|ing)?)\b
+  /ix
+  UNRELATED_FAILURE_REPLY_PATTERN = /
+    (?:
+      \b(?:unrelated|separate)\b
+      [\s\S]{0,120}
+      \b(?:ci|build|job|workflow|checks?)\b
+      [\s\S]{0,120}
+      \b(?:fail(?:s|ed|ing)?|broken|red)\b
+      [\s\S]{0,120}
+      \b(?:nothing\s+to\s+do\s+with|unrelated\s+to)\b
+      [\s\S]{0,80}
+      \b(?:this|the)\s+(?:thread|finding|change|patch|pr|pull[- ]?request)\b
+    )|
+    (?:
+      \b(?:ci|build|job|workflow|checks?)\b
+      [\s\S]{0,120}
+      \b(?:fail(?:s|ed|ing)?|broken|red)\b
+      [\s\S]{0,120}
+      \b(?:unrelated|separate)\b
+      [\s\S]{0,80}
+      \b(?:this|the)\s+(?:thread|finding|change|patch|pr|pull[- ]?request)\b
+    )
+  /ix
+  FAILURE_DISPOSITION_REPLY_SUBJECT_PATTERN = /
+    this|that|it|fix|change|patch|issue|tests?|specs?|suites?|cases?
+  /ix
+  FAILURE_STATUS_SUBJECT_PATTERN = /ci|build|job|workflow|checks?/ix
+  FAILURE_DISPOSITION_REPLY_VERB_PATTERN = /
+    fail(?:s|ed|ing)?|
+    break(?:s|ing)?|broke|broken|
+    red|
+    repro(?:s)?|reproduc(?:e[sd]?|ing)|
+    occurs?|happens?
+  /ix
+  FIXED_FAILURE_REFERENCE_REPLY_PATTERN = /
+    \b(?:this|that|it|fix|change|patch|issue)\b
+    (?!
+      (?:\s+\S+){0,4}\s+
+      \b(?:
+        not|never|cannot|can't|wont|won't|do(?:es)?(?:\s+not|n't)|did(?:\s+not|n't)|
+        (?:is|are|was|were|has|have|had)(?:\s+not|n't)
+      )\b
+    )
+    (?:\s+\S+){0,4}\s+
+    \b(?:fix(?:es|ed|ing)|address(?:es|ed|ing)?|resolve(?:s|d)?|resolving|cover(?:s|ed|ing)?)\b
+    (?:
+      \s+
+      (?!\b(?:and|or|nor|but|however|though|although|still|continues?|keeps?|remains?|regress(?:ed|ion)?|fails?)\b)
+      [^\s,.;:!?()]+
+    ){0,6}\s+
+    \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+  /ix
+  CONTRADICTED_DISPOSITION_REPLY_PATTERN = /
+    (?:
+      \b(?:
+        not|never|cannot|can't|wont|won't|do(?:es)?(?:\s+not|n't)|did(?:\s+not|n't)|
+        (?:is|are|was|were|has|have|had)(?:\s+not|n't)|no\s+longer
+      )\b
+      (?:\s+\S+){0,3}\s+
+      \b(?:fix(?:es|ed|ing)?|address(?:es|ed|ing)?|resolve(?:s|d)?|resolving|work(?:s|ed|ing)?|
+        pass(?:es|ed|ing)?|build(?:s|ing)?|built|compil(?:e|es|ed|ing))\b
+    )|
+    (?:
+      \b(?:still|remains?)\s+
+      (?:needs?\s+(?:to\s+be\s+|to\s+)?|requires?\s+)
+      \b(?:fix(?:es|ed|ing)?|address(?:es|ed|ing)?|resolve(?:s|d)?|resolving)\b
+    )|
+    (?:
+      \b(?:#{FAILURE_DISPOSITION_REPLY_SUBJECT_PATTERN.source})\b
+      (?:\s+\S+){0,6}\s+
+      (?:needs?\s+(?:to\s+be\s+|to\s+)?|requires?\s+)
+      \b(?:fix(?:es|ed|ing)?|address(?:es|ed|ing)?|resolve(?:s|d)?|resolving)\b
+    )|
+    (?:
+      \b(?:still|continues?\s+to|keeps?\s+|(?:is|are|was|were)\s+still|remains?)\s*
+      [\s\S]{0,80}
+      \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+    )|
+    (?:
+      \b(?:#{FAILURE_DISPOSITION_REPLY_SUBJECT_PATTERN.source})\b
+      (?:\s+\S+){0,6}\s+
+      \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+    )|
+    (?:
+      \b(?:#{FAILURE_STATUS_SUBJECT_PATTERN.source})\b
+      [\s\S]{0,80}
+      \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+    )|
+    (?:
+      (?:\A|[\r\n.!?]\s*)
+      \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+      (?:\s+(?:on|in|under|with)\s+\S+(?:\s+\S+){0,4})?
+      \s*(?:[.!?]|\z)
+    )|
+    \bregressed\b|
+    \bregression(?:s)?\b(?![-\s]+(?:test|tests|testing|spec|specs|coverage|suite|suites|case|cases)\b)|
+    \breopen\b
+  /ix
+  NEGATED_REOPEN_REPLY_PATTERN = /
+    \b(?:no\s+need\s+to|do(?:es)?(?:\s+not|n't)|did(?:\s+not|n't)|should(?:\s+not|n't)|never)\s+reopen\b|
+    \breopen(?:ing)?\s+(?:is\s+)?(?:not\s+needed|unnecessary)\b|
+    \b(?:can|could|may|might)\s+reopen\s+(?:this|the)\s+(?:thread|comment|review|discussion)\b
+  /ix
+  NEGATED_FOLLOW_UP_REPLY_PATTERN = /
+    \bno\s+(?:(?:further|additional|more|remaining|other)\s+)?follow[- ]?up
+      (?:\s+(?:issue|pr|pull[- ]?request|ticket|work))?
+      (?:\s+(?:is\s+)?(?:needed|required|necessary))?\b|
+    \bfollow[- ]?up(?:\s+(?:issue|pr|pull[- ]?request|ticket|work))?\s+(?:is\s+)?(?:not\s+needed|unnecessary)\b
+  /ix
+  FOLLOW_UP_DEFERRED_REPLY_PATTERN = /
+    \b(?:open(?:ed|ing)?|create(?:d|s|ing)?|file(?:d|s|ing)?|track(?:ed|s|ing)?)\s+
+    (?:(?:a|an|the)\s+)?
+    (?:(?:follow[- ]?up|tracking|separate|new|linked|related)\s+)?
+    (?:issue|pr|pull[- ]?request|ticket)\b|
+    \bfollow[- ]?up\s+(?:issue|pr|pull[- ]?request|ticket|work)\b|
+    \b(?:remaining|separate|later|next)\s+(?:\S+\s+){0,4}?follow[- ]?up\b
+  /ix
+  DEFERRED_DISPOSITION_REPLY_PATTERN = %r{
+    \A\s*
+    (?:[*_]{1,2})?
+    (?:fixed|addressed)
+    (?:[*_]{1,2})?
+    \s+
+    (?:in|by)\s+
+    (?:(?:a|an|the)\s+)?
+    (?:
+      (?:existing|follow[- ]?up|new|separate|tracking|linked|related|referenced|companion|associated|
+        corresponding|upstream)\s+
+    ){0,3}
+    (?:
+      (?:
+        (?:existing|follow[- ]?up|new|separate|tracking|linked|related|referenced|companion|associated|
+          corresponding|upstream)\s+
+      ){1,3}
+      (?:issue|pr|pull[- ]?request|ticket)\b|
+      (?:issue|pr|pull[- ]?request|ticket)\s+(?:\#\d+|\d+|[A-Z][A-Z0-9_-]*-\d+)\b|
+      (?:
+        (?:existing|follow[- ]?up|new|separate|tracking|linked|related|referenced|companion|associated|
+          corresponding|upstream)\s+
+      ){0,3}
+      (?:follow[- ]?up\b|\#\d+\b|https?://\S*/(?:issues|pull)/\d+\b|not[- ]?applicable\b|n/a\b|
+        separate\b|later\b|next\b|another\b)
+    )
+  }ix
+  HEDGED_FIXED_DISPOSITION_REPLY_PATTERN = /
+    \b(?:in\s+part|partial(?:ly)?|hacky|revisit(?:ed|ing)?)\b|
+    \b(?:for\s+now|temporar(?:y|ily)|stopgap)\b|
+    \b(?:i\s+(?:think|believe|hope)|hopefully|assuming|probably)\b|
+    \b(?:this|that|it|these|those)\s+should\s+(?:\S+\s+){0,2}(?:be|do\s+it|work|pass)\b|
+    \bshould\s+(?:be|do\s+it|work|pass)\b|
+    \b(?:not\s+(?:100%\s+)?sure|untested|unverified)\b|
+    \bnot\s+(?:yet\s+)?(?:been\s+)?(?:tested|verified|confirmed|validated)\b|
+    \b(?:haven't|have\s+not)(?:\s+\S+){0,5}\s+
+      (?:test(?:ed)?|verify|verified|confirm(?:ed)?|validate|validated)\b|
+    \bneeds?\s+to\s+(?:test|verify|confirm|validate)\b|
+    \b(?:needs?|requires?)\s+(?:a\s+)?(?:test(?:ing)?|verification|confirmation|validation)\b|
+    \bwill\s+(?:follow\s+up|test|verify|confirm|validate)\b|
+    \b(?:shortly|soon|in\s+a\s+bit|in\s+a\s+moment)\b|
+    \bfollow[- ]?up\s+(?:needed|required|separately|later|issue|pr|pull|ticket)\b|
+    \bthere\s+(?:is|are)\s+(?:a\s+)?follow[- ]?up\b|
+    \bneeds?\s+(?:a\s+)?(?:follow[- ]?up|revisit)\b|
+    \b(?:might|may)(?:\s+\S+){0,3}\s+need\b|
+    \bstill\s+needs?\b|
+    \bneeds?\s+(?:another|more)\s+(?:look|pass|review|work)\b|
+    \bnot\s+fully\b
+  /ix
+
+  class Error < StandardError; end
+
+  def self.github_api_timeout_seconds
+    timeout = Integer(ENV.fetch("PR_MERGE_LEDGER_GITHUB_API_TIMEOUT_SECONDS", DEFAULT_GITHUB_API_TIMEOUT_SECONDS), 10)
+    return timeout if timeout.positive?
+
+    raise Error, "PR_MERGE_LEDGER_GITHUB_API_TIMEOUT_SECONDS must be a positive integer (seconds)"
+  rescue ArgumentError
+    raise Error, "PR_MERGE_LEDGER_GITHUB_API_TIMEOUT_SECONDS must be an integer (seconds)"
+  end
+
+  def self.capture_command_with_timeout(args, timeout:, timeout_message:)
+    Open3.popen3(*args) do |stdin, stdout, stderr, wait_thread|
+      stdin.close
+      stdout_reader = Thread.new { read_stream(stdout) }
+      stderr_reader = Thread.new { read_stream(stderr) }
+
+      unless wait_thread.join(timeout)
+        terminate_process(wait_thread.pid, wait_thread)
+        close_io(stdout)
+        close_io(stderr)
+        stdout_reader.join(1)
+        stderr_reader.join(1)
+        raise Error, timeout_message
+      end
+
+      [stdout_reader.value, stderr_reader.value, wait_thread.value]
+    end
+  end
+
+  def self.terminate_process(pid, wait_thread)
+    Process.kill("TERM", pid)
+    return if wait_thread.join(1)
+
+    Process.kill("KILL", pid)
+    wait_thread.join(1)
+  rescue Errno::ESRCH
+    nil
+  end
+
+  def self.close_io(io)
+    io.close unless io.closed?
+  rescue IOError
+    nil
+  end
+
+  def self.read_stream(io)
+    io.read
+  rescue IOError
+    ""
+  end
+
+  def self.parse_ci_check_rows(raw)
+    rows = JSON.parse(raw.to_s)
+    rows.is_a?(Array) ? rows : []
+  rescue JSON::ParserError
+    []
+  end
+
+  def self.active_ci_check_rows(rows)
+    Array(rows).reject { |row| row.is_a?(Hash) && row["bucket"].to_s == "cancel" }
+  end
+
+  def self.cancelled_ci_check_rows(rows)
+    Array(rows).select { |row| row.is_a?(Hash) && row["bucket"].to_s == "cancel" }
+  end
+
+  def self.non_ready_ci_check_row?(row)
+    %w[cancel fail pending].include?(row["bucket"].to_s)
+  end
+
+  def self.ci_check_row_key(row)
+    name = row["name"].to_s
+    return name unless name.empty?
+
+    link = row["link"].to_s
+    link.empty? ? row.to_s : link
+  end
+
+  def self.ci_check_row_dedup_key(row)
+    # A check link identifies one physical run across full and hosted snapshots; names are only a fallback.
+    link = row["link"].to_s
+    link.empty? ? ci_check_row_key(row) : link
+  end
+
+  def self.required_ci_check_rows_complete?(required_rows, full_rows)
+    required_keys = Array(required_rows).map { |row| ci_check_row_key(row) }
+    return false if required_keys.empty?
+
+    return false unless missing_required_ci_check_keys(required_rows, full_rows).empty?
+
+    matching_full_rows = Array(full_rows).select { |row| required_keys.include?(ci_check_row_key(row)) }
+    matching_full_rows.none? { |row| non_ready_ci_check_row?(row) }
+  end
+
+  def self.select_ci_readiness_rows(full_rows:, hosted_ci_requested:, hosted_rows:, expected_hosted_workflows:)
+    if hosted_ci_requested
+      observed_workflows = Array(hosted_rows).filter_map do |row|
+        workflow = row["workflow"].to_s
+        workflow unless workflow.empty?
+      end
+      missing_workflows = Array(expected_hosted_workflows) - observed_workflows
+      unless missing_workflows.empty?
+        return {
+          rows: [],
+          required_used: false,
+          message: "hosted CI requested but current-head workflow runs are missing: #{missing_workflows.join(', ')}"
+        }
+      end
+
+      unexecuted_workflows = unexecuted_hosted_workflows(hosted_rows, expected_hosted_workflows)
+      unless unexecuted_workflows.empty?
+        return {
+          rows: [],
+          required_used: false,
+          message: "hosted CI workflows have no executed rows: #{unexecuted_workflows.join(', ')}"
+        }
+      end
+
+      rows_by_key = {}
+      (Array(full_rows) + Array(hosted_rows)).each do |row|
+        rows_by_key[ci_check_row_dedup_key(row)] = row
+      end
+      rows = rows_by_key.values
+      return {
+        rows:,
+        required_used: false,
+        message: "hosted CI requested; using selected current-head hosted checks"
+      }
+    end
+
+    {
+      rows: full_rows,
+      required_used: false,
+      message: nil
+    }
+  end
+
+  def self.unexecuted_hosted_workflows(hosted_rows, expected_hosted_workflows)
+    rows_by_workflow = Array(hosted_rows).group_by { |row| row["workflow"] }
+    Array(expected_hosted_workflows).select do |workflow|
+      workflow_rows = rows_by_workflow.fetch(workflow, [])
+      workflow_rows.any? && workflow_rows.all? { |row| row["bucket"].to_s == "skipping" }
+    end
+  end
+
+  def self.missing_required_ci_check_keys(required_rows, full_rows)
+    required_keys = Array(required_rows).map { |row| ci_check_row_key(row) }
+    full_keys = Array(full_rows).map { |row| ci_check_row_key(row) }
+    required_keys - full_keys
+  end
+
+  def self.normalize_ci_check_row(row)
+    case row
+    when Hash
+      {
+        "name" => row["name"].to_s,
+        "state" => row["state"],
+        "bucket" => row["bucket"],
+        "link" => row["link"]
+      }.compact
+    else
+      { "name" => row.to_s }
+    end
+  end
+
+  def self.hosted_ci_check_bucket(status, conclusion)
+    return "pending" unless status.to_s == "COMPLETED"
+
+    case conclusion.to_s
+    when "SUCCESS", "NEUTRAL"
+      "pass"
+    when "SKIPPED"
+      "skipping"
+    when "CANCELLED"
+      "cancel"
+    when "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"
+      "fail"
+    else
+      "pending"
+    end
+  end
+
+  def self.hosted_ci_run_event?(event, allow_pull_request:)
+    return false unless HOSTED_CI_RUN_EVENTS.include?(event.to_s)
+
+    allow_pull_request || event.to_s == "workflow_dispatch"
+  end
+
+  def self.allow_pull_request_hosted_ci?(metadata)
+    metadata["isCrossRepository"] == false && !DEPENDABOT_LOGINS.include?(metadata.dig("author", "login"))
+  end
+
+  def self.hosted_ci_request_not_before(active_labels:, label_events:, comments:, head_committed_at:,
+                                        trusted_label_actors:, trusted_command_actor:)
+    request_labels = Array(active_labels) & HOSTED_CI_REQUEST_LABELS
+    raise Error, "hosted CI request labels are missing" if request_labels.empty?
+
+    latest_events = latest_hosted_ci_label_events(request_labels, label_events)
+    request_times = latest_events.map do |label, event|
+      hosted_ci_label_request_time(
+        label,
+        event,
+        label_events,
+        comments,
+        trusted_label_actors:,
+        trusted_command_actor:
+      )
+    end
+
+    ([parse_hosted_ci_time(head_committed_at, "current-head commit")] + request_times).max
+  end
+
+  def self.latest_hosted_ci_label_events(active_labels, label_events)
+    Array(active_labels).to_h do |label|
+      matching_events = Array(label_events).select { |event| event.dig("label", "name") == label }
+      raise Error, "active hosted CI label #{label} has no timeline event" if matching_events.empty?
+
+      events_with_times = matching_events.map do |event|
+        [event, parse_hosted_ci_time(event["createdAt"], "hosted CI label event")]
+      end
+      latest_time = events_with_times.map(&:last).max
+      latest_events = events_with_times.select { |_event, event_time| event_time == latest_time }
+      raise Error, "active hosted CI label #{label} has ambiguous latest timeline events" if latest_events.length > 1
+
+      [label, latest_events.first.first]
+    end
+  end
+
+  def self.select_hosted_ci_suites(suites, expected_workflows:, allow_pull_request:, not_before:)
+    threshold = not_before.is_a?(Time) ? not_before : parse_hosted_ci_time(not_before, "hosted CI request threshold")
+    selected_suites = Array(suites).select do |suite|
+      hosted_ci_suite_eligible?(suite, expected_workflows, allow_pull_request:, threshold:)
+    end
+    suites_by_workflow = selected_suites.group_by { |suite| suite.dig("workflowRun", "workflow", "name") }
+    suites_by_workflow.values.map { |workflow_suites| latest_hosted_ci_suite(workflow_suites) }
+  end
+
+  def self.latest_hosted_ci_suite(workflow_suites)
+    suites_with_times = workflow_suites.map do |suite|
+      created_at = parse_hosted_ci_time(suite.dig("workflowRun", "createdAt"), "hosted CI workflow run")
+      [suite, created_at]
+    end
+    latest_time = suites_with_times.map(&:last).max
+    latest_suites = suites_with_times.select { |_suite, created_at| created_at == latest_time }
+    if latest_suites.length > 1
+      workflow = latest_suites.first.first.dig("workflowRun", "workflow", "name")
+      raise Error, "ambiguous latest workflow runs for #{workflow}"
+    end
+
+    latest_suites.first.first
+  end
+
+  def self.parse_hosted_ci_time(value, context)
+    Time.iso8601(value.to_s)
+  rescue ArgumentError
+    raise Error, "#{context} has invalid timestamp #{value.inspect}"
+  end
+
+  def self.hosted_ci_label_request_time(label, event, label_events, comments, trusted_label_actors:,
+                                        trusted_command_actor:)
+    unless event["__typename"] == "LabeledEvent"
+      raise Error, "active hosted CI label #{label} has no labeled-event lineage"
+    end
+
+    label_time = parse_hosted_ci_time(event["createdAt"], "hosted CI label #{label}")
+    actor = event.dig("actor", "login").to_s
+    if GITHUB_ACTIONS_ACTORS.include?(actor)
+      return trusted_hosted_ci_command_time(label, label_events, comments, label_time, trusted_command_actor:)
+    end
+    if HOSTED_CI_COMMAND_AFTER_LABEL_ACTORS.include?(actor)
+      return trusted_hosted_ci_command_after_label_time(label, comments, label_time, trusted_command_actor:)
+    end
+
+    unless Array(trusted_label_actors).include?(actor)
+      raise Error, "untrusted hosted CI label actor #{actor.empty? ? '(missing)' : actor}"
+    end
+
+    label_time
+  end
+
+  def self.trusted_hosted_ci_command_time(label, label_events, comments, label_time, trusted_command_actor:)
+    epoch_start = hosted_ci_label_epoch_start(label, label_events, before: label_time)
+    command = latest_trusted_hosted_ci_command(
+      comments,
+      label:,
+      after: epoch_start,
+      before: label_time,
+      trusted_command_actor:
+    )
+    required_command = label == "force-full-hosted-ci" ? "+ci-force-full" : "hosted CI start"
+    raise Error, "hosted CI label #{label} has no trusted #{required_command} command lineage" unless command
+
+    parse_hosted_ci_time(command["createdAt"], "hosted CI command for #{label}")
+  end
+
+  def self.trusted_hosted_ci_command_after_label_time(label, comments, label_time, trusted_command_actor:)
+    command = latest_trusted_hosted_ci_command(
+      comments,
+      label:,
+      after: label_time,
+      before: nil,
+      trusted_command_actor:
+    )
+    required_command = label == "force-full-hosted-ci" ? "+ci-force-full" : "hosted CI start"
+    raise Error, "hosted CI label #{label} has no later trusted #{required_command} command lineage" unless command
+
+    parse_hosted_ci_time(command["createdAt"], "hosted CI command for #{label}")
+  end
+
+  def self.hosted_ci_label_epoch_start(label, label_events, before:)
+    Array(label_events).filter_map do |event|
+      next unless event["__typename"] == "UnlabeledEvent"
+      next unless event.dig("label", "name") == label
+
+      event_time = parse_hosted_ci_time(event["createdAt"], "hosted CI unlabel event")
+      event_time if event_time <= before
+    end.max
+  end
+
+  def self.hosted_ci_suite_eligible?(suite, expected_workflows, allow_pull_request:, threshold:)
+    workflow_run = suite["workflowRun"]
+    return false unless workflow_run
+    return false unless hosted_ci_run_event?(workflow_run["event"], allow_pull_request:)
+    return false unless expected_workflows.include?(workflow_run.dig("workflow", "name"))
+
+    parse_hosted_ci_time(workflow_run["createdAt"], "hosted CI workflow run") > threshold
+  end
+
+  def self.latest_trusted_hosted_ci_command(comments, label:, after:, before:, trusted_command_actor:)
+    allowed_commands = label == "force-full-hosted-ci" ? ["+ci-force-full"] : HOSTED_CI_START_COMMANDS
+    Array(comments).filter_map do |comment|
+      trusted_hosted_ci_command_candidate(comment, allowed_commands, after:, before:, trusted_command_actor:)
+    end.max_by(&:last)&.first
+  end
+
+  def self.trusted_hosted_ci_command_candidate(comment, allowed_commands, after:, before:, trusted_command_actor:)
+    association = comment["authorAssociation"].to_s
+    return unless TRUSTED_HOSTED_CI_REQUEST_ASSOCIATIONS.include?(association)
+    return unless allowed_commands.include?(hosted_ci_start_command(comment["body"]))
+
+    created_at = parse_hosted_ci_time(comment["createdAt"], "hosted CI command")
+    return if after && created_at <= after
+    return if before && created_at > before
+
+    return unless trusted_hosted_ci_command_actor?(comment, trusted_command_actor)
+
+    [comment, created_at]
+  end
+
+  def self.trusted_hosted_ci_command_actor?(comment, trusted_command_actor)
+    actor = comment.dig("author", "login").to_s
+    !actor.empty? && trusted_command_actor.call(actor)
+  end
+
+  def self.hosted_ci_start_command(body)
+    command_text = body.to_s
+                       .gsub(/```.*?```/m, "")
+                       .gsub(/~~~.*?~~~/m, "")
+                       .lines
+                       .grep_v(/^\s*>/)
+                       .join
+    command = command_text.match(/(?:\A|\n)\s*(\+ci-[a-z0-9][a-z0-9-]*)(?:[ \t]+[^\n]*)?/i)
+                          &.captures&.first&.downcase
+    command if HOSTED_CI_START_COMMANDS.include?(command)
+  end
+
+  def self.ci_readiness_from_check_rows(pr_number, required_used:, rows:, message: nil)
+    checks = Array(rows).map { |row| normalize_ci_check_row(row) }
+    active_checks = active_ci_check_rows(checks)
+    cancelled_checks = cancelled_ci_check_rows(checks)
+    failing = active_checks.select { |row| row["bucket"].to_s == "fail" }
+    pending = active_checks.select { |row| row["bucket"].to_s == "pending" }
+    pending += cancelled_checks unless active_checks.empty?
+    verdict = ci_verdict_for(checks, failing, pending)
+    status = ci_status_for(verdict)
+
+    {
+      "pr" => pr_number.to_i,
+      "status" => status,
+      "verdict" => verdict,
+      "required_used" => required_used == true,
+      "failing" => failing,
+      "pending" => pending,
+      "checks" => checks,
+      "message" => message || ci_unknown_message(status)
+    }.compact
+  end
+
+  def self.ci_verdict_for(checks, failing, pending)
+    active_checks = active_ci_check_rows(checks)
+    return UNKNOWN if active_checks.empty?
+    return "READY" if failing.empty? && pending.empty?
+
+    "NOT_READY"
+  end
+
+  def self.ci_status_for(verdict)
+    verdict == UNKNOWN ? UNKNOWN : "known"
+  end
+
+  def self.ci_unknown_message(status)
+    status == UNKNOWN ? "no active current-head non-cancelled check rows were returned" : nil
+  end
+
+  def self.run(argv)
+    new(argv).run
+  end
+
+  def initialize(argv)
+    @argv = argv.dup
+    @options = {
+      changelog_classification: UNKNOWN,
+      pretty: false,
+      strict: false
+    }
+  end
+
+  def run
+    parse_options
+
+    if @options[:schema]
+      puts File.read(SCHEMA_PATH)
+      return 0
+    end
+
+    report = build_report
+    write_report(report)
+
+    return 0 unless @options[:strict] && !report.fetch("complete_allowed")
+
+    warn "ledger violations: #{report.fetch('violations').length}; " \
+         "unknown fields: #{report.fetch('unknown_fields').length}"
+    1
+  rescue Error, JSON::ParserError, Errno::ENOENT, Errno::EACCES, KeyError => e
+    warn "pr-merge-ledger: #{e.message}"
+    2
+  end
+
+  private
+
+  def parse_options
+    build_option_parser.parse!(@argv)
+    validate_options
+  rescue OptionParser::InvalidOption, OptionParser::InvalidArgument => e
+    raise Error, e.message
+  end
+
+  def validate_options
+    if @options[:fixture] && !@argv.empty?
+      raise Error, "PR number args (#{@argv.join(', ')}) are ignored when --fixture is given; " \
+                   "remove them or omit --fixture"
+    end
+
+    if @argv.length > 1 && @options[:changelog_classification_provided]
+      raise Error,
+            "--changelog-classification applies to one PR at a time; run multi-PR ledgers separately"
+    end
+
+    return unless @options[:strict] && @argv.length > 1
+
+    raise Error, "--strict with multiple PRs requires separate per-PR runs with explicit " \
+                 "--changelog-classification"
+  end
+
+  def build_option_parser
+    OptionParser.new do |opts|
+      opts.banner = "Usage: script/pr-merge-ledger [PR ...] [options]"
+      opts.on("--repo OWNER/REPO", "GitHub repository. Defaults to gh repo view.") do |repo|
+        @options[:repo] = repo
+      end
+      opts.on("--fixture PATH", "Read one normalized fixture instead of live GitHub state.") do |path|
+        @options[:fixture] = path
+      end
+      opts.on("--schema", "Print the fixed JSON schema and exit.") do
+        @options[:schema] = true
+      end
+      opts.on("--strict", "Exit non-zero when violations or UNKNOWN fields block closeout.") do
+        @options[:strict] = true
+      end
+      opts.on("--pretty", "Pretty-print JSON output.") do
+        @options[:pretty] = true
+      end
+      add_finding_dispositions_option(opts)
+      opts.on("--changelog-classification CLASS", CHANGELOG_CLASSIFICATIONS) do |classification|
+        @options[:changelog_classification] = classification
+        @options[:changelog_classification_provided] = true
+      end
+      add_help_option(opts)
+    end
+  end
+
+  def add_finding_dispositions_option(opts)
+    opts.on("--finding-dispositions FILE", "JSON map from finding URL/id, URL#L<line>, or URL#L<line>:<n>.") do |path|
+      @options[:finding_dispositions] = path
+    end
+    opts.separator "    Top-level PR comments have no head SHA; priority findings in those comments " \
+                   "require dispositions."
+    opts.separator "    Resolved review-thread replies beginning with \"Fixed in ...\" or " \
+                   "\"Addressed by ...\" can satisfy single priority finding dispositions."
+  end
+
+  def add_help_option(opts)
+    opts.on("-h", "--help", "Show this help.") do
+      puts opts
+      exit 0
+    end
+  end
+
+  def build_report
+    datasets = @options[:fixture] ? [load_fixture(@options[:fixture])] : fetch_live_pull_requests
+    dispositions = load_dispositions(@options[:finding_dispositions])
+    enforce_unused_dispositions = datasets.length == 1
+    ledgers = datasets.map do |dataset|
+      ledger_for(dataset, dispositions, enforce_unused_dispositions:)
+    end
+
+    violations = ledgers.flat_map { |ledger| ledger.fetch("violations") }
+    unknown_fields = ledgers.flat_map { |ledger| ledger.fetch("unknown_fields") }
+
+    {
+      "$schema" => SCHEMA_URI,
+      "schema_version" => SCHEMA_VERSION,
+      "generated_at" => Time.now.utc.iso8601,
+      "repository" => datasets.first.fetch("repository"),
+      "source" => source_summary,
+      "pull_requests" => ledgers,
+      "violations" => violations,
+      "unknown_fields" => unknown_fields,
+      "complete_allowed" => violations.empty?
+    }
+  end
+
+  def fetch_live_pull_requests
+    raise Error, "provide at least one PR number or --fixture" if @argv.empty?
+
+    repo = @options[:repo] || detect_repo
+    @options[:repo] = repo
+    owner, name = repo.split("/", 2)
+    unless owner.to_s.match?(GITHUB_REPO_NAME_PATTERN) && name.to_s.match?(GITHUB_REPO_NAME_PATTERN)
+      raise Error, "repo must look like OWNER/REPO: #{repo.inspect}"
+    end
+
+    collector = GitHubCollector.new(owner, name)
+    @argv.map do |pr_number|
+      begin
+        pr_int = Integer(pr_number, 10)
+        raise ArgumentError unless pr_int.positive?
+      rescue ArgumentError
+        raise Error, "PR number must be a positive integer: #{pr_number.inspect}"
+      end
+
+      collector.fetch(pr_int).merge("repository" => repo)
+    end
+  end
+
+  def detect_repo
+    timeout = self.class.github_api_timeout_seconds
+    stdout, stderr, status = self.class.capture_command_with_timeout(
+      ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+      timeout:,
+      timeout_message: "gh repo view timed out after #{timeout} seconds"
+    )
+    raise Error, "could not detect gh repo: #{stderr.strip}" unless status.success?
+
+    stdout.strip
+  end
+
+  def load_fixture(path)
+    JSON.parse(File.read(path)).tap do |dataset|
+      raise Error, "fixture must be a JSON object" unless dataset.is_a?(Hash)
+      raise Error, "fixture is missing repository" unless dataset["repository"]
+      raise Error, "fixture is missing pull_request" unless dataset["pull_request"]
+    end
+  end
+
+  def load_dispositions(path)
+    return {} unless path
+
+    JSON.parse(File.read(path)).tap do |dispositions|
+      raise Error, "--finding-dispositions must contain a JSON object" unless dispositions.is_a?(Hash)
+    end
+  end
+
+  def source_summary
+    if @options[:fixture]
+      { "mode" => "fixture", "path" => fixture_source_path(@options[:fixture]) }
+    else
+      { "mode" => "live_github", "repo" => @options[:repo], "prs" => @argv.map(&:to_i) }
+    end
+  end
+
+  def fixture_source_path(path)
+    expanded_path = File.expand_path(path)
+    repo_prefix = "#{File.expand_path(Dir.pwd)}/"
+
+    return expanded_path.delete_prefix(repo_prefix) if expanded_path.start_with?(repo_prefix)
+
+    File.basename(path)
+  end
+
+  # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
+  def ledger_for(dataset, dispositions, enforce_unused_dispositions: true)
+    pull_request = normalize_pull_request(dataset.fetch("pull_request"))
+    files = file_paths(dataset)
+    review_threads = normalized_review_threads(dataset, pull_request)
+    reviews = normalized_reviews(dataset, pull_request)
+    issue_comments = normalized_issue_comments(dataset)
+    ci_readiness = normalized_ci_readiness(dataset, pull_request)
+
+    unresolved_threads = review_threads.select { |thread| unresolved_current_head_thread?(thread) }
+    output_reviews = reviews.map { |review| review.except("body_text") }
+    output_issue_comments = issue_comments.map { |comment| comment.except("body") }
+    latest_reviews = latest_reviews_by_reviewer(output_reviews)
+    all_changes_requested = output_reviews.select { |review| review.fetch("state") == "CHANGES_REQUESTED" }
+    changes_requested = current_changes_requested(output_reviews)
+    finding_report = finding_dispositions(review_threads, reviews, issue_comments, dispositions,
+                                          enforce_unused_dispositions:)
+    changelog = changelog_classification
+    lockfile = lockfile_diff(files)
+
+    ledger = {
+      "pr" => pull_request.except(INTERNAL_REVIEW_DECISION_RAW_KEY, INTERNAL_PULL_REQUEST_BODY_KEY),
+      "unresolved_current_head_review_threads" => {
+        "status" => "known",
+        "count" => unresolved_threads.length,
+        "threads" => unresolved_threads
+      },
+      "review_objects" => {
+        "status" => "known",
+        "review_decision" => pull_request.fetch("review_decision"),
+        "latest_by_reviewer" => latest_reviews,
+        "changes_requested" => changes_requested,
+        "all_changes_requested" => all_changes_requested
+      },
+      "issue_comments" => output_issue_comments,
+      "ci_readiness" => ci_readiness,
+      "priority_finding_dispositions" => finding_report,
+      "changelog_classification" => changelog,
+      "lockfile_diff" => lockfile
+    }
+
+    gate_context = {
+      review_threads:,
+      finding_report:,
+      ci_readiness:,
+      changelog:,
+      lockfile:,
+      unresolved_threads:,
+      changes_requested:,
+      unknown_fields: nil
+    }
+    unknown_fields = unknown_fields_for(pull_request, gate_context)
+    gate_context[:unknown_fields] = unknown_fields
+    violations = violations_for(pull_request, gate_context)
+    ledger.merge(
+      "violations" => violations,
+      "unknown_fields" => unknown_fields,
+      "complete_allowed" => violations.empty?
+    )
+  end
+  # rubocop:enable Metrics/AbcSize, Metrics/MethodLength
+
+  def file_paths(dataset)
+    return nil unless dataset.key?("files") && !dataset["files"].nil?
+
+    Array(dataset["files"]).map { |file| file.is_a?(Hash) ? file.fetch("path") : file }
+  end
+
+  def normalized_review_threads(dataset, pull_request)
+    Array(dataset["review_threads"]).map { |thread| normalize_review_thread(thread, pull_request) }
+  end
+
+  def normalized_reviews(dataset, pull_request)
+    Array(dataset["reviews"]).map { |review| normalize_review(review, pull_request) }
+  end
+
+  def normalized_issue_comments(dataset)
+    Array(dataset["comments"]).map { |comment| normalize_issue_comment(comment) }
+  end
+
+  def normalized_ci_readiness(dataset, pull_request)
+    return normalize_ci_readiness(dataset.fetch("ci_readiness"), pull_request) if dataset.key?("ci_readiness")
+
+    if dataset.key?("checks")
+      return self.class.ci_readiness_from_check_rows(
+        pull_request.fetch("number"),
+        required_used: dataset["required_checks_used"],
+        rows: dataset.fetch("checks")
+      )
+    end
+
+    self.class.ci_readiness_from_check_rows(
+      pull_request.fetch("number"),
+      required_used: false,
+      rows: [],
+      message: "fixture is missing ci_readiness"
+    )
+  end
+
+  def normalize_pull_request(raw_pr)
+    {
+      "number" => raw_pr.fetch("number"),
+      "title" => raw_pr["title"],
+      "url" => raw_pr["url"],
+      "state" => raw_pr["state"],
+      "is_draft" => raw_pr["isDraft"],
+      "base_ref" => raw_pr["baseRefName"],
+      "head_ref" => raw_pr["headRefName"],
+      "head_sha" => blank_to_unknown(raw_pr["headRefOid"]),
+      "merged_at" => raw_pr["mergedAt"],
+      # Internal-only diagnostic source for unknown_fields; stripped before output.
+      INTERNAL_REVIEW_DECISION_RAW_KEY => raw_review_decision(raw_pr),
+      # Internal-only body scan input; stripped before output so reports do not duplicate PR prose.
+      INTERNAL_PULL_REQUEST_BODY_KEY => raw_pr["body"].to_s,
+      "review_decision" => normalize_review_decision(raw_pr)
+    }
+  end
+
+  def blank_to_unknown(value)
+    value.nil? || value.to_s.empty? ? UNKNOWN : value
+  end
+
+  def raw_review_decision(raw_pr)
+    # A present blank value is UNKNOWN here only for unsupported-value diagnostics;
+    # normalize_review_decision maps it to the known NOT_REQUIRED state, so
+    # pull_request_unknown_fields never reads this raw key for blank inputs.
+    return UNKNOWN unless raw_pr.key?("reviewDecision")
+
+    blank_to_unknown(raw_pr["reviewDecision"])
+  end
+
+  def normalize_review_decision(raw_pr)
+    return UNKNOWN unless raw_pr.key?("reviewDecision")
+
+    decision = raw_pr["reviewDecision"]
+    return "NOT_REQUIRED" if decision.nil? || decision.to_s.empty?
+
+    KNOWN_REVIEW_DECISION_STATES.include?(decision) ? decision : UNKNOWN
+  end
+
+  def normalize_review_thread(thread, pull_request)
+    comments, comments_complete = review_thread_comments(thread)
+    normalized_comments = comments.map { |comment| normalize_thread_comment(comment, pull_request) }
+    latest_comment = normalized_comments.max_by { |comment| timestamp_sort_key(comment["created_at"]) }
+    current_head_evidence = current_thread_evidence(thread, normalized_comments, pull_request)
+
+    {
+      "id" => thread.fetch("id"),
+      "is_resolved" => thread["isResolved"] == true,
+      "is_outdated" => thread["isOutdated"] == true,
+      "path" => thread["path"] || latest_comment&.fetch("path", nil),
+      "line" => thread["line"] || latest_comment&.fetch("line", nil),
+      "url" => latest_comment&.fetch("url", nil),
+      "author" => latest_comment&.fetch("author", nil),
+      "created_at" => latest_comment&.fetch("created_at", nil),
+      "body_excerpt" => excerpt(latest_comment&.fetch("body", nil)),
+      "review_state" => latest_comment&.fetch("review_state", nil),
+      "review_head_sha" => latest_comment&.fetch("review_head_sha", nil),
+      "comment_head_sha" => latest_comment&.fetch("comment_head_sha", nil),
+      "current_head" => !current_head_evidence.nil?,
+      "current_head_evidence" => current_head_evidence,
+      "comments_complete" => comments_complete,
+      "comments" => normalized_comments
+    }
+  end
+
+  def review_thread_comments(thread)
+    raw_comments = thread["comments"]
+    comments = Array(raw_comments.is_a?(Hash) ? raw_comments["nodes"] : raw_comments)
+
+    [comments, review_thread_comments_complete?(raw_comments)]
+  end
+
+  def review_thread_comments_complete?(raw_comments)
+    !raw_comments.is_a?(Hash) || raw_comments.dig("pageInfo", "hasNextPage") != true
+  end
+
+  def normalize_thread_comment(comment, pull_request)
+    review = comment["pullRequestReview"] || {}
+
+    {
+      "id" => review_thread_comment_identifier(comment),
+      "url" => comment["url"],
+      "path" => comment["path"],
+      "line" => comment["line"],
+      "created_at" => comment["createdAt"],
+      "author" => comment.dig("author", "login"),
+      "author_association" => comment["authorAssociation"],
+      "body" => comment["body"].to_s,
+      "outdated" => comment["outdated"] == true,
+      "reply_to_id" => review_thread_comment_reply_to_identifier(comment),
+      "review_state" => review["state"],
+      "review_head_sha" => review.dig("commit", "oid"),
+      "comment_head_sha" => comment.dig("commit", "oid"),
+      "current_head" => comment.dig("commit", "oid") == pull_request.fetch("head_sha")
+    }
+  end
+
+  def review_thread_comment_identifier(comment)
+    identifier = comment["id"] || comment["databaseId"] || comment["url"]
+    return identifier.to_s if identifier.to_s.match?(/\S/)
+
+    raise Error, "review thread comment is missing id, databaseId, and url"
+  end
+
+  def review_thread_comment_reply_to_identifier(comment)
+    reply_to = comment["replyTo"]
+    return nil unless reply_to
+
+    review_thread_comment_identifier(reply_to)
+  end
+
+  def normalize_review(review, pull_request)
+    {
+      "id" => review.fetch("id"),
+      "reviewer" => review.dig("author", "login") || UNKNOWN,
+      "state" => review["state"] || UNKNOWN,
+      "submitted_at" => review["submittedAt"],
+      "head_sha" => review.dig("commit", "oid") || UNKNOWN,
+      "url" => review["url"],
+      "body_excerpt" => excerpt(review["body"]),
+      "body_text" => review["body"].to_s,
+      "current_head" => review.dig("commit", "oid") == pull_request.fetch("head_sha")
+    }
+  end
+
+  def normalize_issue_comment(comment)
+    {
+      "id" => comment.fetch("id"),
+      "url" => comment["url"],
+      "author" => comment.dig("author", "login"),
+      "created_at" => comment["createdAt"],
+      "body_excerpt" => excerpt(comment["body"]),
+      "body" => comment["body"].to_s
+    }
+  end
+
+  def normalize_ci_readiness(raw_readiness, pull_request)
+    return unknown_ci_readiness(pull_request, "ci_readiness must be a JSON object") unless raw_readiness.is_a?(Hash)
+
+    computed = self.class.ci_readiness_from_check_rows(
+      pull_request.fetch("number"),
+      required_used: raw_readiness["required_used"],
+      rows: Array(raw_readiness["checks"]),
+      message: raw_readiness["message"]
+    )
+    checks = computed.fetch("checks")
+    components = normalize_ci_readiness_components(raw_readiness, computed, checks)
+
+    {
+      "pr" => (raw_readiness["pr"] || pull_request.fetch("number")).to_i,
+      "status" => components.fetch("status"),
+      "verdict" => components.fetch("verdict"),
+      "required_used" => raw_readiness["required_used"] == true,
+      "failing" => components.fetch("failing"),
+      "pending" => components.fetch("pending"),
+      "checks" => checks,
+      "message" => raw_readiness["message"] || computed["message"]
+    }.compact
+  end
+
+  def normalize_ci_readiness_components(raw_readiness, computed, checks)
+    return computed_ci_readiness_components(computed) unless checks.empty?
+
+    failing = normalize_ci_readiness_check_list(raw_readiness, computed, checks, "failing", "fail")
+    pending = normalize_ci_readiness_check_list(raw_readiness, computed, checks, "pending", "pending")
+    verdict = normalize_ci_readiness_verdict(raw_readiness, computed, checks, failing, pending)
+    {
+      "status" => normalize_ci_readiness_status(raw_readiness, computed, verdict),
+      "verdict" => verdict,
+      "failing" => failing,
+      "pending" => pending
+    }
+  end
+
+  def computed_ci_readiness_components(computed)
+    {
+      "status" => computed.fetch("status"),
+      "verdict" => computed.fetch("verdict"),
+      "failing" => computed.fetch("failing"),
+      "pending" => computed.fetch("pending")
+    }
+  end
+
+  def normalize_ci_readiness_check_list(raw_readiness, computed, checks, key, bucket)
+    return computed.fetch(key) unless raw_readiness.key?(key)
+
+    normalize_ci_check_list(raw_readiness[key], checks, bucket)
+  end
+
+  def normalize_ci_readiness_verdict(raw_readiness, computed, checks, failing, pending)
+    return computed.fetch("verdict") unless raw_readiness.key?("verdict")
+
+    normalize_ci_verdict(raw_readiness["verdict"], checks, failing, pending)
+  end
+
+  def normalize_ci_readiness_status(raw_readiness, computed, verdict)
+    return computed.fetch("status") unless raw_readiness.key?("status")
+
+    normalize_ci_status(raw_readiness["status"], verdict)
+  end
+
+  def normalize_ci_check_list(raw_rows, checks, bucket)
+    rows = if raw_rows.nil?
+             checks.select { |row| row["bucket"].to_s == bucket }
+           else
+             Array(raw_rows)
+           end
+
+    rows.map { |row| self.class.normalize_ci_check_row(row) }
+  end
+
+  def normalize_ci_verdict(raw_verdict, checks, failing, pending)
+    return raw_verdict if CI_VERDICTS.include?(raw_verdict)
+
+    return UNKNOWN if self.class.active_ci_check_rows(checks).empty?
+    return "READY" if failing.empty? && pending.empty?
+
+    "NOT_READY"
+  end
+
+  def normalize_ci_status(raw_status, verdict)
+    return "known" if raw_status == "known" && verdict != UNKNOWN
+    return UNKNOWN if raw_status == UNKNOWN || verdict == UNKNOWN
+
+    "known"
+  end
+
+  def unknown_ci_readiness(pull_request, message)
+    self.class.ci_readiness_from_check_rows(
+      pull_request.fetch("number"),
+      required_used: false,
+      rows: [],
+      message:
+    )
+  end
+
+  def latest_reviews_by_reviewer(reviews)
+    latest_reviews = reviews.group_by { |review| review.fetch("reviewer") }
+                            .map do |_reviewer, reviewer_reviews|
+                              latest_review_by_timestamp_and_order(reviewer_reviews)
+                            end
+
+    latest_reviews.sort_by { |review| review.fetch("reviewer") }
+  end
+
+  def latest_review_by_timestamp_and_order(reviewer_reviews)
+    reviewer_reviews.each_with_index.max_by do |review, index|
+      [timestamp_sort_key(review["submitted_at"], "review #{review.fetch('id')} submitted_at"), index]
+    end.first
+  end
+
+  def current_changes_requested(reviews)
+    latest_current_decision_reviews_by_reviewer(reviews).select do |review|
+      review.fetch("state") == "CHANGES_REQUESTED"
+    end
+  end
+
+  def latest_current_decision_reviews_by_reviewer(reviews)
+    decision_reviews = reviews.select do |review|
+      review.fetch("current_head") && REVIEW_OBJECT_DECISION_STATES.include?(review.fetch("state"))
+    end
+
+    decision_reviews.group_by { |review| review.fetch("reviewer") }
+                    .values
+                    .map do |reviewer_reviews|
+                      latest_review_by_timestamp_and_order(reviewer_reviews)
+                    end
+  end
+
+  def current_thread_evidence(thread, comments, pull_request)
+    return nil if thread["isOutdated"] == true
+    return nil if comments.empty?
+
+    # Conservative fallback: if no comment can be confirmed as current-head by SHA but GitHub has not marked
+    # a comment outdated, block rather than silently miss an unresolved thread after a non-force push.
+    return "sha_match" if current_thread_comment?(comments, pull_request)
+    return "conservative_non_outdated" if comments.any? { |comment| !comment.fetch("outdated") }
+
+    nil
+  end
+
+  def current_thread_comment?(comments, pull_request)
+    # Exact commit matches are current-head evidence even when GitHub's outdated flag lags behind a force-push.
+    comments.any? { |comment| comment.fetch("current_head") && !comment.fetch("outdated") } ||
+      comments.any? { |comment| comment.fetch("comment_head_sha") == pull_request.fetch("head_sha") }
+  end
+
+  def unresolved_current_head_thread?(thread)
+    # Truncated comment pages are reported through unknown_fields instead of counted from partial evidence.
+    complete_current_head_thread?(thread) && !thread.fetch("is_resolved")
+  end
+
+  def finding_dispositions(review_threads, reviews, issue_comments, dispositions, enforce_unused_dispositions: true)
+    findings = []
+    used_disposition_keys = []
+
+    truncated_sources = []
+    context = {
+      dispositions:,
+      used_disposition_keys:,
+      truncated_sources:
+    }
+    append_findings(
+      thread_comments_for_findings(review_threads),
+      "body",
+      findings,
+      context
+    )
+    append_findings(
+      reviews_for_findings(reviews),
+      "body_text",
+      findings,
+      context
+    )
+    append_findings(issue_comments, "body", findings, context)
+
+    unused_disposition_keys = unused_disposition_keys(dispositions, used_disposition_keys,
+                                                      enforce_unused_dispositions:)
+
+    unique_findings = findings.uniq do |finding|
+      [
+        finding.fetch("id"),
+        finding.fetch("url"),
+        finding.fetch("severity"),
+        finding.fetch("source_line"),
+        finding.fetch("marker_index"),
+        finding.fetch("text_excerpt")
+      ]
+    end
+    {
+      "status" => truncated_sources.empty? ? "known" : UNKNOWN,
+      "findings" => unique_findings,
+      "truncated_sources" => truncated_sources.uniq { |source| source.fetch("url") },
+      "unused_keys" => unused_disposition_keys
+    }
+  end
+
+  def append_findings(records, text_key, findings, context)
+    records.each do |record|
+      findings.concat(
+        findings_from_text(
+          record.fetch(text_key),
+          record.fetch("url"),
+          record.fetch("id"),
+          context,
+          inferred_disposition: record["inferred_disposition"]
+        )
+      )
+    end
+  end
+
+  def thread_comments_for_findings(review_threads)
+    review_threads
+      .select { |thread| complete_current_head_thread?(thread) }
+      # Incomplete comment pages are blocked through unknown_fields; unfetched bodies cannot be scanned for priorities.
+      .flat_map { |thread| comments_with_inferred_dispositions(thread) }
+      .reject { |comment| comment.fetch("outdated") }
+  end
+
+  def comments_with_inferred_dispositions(thread)
+    comments = thread.fetch("comments")
+    inferred_dispositions = inferred_dispositions_by_comment_id(thread, comments)
+
+    comments.map do |comment|
+      next comment unless inferred_dispositions.key?(comment.fetch("id"))
+
+      comment.merge("inferred_disposition" => inferred_dispositions.fetch(comment.fetch("id")))
+    end
+  end
+
+  def complete_current_head_thread?(thread)
+    thread.fetch("comments_complete") && thread.fetch("current_head")
+  end
+
+  def reviews_for_findings(reviews)
+    reviews.select do |review|
+      review.fetch("current_head") && FINDING_REVIEW_STATES.include?(review.fetch("state"))
+    end
+  end
+
+  def findings_from_text(text, url, id, context, inferred_disposition: nil)
+    lines = text.to_s.each_line.map(&:chomp)
+    if lines.length > MAX_BODY_LINES
+      warn "pr-merge-ledger: #{url} body has #{lines.length} lines; scanning first #{MAX_BODY_LINES}"
+      context.fetch(:truncated_sources) << {
+        "id" => id,
+        "url" => url,
+        "line_count" => lines.length,
+        "scanned_line_count" => MAX_BODY_LINES
+      }
+      lines = lines.first(MAX_BODY_LINES)
+    end
+
+    finding_lines = lines.each_with_index.filter_map do |line_text, index|
+      next if non_actionable_finding_summary?(line_text)
+
+      occurrences = finding_occurrences(line_text)
+      next if occurrences.empty?
+
+      [line_text, index + 1, occurrences]
+    end
+    # Count before extracting individual findings so broad disposition keys are disabled
+    # whenever one source contains multiple priority markers.
+    source_finding_count = finding_lines.sum { |(_line_text, _source_line, occurrences)| occurrences.length }
+    line_context = {
+      source_finding_count:,
+      dispositions: context.fetch(:dispositions),
+      used_disposition_keys: context.fetch(:used_disposition_keys),
+      inferred_disposition:
+    }
+
+    finding_lines.flat_map do |line_text, source_line, occurrences|
+      findings_from_occurrences(line_text, source_line, { url:, id: }, occurrences, line_context)
+    end
+  end
+
+  def findings_from_occurrences(line_text, source_line, source, occurrences, context)
+    finding_context = context.merge(
+      multiple_markers: occurrences.length > 1
+    )
+    occurrences.map do |occurrence|
+      finding_from_occurrence(line_text, source_line, source, occurrence, finding_context)
+    end
+  end
+
+  def finding_from_occurrence(line_text, source_line, source, occurrence, context)
+    finding = source.merge(
+      source_line:,
+      marker_index: occurrence.fetch(:marker_index),
+      multiple_markers: context.fetch(:multiple_markers),
+      multiple_source_findings: context.fetch(:source_finding_count) > 1
+    )
+    disposition = disposition_for(finding, context.fetch(:dispositions), context.fetch(:used_disposition_keys))
+    disposition = inferred_disposition_for(finding, context, disposition)
+
+    {
+      "id" => source.fetch(:id),
+      "url" => source.fetch(:url),
+      "severity" => occurrence.fetch(:severity),
+      "source_line" => source_line,
+      "source_column" => occurrence.fetch(:source_column),
+      "marker_index" => occurrence.fetch(:marker_index),
+      "text_excerpt" => excerpt(line_text),
+      "disposition" => disposition.fetch("disposition"),
+      "evidence" => disposition["evidence"]
+    }
+  end
+
+  def inferred_dispositions_by_comment_id(thread, comments)
+    return {} unless thread.fetch("is_resolved")
+    return {} unless thread.fetch("current_head")
+
+    reply_to_by_id = comments.to_h { |comment| [comment.fetch("id"), comment["reply_to_id"]] }
+    root_comment_ids = root_comment_ids_by_comment_id(comments, reply_to_by_id:)
+    comments_by_id = comments.to_h { |comment| [comment.fetch("id"), comment] }
+
+    sorted_inference_replies(comments).each_with_object({}) do |reply, inferred|
+      reply_to_id = reply.fetch("reply_to_id")
+      root_reply_to_id = root_comment_ids.fetch(reply_to_id, reply_to_id)
+      update_inferred_dispositions_from_reply(
+        inferred,
+        reply,
+        reply_to_id,
+        reply_to_by_id:,
+        root_reply_to_id:,
+        target_comment: comments_by_id[reply_to_id],
+        comments_by_id:
+      )
+    end
+  end
+
+  def sorted_inference_replies(comments)
+    replies = comments.select do |comment|
+      comment["reply_to_id"] && !comment.fetch("outdated")
+    end
+    sorted_reply_pairs = replies.each_with_index.to_a.sort_by do |comment, index|
+      [timestamp_sort_key(comment["created_at"], "comment #{comment.fetch('id')} created_at"), index]
+    end
+
+    sorted_reply_pairs.map(&:first)
+  end
+
+  def root_comment_ids_by_comment_id(comments, reply_to_by_id:)
+    comments.each_with_object({}) do |comment, roots|
+      roots[comment.fetch("id")] = root_comment_id(comment.fetch("id"), reply_to_by_id)
+    end
+  end
+
+  def root_comment_id(comment_id, reply_to_by_id)
+    seen_ids = {}
+    current_id = comment_id
+
+    while (parent_id = reply_to_by_id[current_id])
+      break if seen_ids[parent_id]
+
+      seen_ids[current_id] = true
+      current_id = parent_id
+    end
+
+    current_id
+  end
+
+  def update_inferred_dispositions_from_reply(
+    inferred,
+    reply,
+    reply_to_id,
+    reply_to_by_id:,
+    root_reply_to_id:,
+    target_comment:,
+    comments_by_id:
+  )
+    trusted_reply = trusted_disposition_reply_author_association?(reply)
+    body, truncated = bounded_disposition_reply_body(reply.fetch("body"))
+    normalized_body = normalized_disposition_reply_body(body)
+    clear_disposition_reply = trusted_reply && clear_inferred_disposition_reply?(normalized_body, truncated:)
+    disposition = inferred_disposition_from_reply(
+      reply,
+      body:,
+      truncated:,
+      normalized_body:,
+      clear_disposition_reply:,
+      target_comment:
+    )
+    if disposition
+      inferred[reply_to_id] = disposition
+    elsif clear_disposition_reply && !priority_finding_reply?(normalized_body)
+      clear_target_id = clear_disposition_target_id(
+        inferred,
+        reply_to_id,
+        reply_to_by_id:,
+        root_reply_to_id:,
+        comments_by_id:
+      )
+      inferred.delete(clear_target_id) if clear_target_id
+    end
+  end
+
+  def priority_finding_reply?(normalized_body)
+    normalized_body.to_s.each_line.any? do |line|
+      !non_actionable_finding_summary?(line) && finding_occurrences(line).any?
+    end
+  end
+
+  def clear_disposition_target_id(inferred, reply_to_id, reply_to_by_id:, root_reply_to_id:, comments_by_id:)
+    seen_ids = {}
+    current_id = reply_to_id
+    while current_id
+      return current_id if inferred.key?(current_id)
+      return nil if priority_finding_comment?(comments_by_id[current_id])
+      break if seen_ids[current_id]
+
+      seen_ids[current_id] = true
+      current_id = reply_to_by_id[current_id]
+    end
+
+    root_reply_to_id if inferred.key?(root_reply_to_id)
+  end
+
+  def priority_finding_comment?(comment)
+    return false unless comment
+
+    priority_finding_reply?(normalized_disposition_reply_body(comment["body"]))
+  end
+
+  def inferred_disposition_from_reply(
+    reply,
+    body:,
+    truncated:,
+    normalized_body:,
+    clear_disposition_reply:,
+    target_comment: nil
+  )
+    return nil if truncated
+    return nil if clear_disposition_reply
+    return nil unless normalized_body.match?(FIXED_DISPOSITION_REPLY_PATTERN)
+    return nil unless priority_finding_comment?(target_comment)
+    return nil unless trusted_disposition_reply_author?(reply, target_comment:)
+
+    {
+      "disposition" => "fixed",
+      "evidence" => "resolved review-thread reply #{reply.fetch('url')} by #{reply['author'] || 'UNKNOWN'}: " \
+                    "#{excerpt(body)}"
+    }
+  end
+
+  def clear_inferred_disposition_reply?(normalized_body, truncated:)
+    return true if truncated
+
+    body = normalized_body.gsub(NEGATED_FOLLOW_UP_REPLY_PATTERN, "")
+    return true if body.match?(DEFERRED_DISPOSITION_REPLY_PATTERN)
+    return true if body.match?(FOLLOW_UP_DEFERRED_REPLY_PATTERN)
+    return true if hedged_fixed_disposition_reply?(body)
+    return true if ambiguous_fixed_disposition_reply?(normalized_body)
+
+    contradicted_disposition_reply?(body)
+  end
+
+  def contradicted_disposition_reply?(normalized_body)
+    body = normalized_body.gsub(BENIGN_REGRESSION_REPLY_PATTERN, "")
+    body = body.gsub(UNRELATED_FAILURE_REPLY_PATTERN, "")
+    body = body.gsub(FIXED_FAILURE_REFERENCE_REPLY_PATTERN, "")
+    body = body.gsub(NEGATED_REOPEN_REPLY_PATTERN, "")
+    body = body.gsub(
+      /
+        \bno\s+longer\s+
+        (?:apply|applies|applied|applying|infer|infers|inferred|inferring|mark|marks|marked|marking)\s+
+        (?:a\s+)?
+        fixed\s+disposition\b
+      /ix,
+      ""
+    )
+    body = strip_negated_failure_reply_clauses(body, FAILURE_DISPOSITION_REPLY_SUBJECT_PATTERN)
+    body = strip_negated_failure_reply_clauses(body, FAILURE_STATUS_SUBJECT_PATTERN)
+
+    body.match?(CONTRADICTED_DISPOSITION_REPLY_PATTERN)
+  end
+
+  def strip_negated_failure_reply_clauses(body, subject_pattern)
+    body.gsub(
+      /
+        \b(?:#{subject_pattern.source})\b
+        (?:\s+\S+){0,6}\s+
+        \b(?:
+          not|never|cannot|can't|wont|won't|do(?:es)?(?:\s+not|n't)|did(?:\s+not|n't)|
+          (?:is|are|was|were|has|have|had)(?:\s+not|n't)|no\s+longer
+        )\b
+        (?!
+          (?:\s+\S+){0,3}\s+
+          \b(?:fix(?:es|ed|ing)?|address(?:es|ed|ing)?|resolve(?:s|d)?|resolving)\b
+        )
+        (?:\s+\S+){0,3}\s+
+        \b(?:#{FAILURE_DISPOSITION_REPLY_VERB_PATTERN.source})\b
+      /ix,
+      ""
+    )
+  end
+
+  def hedged_fixed_disposition_reply?(normalized_body)
+    normalized_body.match?(FIXED_DISPOSITION_REPLY_PATTERN) &&
+      normalized_body.match?(HEDGED_FIXED_DISPOSITION_REPLY_PATTERN)
+  end
+
+  def ambiguous_fixed_disposition_reply?(normalized_body)
+    return false unless normalized_body.match?(FIXED_DISPOSITION_REPLY_PATTERN)
+
+    body_without_urls = normalized_body.gsub(%r{https?://\S+}, "URL")
+    sentence_boundary = body_without_urls.match(
+      /[!\r\n]|
+       [.,;:](?=\s|$)|
+       (?:\s-\s+|\s*\(\s*)(?=(?:can|could|please|does|do|did|would|is|are)\b)/ix
+    )
+    first_sentence = sentence_boundary ? body_without_urls[0...sentence_boundary.begin(0)] : body_without_urls
+    return true if first_sentence.include?("?")
+
+    follow_up = sentence_boundary ? body_without_urls[sentence_boundary.end(0)..].to_s : ""
+    follow_up.match?(
+      /\b(?:can|could)\s+you\s+(?:please\s+)?(?:confirm|verify|check|validate|test)\b|
+       \bplease\s+(?:confirm|verify|check|validate|test)\b|
+       \b(?:does|do|did|would)\s+(?:this|that|it)\s+(?:look|cover|address|fix|work)\b|
+       \b(?:is|are)\s+(?:this|that|it|these|those)\s+(?:correct|right|okay|ok)\b/ix
+    )
+  end
+
+  def trusted_disposition_reply_author?(reply, target_comment: nil)
+    return false unless target_comment
+    return false if same_author_disposition_reply?(reply, target_comment)
+
+    trusted_disposition_reply_author_association?(reply)
+  end
+
+  def trusted_disposition_reply_author_association?(reply)
+    association = reply["author_association"]
+
+    TRUSTED_DISPOSITION_REPLY_AUTHOR_ASSOCIATIONS.include?(association)
+  end
+
+  def same_author_disposition_reply?(reply, target_comment)
+    return false unless target_comment
+
+    reply_author = reply["author"]
+    target_author = target_comment["author"]
+    reply_author && target_author && reply_author == target_author
+  end
+
+  def normalized_disposition_reply_body(body)
+    body.to_s.lstrip.gsub(/[\u2018\u2019]/, "'")
+  end
+
+  def bounded_disposition_reply_body(body)
+    bounded_lines = +""
+    body.to_s.each_line.with_index(1) do |line, line_number|
+      return [bounded_lines, true] if line_number > MAX_BODY_LINES
+
+      bounded_lines << line
+      if bounded_lines.length > MAX_DISPOSITION_REPLY_BODY_LENGTH
+        return [bounded_lines[0, MAX_DISPOSITION_REPLY_BODY_LENGTH], true]
+      end
+    end
+
+    [bounded_lines, false]
+  end
+
+  def inferred_disposition_for(finding, context, disposition)
+    return disposition unless disposition.fetch("disposition") == UNKNOWN
+    return disposition unless context.fetch(:source_finding_count) == 1
+    return disposition unless finding.fetch(:multiple_markers) == false
+
+    context.fetch(:inferred_disposition) || disposition
+  end
+
+  def finding_severity(line)
+    primary_finding_match(line)&.first
+  end
+
+  def primary_finding_match(line)
+    FINDING_PATTERNS.each do |severity, pattern|
+      match = line.match(pattern)
+      return [severity, match] if match
+    end
+
+    nil
+  end
+
+  def finding_occurrences(line)
+    primary_match = primary_finding_match(line)
+    return [] unless primary_match
+
+    first_severity, first_match = primary_match
+
+    occurrences = [{
+      severity: first_severity,
+      source_column: primary_finding_source_column(line, first_severity, first_match),
+      marker_index: 1
+    }]
+    line.scan(ADDITIONAL_SEVERITY_PATTERN) do
+      match = Regexp.last_match
+      occurrences << {
+        severity: normalize_finding_severity(match[:severity]),
+        source_column: match.begin(:severity) + 1,
+        marker_index: occurrences.length + 1
+      }
+    end
+
+    append_uncovered_priority_occurrences(line, first_match.end(0), occurrences)
+    occurrences.sort_by! { |occurrence| occurrence.fetch(:source_column) }
+    occurrences.each_with_index { |occurrence, index| occurrence[:marker_index] = index + 1 }
+    occurrences
+  end
+
+  def append_uncovered_priority_occurrences(line, first_marker_end, occurrences)
+    line.scan(STANDALONE_PRIORITY_MARKER_PATTERN) do
+      match = Regexp.last_match
+      next if match.begin(0) < first_marker_end
+
+      gap = line[first_marker_end...match.begin(0)].to_s
+      if gap.match?(/\A\s*\z/)
+        next unless match.begin(0).positive? && line[match.begin(0) - 1] == "/"
+      else
+        next unless separate_finding_gap?(gap)
+      end
+
+      source_column = match.begin(0) + 1
+      next if occurrences.any? { |occurrence| occurrence.fetch(:source_column) == source_column }
+
+      occurrences << {
+        severity: normalize_finding_severity(match[0]),
+        source_column:,
+        marker_index: nil
+      }
+    end
+  end
+
+  def primary_finding_source_column(line, severity, match)
+    marker_pattern =
+      if severity == "MUST_FIX"
+        /MUST[- ]?FIX/i
+      else
+        /\[?#{Regexp.escape(severity)}\]?/i
+      end
+    matched_text = line[match.begin(0)...match.end(0)].to_s
+    marker_offset = matched_text.index(marker_pattern) || 0
+
+    match.begin(0) + marker_offset + 1
+  end
+
+  def separate_finding_gap?(gap)
+    return true if gap.match?(%r{\A\s*/\s*\z})
+
+    gap.match?(/[.!?;]/) ||
+      gap.match?(/\b(?:also|but|fixed|however|open|please|regression|remaining|resolved|still|unresolved|waived)\b/i)
+  end
+
+  def normalize_finding_severity(raw_severity)
+    raw_severity.to_s.delete("[]").upcase.tr("- ", "_")
+  end
+
+  def non_actionable_finding_summary?(line)
+    # Suppress only clearly resolved summary prose; ambiguous priority text remains a finding until triaged.
+    match = line.match(FINDING_SUMMARY_PREFIX_PATTERN)
+    return false unless match
+
+    summary = match[:summary].to_s
+    return false unless summary.match?(FINDING_SUMMARY_SUBJECT_PATTERN)
+    return false unless resolved_finding_summary_clause?(summary)
+
+    additional_clauses = additional_finding_summary_clauses(summary)
+    return false if hidden_additional_priority?(summary, additional_clauses)
+
+    additional_clauses.all? do |clause|
+      resolved_finding_summary_clause?(clause)
+    end
+  end
+
+  def additional_finding_summary_clauses(summary)
+    matches = []
+    summary.scan(ADDITIONAL_SEVERITY_PATTERN) do
+      matches << Regexp.last_match
+    end
+
+    matches.map.with_index do |match, index|
+      clause_end = matches[index + 1]&.begin(0) || summary.length
+      summary[match.begin(:severity)...clause_end].to_s
+    end
+  end
+
+  def resolved_finding_summary_clause?(summary)
+    first_clause = summary.split(/[.;(]/, 2).first.to_s
+    return false if first_clause.match?(SUMMARY_TRAILING_PRIORITY_PATTERN)
+    return false if first_clause.match?(NEGATED_SUMMARY_RESOLUTION_PATTERN)
+
+    first_clause.match?(FINDING_SUMMARY_RESOLUTION_PATTERN)
+  end
+
+  def hidden_additional_priority?(summary, additional_clauses)
+    rest = summary.split(/[.;(]/, 2)[1]
+    return false unless rest
+
+    priority_marker_count(rest) > additional_clauses.sum { |clause| priority_marker_count(clause) }
+  end
+
+  def priority_marker_count(text)
+    text.to_s.scan(STANDALONE_PRIORITY_MARKER_PATTERN).length
+  end
+
+  def disposition_for(finding, dispositions, used_disposition_keys)
+    disposition_key = disposition_keys(finding).find do |key|
+      dispositions.key?(key)
+    end
+    return { "disposition" => UNKNOWN } unless disposition_key
+
+    used_disposition_keys << disposition_key
+    normalize_disposition_override(dispositions.fetch(disposition_key), disposition_key)
+  end
+
+  def normalize_disposition_override(override, disposition_key)
+    case override
+    when String
+      validate_disposition(override)
+      { "disposition" => override }
+    when Hash
+      disposition = override.fetch("disposition")
+      validate_disposition(disposition)
+      evidence = override["evidence"]
+      validate_disposition_evidence(evidence, disposition_key)
+      { "disposition" => disposition, "evidence" => evidence }
+    when nil
+      raise Error, "finding disposition for #{disposition_key} cannot be null"
+    else
+      raise Error, "finding disposition for #{disposition_key} must be a string or object"
+    end
+  end
+
+  def disposition_keys(finding)
+    url = finding.fetch(:url)
+    id = finding.fetch(:id)
+    source_line = finding.fetch(:source_line)
+    marker_index = finding.fetch(:marker_index)
+    marker_keys = [
+      url && "#{url}#L#{source_line}:#{marker_index}",
+      id && "#{id}#L#{source_line}:#{marker_index}"
+    ]
+    line_keys = [
+      url && "#{url}#L#{source_line}",
+      id && "#{id}#L#{source_line}",
+      url,
+      id
+    ]
+
+    return marker_keys.compact if finding.fetch(:multiple_markers)
+    return (marker_keys + line_keys.take(2)).compact if finding.fetch(:multiple_source_findings)
+
+    (marker_keys + line_keys).compact
+  end
+
+  def warn_unused_dispositions(dispositions, used_disposition_keys)
+    unused_keys = dispositions.keys - used_disposition_keys.to_a
+    return [] if unused_keys.empty?
+
+    warn "pr-merge-ledger: unused disposition keys: #{unused_keys.join(', ')}"
+    unused_keys
+  end
+
+  def unused_disposition_keys(dispositions, used_disposition_keys, enforce_unused_dispositions: true)
+    return [] unless enforce_unused_dispositions
+
+    warn_unused_dispositions(dispositions, used_disposition_keys)
+  end
+
+  def validate_disposition(disposition)
+    return if DISPOSITIONS.include?(disposition)
+
+    raise Error, "finding disposition #{disposition.inspect} must be one of #{DISPOSITIONS.join(', ')}"
+  end
+
+  def validate_disposition_evidence(evidence, disposition_key)
+    return if evidence.nil? || evidence.is_a?(String)
+
+    raise Error, "finding disposition evidence for #{disposition_key} must be a string"
+  end
+
+  def timestamp_sort_key(raw_timestamp, warning_context = nil)
+    # Pending/malformed GitHub review timestamps sort oldest so they cannot clear
+    # a later dated decision review.
+    Time.parse(raw_timestamp.to_s)
+  rescue ArgumentError
+    label = warning_context || "timestamp"
+    warn "pr-merge-ledger: #{label} has invalid timestamp #{raw_timestamp.inspect}; treating as oldest"
+    Time.at(0).utc
+  end
+
+  def changelog_classification
+    {
+      "status" => @options[:changelog_classification] == UNKNOWN ? UNKNOWN : "known",
+      "classification" => @options[:changelog_classification]
+    }
+  end
+
+  def lockfile_diff(files)
+    if files.nil?
+      return {
+        "status" => UNKNOWN,
+        "has_lockfile_diff" => UNKNOWN,
+        "files" => []
+      }
+    end
+
+    lockfiles = files.select { |path| lockfile_path?(path) }
+    {
+      "status" => "known",
+      "has_lockfile_diff" => !lockfiles.empty?,
+      "files" => lockfiles
+    }
+  end
+
+  def lockfile_path?(path)
+    basename = File.basename(path)
+    # Keep generic *.lock conservative; narrow this if real closeouts produce false positives.
+    LOCKFILE_BASENAMES.include?(basename) || basename.end_with?(".lock")
+  end
+
+  def unknown_fields_for(pull_request, gate_context)
+    review_threads = gate_context.fetch(:review_threads)
+    finding_dispositions = gate_context.fetch(:finding_report)
+    ci_readiness = gate_context.fetch(:ci_readiness)
+    changelog = gate_context.fetch(:changelog)
+    lockfile = gate_context.fetch(:lockfile)
+    # pull_request must be the pre-output object so INTERNAL_REVIEW_DECISION_RAW_KEY
+    # remains available for specific unsupported reviewDecision diagnostics.
+    unknowns = pull_request_unknown_fields(pull_request)
+
+    review_threads.each do |thread|
+      next if thread.fetch("comments_complete")
+
+      unknowns << unknown_field(
+        pull_request,
+        "review_threads.comments",
+        "review thread comments were truncated by GitHub pagination",
+        thread["url"]
+      )
+    end
+
+    unknowns.concat(priority_finding_unknown_fields(pull_request, finding_dispositions))
+
+    if ci_readiness.fetch("status") == UNKNOWN || ci_readiness.fetch("verdict") == UNKNOWN
+      unknowns << unknown_field(
+        pull_request,
+        "ci_readiness.verdict",
+        ci_readiness["message"] || "CI readiness is UNKNOWN"
+      )
+    end
+
+    if changelog.fetch("classification") == UNKNOWN
+      unknowns << unknown_field(
+        pull_request,
+        "changelog_classification.classification",
+        "changelog classification is UNKNOWN"
+      )
+    end
+
+    if lockfile.fetch("status") == UNKNOWN
+      unknowns << unknown_field(pull_request, "lockfile_diff.has_lockfile_diff", "lockfile diff flag is UNKNOWN")
+    end
+
+    unknowns
+  end
+
+  def priority_finding_unknown_fields(pull_request, finding_dispositions)
+    unknowns = finding_dispositions.fetch("findings").filter_map do |finding|
+      next unless finding.fetch("disposition") == UNKNOWN
+
+      unknown_field(
+        pull_request,
+        "priority_finding_dispositions.findings",
+        "P0/P1/P2/Must-Fix finding has no fixed/waived/follow-up disposition",
+        finding["url"]
+      )
+    end
+
+    finding_dispositions.fetch("truncated_sources").each do |source|
+      unknowns << unknown_field(
+        pull_request,
+        "priority_finding_dispositions.body_scan",
+        "priority finding source body was truncated before full scan",
+        source["url"]
+      )
+    end
+
+    return unknowns if finding_dispositions.fetch("unused_keys").empty?
+
+    unknowns << unknown_field(
+      pull_request,
+      "priority_finding_dispositions.unused_keys",
+      "finding disposition keys did not match any priority finding"
+    )
+  end
+
+  def pull_request_unknown_fields(pull_request)
+    unknowns = []
+    review_decision = pull_request.fetch("review_decision")
+    unless KNOWN_REVIEW_DECISION_STATES.include?(review_decision)
+      raw_review_decision = pull_request[INTERNAL_REVIEW_DECISION_RAW_KEY] || UNKNOWN
+      message =
+        if raw_review_decision == UNKNOWN
+          "GitHub reviewDecision is UNKNOWN"
+        else
+          "GitHub reviewDecision is unsupported: #{raw_review_decision}"
+        end
+
+      unknowns << unknown_field(pull_request, "pr.review_decision", message)
+    end
+
+    if pull_request["head_sha"].to_s.empty? || pull_request["head_sha"] == UNKNOWN
+      unknowns << unknown_field(pull_request, "pr.head_sha", "GitHub headRefOid is UNKNOWN")
+    end
+
+    if pull_request_body_exceeds_closing_keyword_scan_limit?(pull_request)
+      unknowns << unknown_field(
+        pull_request,
+        "pr.body_code_formatted_closing_keyword_scan",
+        "PR body exceeded the code-formatted closing keyword scan limit",
+        pull_request["url"]
+      )
+    end
+
+    unknowns
+  end
+
+  def unknown_field(pull_request, field, message, url = nil)
+    {
+      "pr_number" => pull_request.fetch("number"),
+      "field" => field,
+      "message" => message,
+      "url" => url
+    }.compact
+  end
+
+  def violations_for(pull_request, gate_context)
+    [
+      review_decision_violation(pull_request),
+      draft_pr_violation(pull_request),
+      closed_unmerged_pr_violation(pull_request),
+      changelog_violation(pull_request, gate_context.fetch(:changelog)),
+      *changes_requested_violations(pull_request, gate_context.fetch(:changes_requested)),
+      *unresolved_thread_violations(pull_request, gate_context.fetch(:unresolved_threads)),
+      *ci_readiness_violations(pull_request, gate_context.fetch(:ci_readiness)),
+      *code_formatted_closing_keyword_violations(pull_request),
+      *unknown_field_violations(pull_request, gate_context.fetch(:unknown_fields))
+    ].compact
+  end
+
+  def review_decision_violation(pull_request)
+    code, message = BLOCKING_REVIEW_DECISION_VIOLATIONS[pull_request.fetch("review_decision")]
+    return unless code
+
+    violation(pull_request, code, message, pull_request["url"])
+  end
+
+  def draft_pr_violation(pull_request)
+    return unless pull_request["is_draft"]
+
+    violation(
+      pull_request,
+      "draft_pr",
+      "PR is still a draft",
+      pull_request["url"]
+    )
+  end
+
+  def closed_unmerged_pr_violation(pull_request)
+    return unless pull_request["state"] == "CLOSED" && pull_request["merged_at"].nil?
+
+    violation(
+      pull_request,
+      "closed_unmerged_pr",
+      "PR is closed without being merged",
+      pull_request["url"]
+    )
+  end
+
+  def changelog_violation(pull_request, changelog)
+    return unless changelog.fetch("classification") == "changelog_missing"
+
+    violation(
+      pull_request,
+      "changelog_missing",
+      "Changelog classification is changelog_missing",
+      pull_request["url"]
+    )
+  end
+
+  def changes_requested_violations(pull_request, changes_requested)
+    changes_requested.map do |review|
+      violation(
+        pull_request,
+        "changes_requested_review_object",
+        "Review object requested changes",
+        review["url"],
+        "reviewer" => review.fetch("reviewer"),
+        "head_sha" => review.fetch("head_sha"),
+        "current_head" => review.fetch("current_head")
+      )
+    end
+  end
+
+  def unresolved_thread_violations(pull_request, unresolved_threads)
+    unresolved_threads.map do |thread|
+      violation(
+        pull_request,
+        "unresolved_current_head_review_thread",
+        "Unresolved current-head review thread",
+        thread["url"],
+        "path" => thread["path"],
+        "line" => thread["line"]
+      )
+    end
+  end
+
+  def ci_readiness_violations(pull_request, ci_readiness)
+    failed = ci_readiness.fetch("failing").map do |check|
+      ci_check_violation(pull_request, check, "ci_check_failed", "CI check failed")
+    end
+    pending = ci_readiness.fetch("pending").map do |check|
+      if check["bucket"].to_s == "cancel"
+        ci_check_violation(pull_request, check, "ci_check_cancelled", "CI check was cancelled or superseded")
+      else
+        ci_check_violation(pull_request, check, "ci_check_pending", "CI check is still pending")
+      end
+    end
+    details_missing = if ci_readiness.fetch("verdict") == "NOT_READY" && failed.empty? && pending.empty?
+                        [
+                          violation(
+                            pull_request,
+                            "ci_not_ready",
+                            "CI readiness is NOT_READY, but no failed or pending check details were returned",
+                            pull_request["url"]
+                          )
+                        ]
+                      else
+                        []
+                      end
+
+    failed + pending + details_missing
+  end
+
+  def ci_check_violation(pull_request, check, code, message)
+    check_name = check["name"].to_s.empty? ? UNKNOWN : check["name"].to_s
+    violation(
+      pull_request,
+      code,
+      "#{message}: #{check_name}",
+      check["link"],
+      "check_name" => check_name,
+      "state" => check["state"],
+      "bucket" => check["bucket"]
+    )
+  end
+
+  def unknown_field_violations(pull_request, unknown_fields)
+    unknown_fields.map do |unknown|
+      violation(
+        pull_request,
+        unknown_violation_code(unknown.fetch("field")),
+        unknown.fetch("message"),
+        unknown["url"]
+      )
+    end
+  end
+
+  def unknown_violation_code(field)
+    UNKNOWN_VIOLATION_CODES.find { |pattern, _code| field.match?(pattern) }&.last || "unknown_ledger_field"
+  end
+
+  def violation(pull_request, code, message, url, extra = {})
+    {
+      "pr_number" => pull_request.fetch("number"),
+      "code" => code,
+      "message" => message,
+      "url" => url
+    }.merge(extra).compact
+  end
+
+  def excerpt(text)
+    compacted = text.to_s.gsub(/\s+/, " ").strip
+    return compacted if compacted.length <= MAX_EXCERPT_LENGTH
+
+    "#{compacted[0, MAX_EXCERPT_LENGTH - 3]}..."
+  end
+
+  def write_report(report)
+    puts(@options[:pretty] ? JSON.pretty_generate(report) : JSON.generate(report))
+  end
+
+  class GitHubCollector
+    def initialize(owner, name)
+      @owner = owner
+      @name = name
+    end
+
+    def fetch(pr_number)
+      # Metadata, threads, reviews, and comments are fetched sequentially, so a
+      # push during collection can make SHA comparisons a best-effort snapshot
+      # rather than an atomic GitHub view.
+      metadata, files = fetch_metadata_and_files(pr_number)
+      metadata["labels"] = { "nodes" => fetch_labels(pr_number) }
+      hosted_ci_requested = hosted_ci_requested?(metadata)
+      expected_hosted_workflows = expected_hosted_workflows(metadata)
+      allow_pull_request_hosted_ci = PrMergeLedger.allow_pull_request_hosted_ci?(metadata)
+      review_threads = fetch_review_threads(pr_number)
+      reviews = fetch_reviews(pr_number)
+      comments = fetch_comments(pr_number)
+      {
+        "pull_request" => metadata,
+        "files" => files,
+        "review_threads" => review_threads,
+        "reviews" => reviews,
+        "comments" => comments,
+        "ci_readiness" => fetch_ci_readiness(
+          pr_number,
+          head_sha: metadata.fetch("headRefOid"),
+          metadata:,
+          comments:,
+          hosted_ci_requested:,
+          expected_hosted_workflows:,
+          allow_pull_request_hosted_ci:
+        )
+      }
+    end
+
+    private
+
+    def fetch_metadata_and_files(pr_number)
+      files = []
+      metadata = nil
+      cursor = nil
+      page_count = 0
+
+      loop do
+        page_count += 1
+        raise Error, "pagination exceeded #{MAX_GRAPHQL_PAGES} pages for files" if page_count > MAX_GRAPHQL_PAGES
+
+        response = graphql(metadata_query, pr: pr_number, endCursor: cursor)
+        pull_request = response.dig("data", "repository", "pullRequest")
+        raise Error, "PR ##{pr_number} was not found" unless pull_request
+
+        metadata ||= pull_request.except("files")
+        file_connection = pull_request.fetch("files")
+        files.concat(file_connection.fetch("nodes").map { |file| file.fetch("path") })
+        page_info = file_connection.fetch("pageInfo")
+        break unless page_info.fetch("hasNextPage")
+
+        cursor = next_cursor(page_info, "files", cursor)
+      end
+
+      [metadata, files]
+    end
+
+    def fetch_review_threads(pr_number)
+      fetch_paginated_connection(pr_number, review_threads_query, "reviewThreads").map do |thread|
+        complete_review_thread_comments(thread)
+      end
+    end
+
+    def fetch_reviews(pr_number)
+      fetch_paginated_connection(pr_number, reviews_query, "reviews")
+    end
+
+    def fetch_comments(pr_number)
+      fetch_paginated_connection(pr_number, comments_query, "comments")
+    end
+
+    def fetch_labels(pr_number)
+      fetch_paginated_connection(pr_number, labels_query, "labels")
+    end
+
+    def fetch_ci_readiness(pr_number, head_sha:, metadata:, comments:, hosted_ci_requested:,
+                           expected_hosted_workflows:, allow_pull_request_hosted_ci:)
+      hosted_ci_not_before = hosted_ci_request_not_before(metadata, pr_number, comments) if hosted_ci_requested
+      required_result = fetch_pr_checks(pr_number, required: true)
+      required_rows = PrMergeLedger.parse_ci_check_rows(required_result.fetch(:stdout))
+      rows, required_used, message = select_ci_readiness_rows(
+        pr_number,
+        required_result,
+        required_rows,
+        head_sha:,
+        hosted_ci_requested:,
+        hosted_ci_not_before:,
+        expected_hosted_workflows:,
+        allow_pull_request_hosted_ci:
+      )
+
+      PrMergeLedger.ci_readiness_from_check_rows(pr_number, required_used:, rows:, message:)
+    rescue Error => e
+      PrMergeLedger.ci_readiness_from_check_rows(pr_number, required_used: false, rows: [], message: e.message)
+    end
+
+    def select_ci_readiness_rows(pr_number, required_result, required_rows, head_sha:, hosted_ci_requested:,
+                                 hosted_ci_not_before:, expected_hosted_workflows:, allow_pull_request_hosted_ci:)
+      full_rows = fetch_full_pr_check_rows(pr_number, required_result)
+
+      if hosted_ci_requested
+        selection = PrMergeLedger.select_ci_readiness_rows(
+          full_rows:,
+          hosted_ci_requested:,
+          hosted_rows: fetch_hosted_ci_check_rows(
+            head_sha,
+            expected_hosted_workflows,
+            allow_pull_request: allow_pull_request_hosted_ci,
+            not_before: hosted_ci_not_before
+          ),
+          expected_hosted_workflows:
+        )
+        return selection.values_at(:rows, :required_used, :message)
+      end
+
+      if required_rows.empty?
+        required_message = pr_checks_error_message(required_result) unless required_result.fetch(:success)
+        return [full_rows, false, required_message]
+      end
+
+      missing_required_keys = PrMergeLedger.missing_required_ci_check_keys(required_rows, full_rows)
+      unless missing_required_keys.empty?
+        message = "full current-head check list omitted required checks: #{missing_required_keys.join(', ')}"
+        return [[], false, message]
+      end
+      return [required_rows, true, nil] if PrMergeLedger.required_ci_check_rows_complete?(required_rows, full_rows)
+
+      [full_rows, false, "required check subset was incomplete; using full current-head check list"]
+    end
+
+    def hosted_ci_requested?(metadata)
+      active_hosted_ci_labels(metadata).intersect?(HOSTED_CI_REQUEST_LABELS)
+    end
+
+    def active_hosted_ci_labels(metadata)
+      Array(metadata.dig("labels", "nodes")).filter_map { |label| label["name"] }
+    end
+
+    def hosted_ci_request_not_before(metadata, pr_number, comments)
+      active_labels = active_hosted_ci_labels(metadata) & HOSTED_CI_REQUEST_LABELS
+      label_events = fetch_paginated_connection(pr_number, hosted_ci_label_events_query, "timelineItems")
+      latest_events = PrMergeLedger.latest_hosted_ci_label_events(active_labels, label_events)
+      direct_actors = latest_events.values.filter_map do |event|
+        actor = event.dig("actor", "login").to_s
+        actor unless HOSTED_CI_AUTOMATION_ACTORS.include?(actor)
+      end
+      actor_permissions = {}
+      trusted_actor = lambda do |actor|
+        actor_permissions.fetch(actor) do
+          actor_permissions[actor] = trusted_hosted_ci_actor?(actor)
+        end
+      end
+      trusted_label_actors = direct_actors.uniq.select(&trusted_actor)
+
+      PrMergeLedger.hosted_ci_request_not_before(
+        active_labels:,
+        label_events:,
+        comments:,
+        head_committed_at: head_committed_at(metadata),
+        trusted_label_actors:,
+        trusted_command_actor: trusted_actor
+      )
+    end
+
+    def head_committed_at(metadata)
+      commit = Array(metadata.dig("commits", "nodes")).first&.fetch("commit", nil)
+      head_sha = metadata.fetch("headRefOid")
+      raise Error, "current-head commit metadata did not match #{head_sha}" unless commit && commit["oid"] == head_sha
+
+      commit.fetch("committedDate")
+    end
+
+    def trusted_hosted_ci_actor?(actor)
+      unless actor.match?(/\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\z/)
+        raise Error, "invalid hosted CI label actor #{actor.inspect}"
+      end
+
+      permission_path = "repos/#{@owner}/#{@name}/collaborators/#{actor}/permission"
+      stdout, stderr, status = capture_gh_with_retries(["api", permission_path])
+      raise Error, "unable to verify hosted CI label actor #{actor}: #{stderr.strip}" unless status.success?
+
+      %w[admin write].include?(JSON.parse(stdout).fetch("permission"))
+    rescue JSON::ParserError, KeyError => e
+      raise Error, "invalid permission response for hosted CI label actor #{actor}: #{e.message}"
+    end
+
+    def expected_hosted_workflows(metadata)
+      return HOSTED_CI_WORKFLOW_NAMES unless DEPENDABOT_LOGINS.include?(metadata.dig("author", "login"))
+
+      HOSTED_CI_WORKFLOW_NAMES - DEPENDABOT_HOSTED_CI_EXCLUSIONS
+    end
+
+    def fetch_hosted_ci_check_rows(head_sha, expected_workflows, allow_pull_request:, not_before:)
+      suites = fetch_check_suites(head_sha)
+      latest_suites = PrMergeLedger.select_hosted_ci_suites(
+        suites,
+        expected_workflows:,
+        allow_pull_request:,
+        not_before:
+      )
+
+      latest_suites.flat_map { |suite| hosted_ci_rows_for_suite(suite) }
+    end
+
+    def fetch_check_suites(head_sha)
+      suites = []
+      cursor = nil
+      page_count = 0
+
+      loop do
+        page_count += 1
+        raise Error, "pagination exceeded #{MAX_GRAPHQL_PAGES} pages for checkSuites" if page_count > MAX_GRAPHQL_PAGES
+
+        response = graphql(hosted_check_suites_query, headSha: head_sha, endCursor: cursor)
+        commit = response.dig("data", "repository", "object")
+        raise Error, "head commit #{head_sha} was not found" unless commit
+
+        connection = commit.fetch("checkSuites")
+        page_suites = connection.fetch("nodes")
+        if page_suites.any? { |suite| suite.dig("checkRuns", "pageInfo", "hasNextPage") }
+          raise Error, "hosted CI check run pagination exceeded the supported per-suite page"
+        end
+
+        suites.concat(page_suites)
+        page_info = connection.fetch("pageInfo")
+        break unless page_info.fetch("hasNextPage")
+
+        cursor = next_cursor(page_info, "checkSuites", cursor)
+      end
+
+      suites
+    end
+
+    def hosted_ci_rows_for_suite(suite)
+      workflow = suite.dig("workflowRun", "workflow", "name")
+      suite_row = hosted_ci_row(
+        workflow:,
+        name: "#{workflow} / workflow",
+        status: suite["status"],
+        conclusion: suite["conclusion"],
+        link: suite["url"]
+      )
+      check_rows = suite.dig("checkRuns", "nodes").to_a.map do |check_run|
+        hosted_ci_row(
+          workflow:,
+          name: check_run["name"],
+          status: check_run["status"],
+          conclusion: check_run["conclusion"],
+          link: check_run["detailsUrl"]
+        )
+      end
+      [suite_row, *check_rows]
+    end
+
+    def hosted_ci_row(workflow:, name:, status:, conclusion:, link:)
+      {
+        "workflow" => workflow,
+        "name" => name,
+        "state" => conclusion || status,
+        "bucket" => PrMergeLedger.hosted_ci_check_bucket(status, conclusion),
+        "link" => link
+      }.compact
+    end
+
+    def fetch_full_pr_check_rows(pr_number, required_result)
+      full_result = fetch_pr_checks(pr_number, required: false)
+      full_rows = PrMergeLedger.parse_ci_check_rows(full_result.fetch(:stdout))
+      unless full_result.fetch(:success) || !full_rows.empty?
+        raise Error, pr_checks_error_message(required_result, full_result)
+      end
+
+      full_rows
+    end
+
+    def fetch_pr_checks(pr_number, required:)
+      args = ["pr", "checks", pr_number.to_s, "--repo", "#{@owner}/#{@name}"]
+      args << "--required" if required
+      args += ["--json", "name,state,bucket,link"]
+
+      stdout, stderr, status = capture_pr_checks(args, required:)
+      {
+        stdout: stdout.to_s,
+        stderr: stderr.to_s,
+        status:,
+        success: status.success?,
+        required:
+      }
+    end
+
+    def capture_pr_checks(args, required:)
+      attempt = 0
+      loop do
+        attempt += 1
+        stdout, stderr, status = capture_pr_checks_once(args, attempt)
+        return [stdout, stderr, status] if usable_pr_checks_result?(stdout, stderr, status, required:)
+        return [stdout, stderr, status] if attempt >= GITHUB_API_MAX_ATTEMPTS
+        return [stdout, stderr, status] if non_retryable_gh_error?(stderr)
+
+        sleep(GITHUB_API_RETRY_BASE_DELAY_SECONDS * (2**(attempt - 1)))
+      end
+    end
+
+    def capture_pr_checks_once(args, attempt)
+      capture_gh(
+        args,
+        timeout_message: "gh pr checks timed out after #{PrMergeLedger.github_api_timeout_seconds} seconds"
+      )
+    rescue Error => e
+      raise if attempt >= GITHUB_API_MAX_ATTEMPTS
+
+      ["", e.message, failed_status]
+    end
+
+    def usable_pr_checks_result?(stdout, stderr, status, required:)
+      return true if status.success?
+      return true unless PrMergeLedger.parse_ci_check_rows(stdout).empty?
+
+      required && stderr.to_s.match?(/\bno required checks\b/i)
+    end
+
+    def failed_status
+      @failed_status ||= Class.new do
+        def success?
+          false
+        end
+
+        def exitstatus
+          nil
+        end
+      end.new
+    end
+
+    def pr_checks_error_message(*results)
+      results.compact.filter_map do |result|
+        next if result.fetch(:success)
+
+        scope = result.fetch(:required) ? "required" : "full"
+        details = [result.fetch(:stderr), result.fetch(:stdout)].map(&:strip).reject(&:empty?).join(" | ")
+        details = "no command output" if details.empty?
+        "gh pr checks #{scope} failed with exit #{status_exitstatus(result.fetch(:status))}: #{details}"
+      end.join("; ")
+    end
+
+    def status_exitstatus(status)
+      return status.exitstatus if status.respond_to?(:exitstatus) && status.exitstatus
+
+      "unknown"
+    end
+
+    def fetch_paginated_connection(pr_number, query, connection_name)
+      nodes = []
+      cursor = nil
+      page_count = 0
+
+      loop do
+        page_count += 1
+        if page_count > MAX_GRAPHQL_PAGES
+          raise Error, "pagination exceeded #{MAX_GRAPHQL_PAGES} pages for #{connection_name}"
+        end
+
+        response = graphql(query, pr: pr_number, endCursor: cursor)
+        pull_request = response.dig("data", "repository", "pullRequest")
+        raise Error, "PR ##{pr_number} was not found" unless pull_request
+
+        connection = pull_request.fetch(connection_name)
+        nodes.concat(connection.fetch("nodes"))
+        page_info = connection.fetch("pageInfo")
+        break unless page_info.fetch("hasNextPage")
+
+        cursor = next_cursor(page_info, connection_name, cursor)
+      end
+
+      nodes
+    end
+
+    def next_cursor(page_info, connection_name, previous_cursor)
+      cursor = page_info.fetch("endCursor")
+      if cursor.nil? || cursor.to_s.empty? || cursor == previous_cursor
+        raise Error, "pagination cursor did not advance for #{connection_name}"
+      end
+
+      cursor
+    end
+
+    def complete_review_thread_comments(thread)
+      raw_comments = thread["comments"]
+      return thread unless raw_comments.is_a?(Hash)
+
+      page_info = raw_comments.fetch("pageInfo")
+      return thread unless page_info.fetch("hasNextPage")
+
+      completed_comments = raw_comments.merge("nodes" => raw_comments.fetch("nodes").dup)
+      page_info = append_remaining_review_thread_comments(
+        thread.fetch("id"),
+        completed_comments.fetch("nodes"),
+        page_info
+      )
+      completed_comments["pageInfo"] = page_info
+      thread.merge("comments" => completed_comments)
+    end
+
+    def append_remaining_review_thread_comments(thread_id, nodes, page_info)
+      cursor = page_info.fetch("endCursor")
+      page_count = 0
+
+      loop do
+        page_count += 1
+        if page_count > MAX_GRAPHQL_PAGES
+          raise Error, "pagination exceeded #{MAX_GRAPHQL_PAGES} pages for reviewThread.comments"
+        end
+
+        response = graphql(review_thread_comments_query, threadId: thread_id, commentsCursor: cursor)
+        fetched_thread = response.dig("data", "node")
+        raise Error, "review thread #{thread_id} was not found" unless fetched_thread
+
+        connection = fetched_thread.fetch("comments")
+        nodes.concat(connection.fetch("nodes"))
+        page_info = connection.fetch("pageInfo")
+        break unless page_info.fetch("hasNextPage")
+
+        cursor = next_cursor(page_info, "reviewThread.comments", cursor)
+      end
+
+      page_info
+    end
+
+    def graphql(query, variables)
+      args = ["api", "graphql", "-f", "owner=#{@owner}", "-f", "name=#{@name}", "-f", "query=#{query}"]
+      variables.each do |key, value|
+        append_graphql_variable(args, key, value)
+      end
+
+      stdout, stderr, status = capture_gh_with_retries(args)
+      raise Error, "gh api graphql failed: #{stderr.strip}" unless status.success?
+
+      JSON.parse(stdout).tap do |parsed|
+        next unless parsed["errors"]
+
+        messages = parsed.fetch("errors").map { |error| error.fetch("message", error.inspect) }
+        raise Error, "gh api graphql returned errors: #{messages.join('; ')}"
+      end
+    end
+
+    def append_graphql_variable(args, key, value)
+      return if value.nil?
+
+      raise Error, "gh api graphql variable key cannot contain '=': #{key}" if key.to_s.include?("=")
+
+      value_string = value.to_s
+      raise Error, "gh api graphql variable #{key} cannot start with @" if value_string.start_with?("@")
+
+      # Arguments are passed to Open3 as argv, so values are not shell-expanded.
+      flag = value.is_a?(Integer) || value == true || value == false ? "-F" : "-f"
+      args.push(flag, "#{key}=#{value_string}")
+    end
+
+    def capture_gh_with_retries(args)
+      attempt = 0
+      loop do
+        attempt += 1
+        stdout, stderr, status = capture_gh(args)
+        return [stdout, stderr, status] if status.success? || attempt >= GITHUB_API_MAX_ATTEMPTS
+        return [stdout, stderr, status] if non_retryable_gh_error?(stderr)
+
+        sleep(GITHUB_API_RETRY_BASE_DELAY_SECONDS * (2**(attempt - 1)))
+      end
+    end
+
+    def non_retryable_gh_error?(stderr)
+      error_text = stderr.to_s
+      return false if error_text.match?(/\bgh (?:api graphql|pr checks|repo view) timed out after \d+ seconds\b/i)
+
+      if error_text.match?(/\b(?:abuse detection|rate limit|rate-limit|secondary rate|too many requests)\b/i)
+        return false
+      end
+
+      error_text.match?(/\b4(?:0\d|1\d|2[0-8]|[3-9]\d)\b|\b(?:Not Found|Unauthorized|Forbidden)\b/i)
+    end
+
+    def capture_gh(args, timeout_message: nil)
+      timeout = PrMergeLedger.github_api_timeout_seconds
+      PrMergeLedger.capture_command_with_timeout(
+        ["gh", *args],
+        timeout:,
+        timeout_message: timeout_message || "gh api graphql timed out after #{timeout} seconds"
+      )
+    end
+
+    def metadata_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              number
+              title
+              url
+              state
+              isDraft
+              baseRefName
+              headRefName
+              headRefOid
+              mergedAt
+              reviewDecision
+              body
+              author { login }
+              isCrossRepository
+              commits(last:1) {
+                nodes {
+                  commit {
+                    oid
+                    committedDate
+                  }
+                }
+              }
+              files(first:100, after:$endCursor) {
+                nodes { path }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def labels_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              labels(first:100, after:$endCursor) {
+                nodes { name }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def hosted_check_suites_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $headSha:String!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            object(expression:$headSha) {
+              ... on Commit {
+                checkSuites(first:100, after:$endCursor) {
+                  nodes {
+                    id
+                    status
+                    conclusion
+                    url
+                    workflowRun {
+                      event
+                      createdAt
+                      workflow { name }
+                    }
+                    checkRuns(first:100) {
+                      nodes {
+                        name
+                        status
+                        conclusion
+                        detailsUrl
+                      }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def review_threads_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              reviewThreads(first:100, after:$endCursor) {
+                nodes {
+                  id
+                  isResolved
+                  isOutdated
+                  path
+                  line
+                  comments(first:100) {
+                    nodes {
+                      id
+                      databaseId
+                      body
+                      author { login }
+                      authorAssociation
+                      url
+                      path
+                      line
+                      createdAt
+                      outdated
+                      replyTo { id databaseId url }
+                      commit { oid }
+                      pullRequestReview {
+                        id
+                        state
+                        submittedAt
+                        commit { oid }
+                        author { login }
+                      }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def review_thread_comments_query
+      <<~GRAPHQL
+        query($threadId:ID!, $commentsCursor:String) {
+          node(id:$threadId) {
+            ... on PullRequestReviewThread {
+              comments(first:100, after:$commentsCursor) {
+                nodes {
+                  id
+                  databaseId
+                  body
+                  author { login }
+                  authorAssociation
+                  url
+                  path
+                  line
+                  createdAt
+                  outdated
+                  replyTo { id databaseId url }
+                  commit { oid }
+                  pullRequestReview {
+                    id
+                    state
+                    submittedAt
+                    commit { oid }
+                    author { login }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def reviews_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              reviews(first:100, after:$endCursor) {
+                nodes {
+                  id
+                  state
+                  submittedAt
+                  author { login }
+                  commit { oid }
+                  url
+                  body
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def comments_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              comments(first:100, after:$endCursor) {
+                nodes {
+                  id
+                  body
+                  author { login }
+                  authorAssociation
+                  url
+                  createdAt
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+
+    def hosted_ci_label_events_query
+      <<~GRAPHQL
+        query($owner:String!, $name:String!, $pr:Int!, $endCursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$pr) {
+              timelineItems(
+                first:100
+                after:$endCursor
+                itemTypes:[LABELED_EVENT, UNLABELED_EVENT]
+              ) {
+                nodes {
+                  __typename
+                  ... on LabeledEvent {
+                    createdAt
+                    actor { login }
+                    label { name }
+                  }
+                  ... on UnlabeledEvent {
+                    createdAt
+                    actor { login }
+                    label { name }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+      GRAPHQL
+    end
+  end
+end
+# rubocop:enable Metrics/ClassLength
+
+exit PrMergeLedger.run(ARGV) if $PROGRAM_NAME == __FILE__

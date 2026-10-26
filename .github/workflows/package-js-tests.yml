@@ -1,0 +1,154 @@
+name: JS unit tests for Renderer package
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/**'
+    # Always trigger on main/release branches; non-runtime detection handles skipping heavy jobs
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      force_full_hosted:
+        description: 'Force full hosted CI (bypass optimized detect-changes)'
+        required: false
+        type: boolean
+        default: false
+      pull_request_base_ref:
+        description: 'Pull request base branch for label/command dispatches'
+        required: false
+        type: string
+      pull_request_base_sha:
+        description: 'Pull request base SHA for label/command dispatches'
+        required: false
+        type: string
+
+jobs:
+  detect-changes:
+    # Branch deletion push events have no checkoutable release ref.
+    if: github.event_name != 'push' || github.event.deleted != true
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    runs-on: ubuntu-22.04
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+      non_runtime_only: ${{ steps.detect.outputs.non_runtime_only }}
+      run_lint: ${{ steps.detect.outputs.run_lint }}
+      run_js_tests: ${{ steps.detect.outputs.run_js_tests }}
+      run_ruby_tests: ${{ steps.detect.outputs.run_ruby_tests }}
+      run_dummy_tests: ${{ steps.detect.outputs.run_dummy_tests }}
+      run_generators: ${{ steps.detect.outputs.run_generators }}
+      should_run_hosted_ci: ${{ steps.hosted-ci.outputs.should_run_hosted_ci }}
+      should_force_full_hosted_ci: ${{ steps.hosted-ci.outputs.should_force_full_hosted_ci }}
+      should_use_full_matrix: ${{ steps.hosted-ci.outputs.should_use_full_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is only needed for workflow_dispatch base-SHA reruns.
+          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && '0' || '50' }}
+          persist-credentials: false
+      - name: Select hosted CI mode
+        id: hosted-ci
+        uses: ./.github/actions/hosted-ci-selectors
+        with:
+          force-full-hosted: ${{ inputs.force_full_hosted || false }}
+          base-ref: ${{ inputs.pull_request_base_ref || '' }}
+      - name: Detect relevant changes
+        id: detect
+        env:
+          PULL_REQUEST_BASE_SHA: ${{ inputs.pull_request_base_sha || '' }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'origin/main' }}
+        run: |
+          # Force-full hosted CI is the explicit escape hatch that bypasses
+          # optimized change selection. Hosted readiness alone stays path-based.
+          if [ "${{ steps.hosted-ci.outputs.should_force_full_hosted_ci }}" = "true" ]; then
+            {
+              echo "run_lint=true"
+              echo "run_js_tests=true"
+              echo "run_ruby_tests=true"
+              echo "run_dummy_tests=true"
+              echo "run_generators=true"
+              echo "docs_only=false"
+              echo "non_runtime_only=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          script/ci-required-diff-base
+        shell: bash
+      - name: Guard docs-only main pushes
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'merge_group' &&
+           github.event.merge_group.base_ref == 'refs/heads/main')
+        uses: ./.github/actions/ensure-main-docs-safety
+        with:
+          docs-only: ${{ steps.detect.outputs.docs_only }}
+          previous-sha: ${{ github.event.before || github.event.merge_group.base_sha }}
+
+  build:
+    needs: detect-changes
+    # Run hosted JS tests only when hosted CI is allowed and JS paths changed.
+    if: |
+      needs.detect-changes.outputs.should_run_hosted_ci == 'true' &&
+      needs.detect-changes.outputs.run_js_tests == 'true'
+    strategy:
+      matrix:
+        node-version:
+          # Always run: Latest Node version (fast feedback on PRs)
+          - '22'
+          # Broad-matrix contexts: minimum supported Node version
+          - '20'
+        exclude:
+          # Skip the minimum Node lane unless this is a broad matrix context:
+          # main, merge queue, release target, or explicit force-full hosted CI.
+          - node-version: ${{ needs.detect-changes.outputs.should_use_full_matrix != 'true' && '20' || '' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+      - name: Print system information
+        run: |
+          echo "Linux release: "; cat /etc/issue
+          echo "Current user: "; whoami
+          echo "Current directory: "; pwd
+          echo "Node version: "; node -v
+          echo "pnpm version: "; pnpm --version
+      - name: run conversion script
+        if: matrix.node-version == '20'
+        run: script/convert
+      - name: Install Node modules with pnpm
+        run: pnpm install ${{ matrix.node-version == '22' && '--frozen-lockfile' || '--no-frozen-lockfile' }}
+      - name: Build Renderer package
+        run: pnpm build
+      - name: Run JS unit tests for react-on-rails package
+        run: pnpm --filter react-on-rails test
+      - name: Run JS unit tests for react-on-rails-pro package
+        run: pnpm --filter react-on-rails-pro test
+      - name: Run JS unit tests for create-react-on-rails-app package
+        run: pnpm --filter create-react-on-rails-app test

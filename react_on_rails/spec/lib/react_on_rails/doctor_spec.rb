@@ -1,0 +1,13162 @@
+# frozen_string_literal: true
+
+require_relative "../../react_on_rails/spec_helper"
+require_relative "../../../lib/react_on_rails/doctor"
+require_relative "../../../lib/react_on_rails/doctor_schema"
+require "fileutils"
+require "tmpdir"
+
+RSpec.describe ReactOnRails::Doctor do
+  let(:doctor) { described_class.new(verbose: false, fix: false) }
+
+  def install_package(name, package_json)
+    FileUtils.mkdir_p("node_modules/#{name}")
+    File.write("node_modules/#{name}/package.json", JSON.generate(package_json))
+  end
+
+  def require_node_runtime!
+    return if ReactOnRails::Utils.command_available?("node")
+
+    skip "Node.js is required for this JavaScript runtime proof"
+  end
+
+  describe "#initialize" do
+    it "initializes with default options" do
+      expect(doctor).to be_instance_of(described_class)
+    end
+
+    it "accepts verbose and fix options" do
+      verbose_doctor = described_class.new(verbose: true, fix: true)
+      expect(verbose_doctor).to be_instance_of(described_class)
+    end
+  end
+
+  describe "#run_diagnosis" do
+    before do
+      # Mock all output methods to avoid actual printing
+      allow(doctor).to receive(:puts)
+      allow(doctor).to receive(:exit)
+
+      # Mock file system interactions
+      allow(File).to receive_messages(exist?: false, directory?: false)
+
+      # Mock the new server bundle path methods
+      allow(doctor).to receive_messages(
+        "`": "",
+        determine_server_bundle_path: "app/javascript/packs/server-bundle.js",
+        server_bundle_filename: "server-bundle.js",
+        npm_test_script?: false,
+        yarn_test_script?: false
+      )
+
+      # Mock the checker to avoid actual system calls
+      checker = instance_double(ReactOnRails::SystemChecker)
+      allow(ReactOnRails::SystemChecker).to receive(:new).and_return(checker)
+      allow(checker).to receive_messages(
+        check_node_installation: true,
+        check_package_manager: true,
+        check_react_on_rails_packages: true,
+        check_shakapacker_configuration: true,
+        check_react_dependencies: true,
+        check_react_on_rails_initializer: true,
+        check_webpack_configuration: true,
+        report_dependency_versions: true,
+        report_shakapacker_version: true,
+        report_bundler_version: true,
+        add_success: true,
+        add_warning: true,
+        add_info: true,
+        errors?: false,
+        warnings?: false,
+        messages: []
+      )
+    end
+
+    it "runs diagnosis without errors" do
+      expect { doctor.run_diagnosis }.not_to raise_error
+    end
+
+    it "prints header" do
+      expect(doctor).to receive(:puts).with(/REACT ON RAILS DOCTOR/)
+      doctor.run_diagnosis
+    end
+
+    it "runs all check sections" do
+      checker = doctor.instance_variable_get(:@checker)
+
+      expect(checker).to receive(:check_node_installation)
+      expect(checker).to receive(:check_package_manager)
+      expect(checker).to receive(:check_react_on_rails_packages)
+      expect(checker).to receive(:check_shakapacker_configuration)
+      expect(checker).to receive(:check_react_dependencies)
+      expect(checker).to receive(:check_react_on_rails_initializer)
+      expect(checker).to receive(:check_webpack_configuration)
+
+      doctor.run_diagnosis
+    end
+
+    it "uses a neutral bundler configuration section header" do
+      checker = doctor.instance_variable_get(:@checker)
+      messages = []
+      allow(checker).to receive(:messages).and_return(messages)
+      allow(checker).to receive(:check_webpack_configuration) do
+        messages << { type: :success, content: "Bundler config checked" }
+      end
+
+      expect(doctor).to receive(:puts).with(/Bundler Configuration:/)
+      expect(doctor).not_to receive(:puts).with(/Webpack Configuration:/)
+
+      doctor.run_diagnosis
+    end
+  end
+
+  describe "JSON output format" do
+    let(:json_doctor) { described_class.new(format: :json) }
+
+    # All check section methods are stubbed so no real system inspection runs;
+    # messages_by_id injects SystemChecker-style messages for specific sections.
+    def stub_check_sections(doctor, messages_by_id = {})
+      checker = doctor.instance_variable_get(:@checker)
+      described_class::CHECK_SECTIONS.each do |section|
+        allow(doctor).to receive(section[:method]) do
+          (messages_by_id[section[:id]] || []).each { |message| checker.messages << message }
+        end
+      end
+    end
+
+    def run_and_parse_json(doctor)
+      output = []
+      allow(doctor).to receive(:exit)
+      allow(doctor).to receive(:puts) { |arg| output << arg.to_s }
+      doctor.run_diagnosis
+      JSON.parse(output.join("\n"))
+    end
+
+    it "rejects unknown formats" do
+      expect { described_class.new(format: :xml) }.to raise_error(ArgumentError, /Invalid doctor format/)
+    end
+
+    it "rejects nil and other non-symbolizable formats with ArgumentError" do
+      expect { described_class.new(format: nil) }.to raise_error(ArgumentError, /Invalid doctor format/)
+      expect { described_class.new(format: 42) }.to raise_error(ArgumentError, /Invalid doctor format/)
+    end
+
+    it "accepts the format as a string" do
+      expect(described_class.new(format: "json").send(:format)).to eq(:json)
+    end
+
+    it "emits valid JSON with schema_version and ror_version" do
+      stub_check_sections(json_doctor)
+      report = run_and_parse_json(json_doctor)
+
+      expect(report["schema_version"]).to eq(1)
+      expect(report["ror_version"]).to eq(ReactOnRails::VERSION)
+    end
+
+    it "validates emitted reports against the public schema contract" do
+      stub_check_sections(
+        json_doctor,
+        "environment_prerequisites" => [{ type: :error, content: "Node is missing" }]
+      )
+      report = run_and_parse_json(json_doctor)
+
+      symbolized_report = JSON.parse(JSON.generate(report), symbolize_names: true)
+
+      expect { ReactOnRails::DoctorSchema.validate!(symbolized_report) }.not_to raise_error
+    end
+
+    it "summarizes statuses with zero counts for absent statuses" do
+      expect(ReactOnRails::DoctorSchema.summarize_statuses(%w[warn warn])).to eq(pass: 0, warn: 2, fail: 0)
+    end
+
+    it "reports a descriptive error when check metadata drifts from check sections" do
+      expect { ReactOnRails::DoctorSchema.metadata("new_check_without_metadata") }
+        .to raise_error(
+          ArgumentError,
+          'Missing DoctorSchema::CHECK_METADATA entry for check id "new_check_without_metadata"'
+        )
+    end
+
+    it "rejects reports that omit a required check field" do
+      stub_check_sections(json_doctor)
+      report = JSON.parse(JSON.generate(run_and_parse_json(json_doctor)), symbolize_names: true)
+      report[:checks].first.delete(:severity)
+
+      expect { ReactOnRails::DoctorSchema.validate!(report) }
+        .to raise_error(ArgumentError, /check missing keys: severity/)
+    end
+
+    it "rejects inconsistent report semantics and duplicate check IDs" do
+      stub_check_sections(json_doctor)
+      report = JSON.parse(JSON.generate(run_and_parse_json(json_doctor)), symbolize_names: true)
+
+      mutations = {
+        "status severity mismatch" => [
+          ->(value) { value[:checks].first[:severity] = "error" }, /severity does not match/
+        ],
+        "overall status mismatch" => [->(value) { value[:status] = "warn" }, /report status does not match/],
+        "summary mismatch" => [->(value) { value[:summary][:pass] -= 1 }, /summary does not match/],
+        "duplicate check ID" => [->(value) { value[:checks][1][:id] = value[:checks][0][:id] }, /ids must be unique/],
+        "non-string version" => [->(value) { value[:ror_version] = 17 }, /ror_version must be a string/],
+        "non-string title" => [->(value) { value[:checks].first[:title] = nil }, /invalid title/]
+      }
+
+      aggregate_failures do
+        mutations.each do |name, (mutation, error_pattern)|
+          mutated_report = Marshal.load(Marshal.dump(report))
+          mutation.call(mutated_report)
+          expect { ReactOnRails::DoctorSchema.validate!(mutated_report) }
+            .to raise_error(ArgumentError, error_pattern), name
+        end
+      end
+    end
+
+    it "rejects malformed nested detail fields" do
+      stub_check_sections(json_doctor, "environment_prerequisites" => [{ type: :info, content: "Checking" }])
+      report = JSON.parse(JSON.generate(run_and_parse_json(json_doctor)), symbolize_names: true)
+
+      mutations = {
+        "missing content" => [->(detail) { detail.delete(:content) }, /detail.*missing keys: content/],
+        "unknown level" => [->(detail) { detail[:level] = "critical" }, /invalid detail level/],
+        "non-string content" => [->(detail) { detail[:content] = nil }, /invalid detail content/]
+      }
+
+      aggregate_failures do
+        mutations.each do |name, (mutation, error_pattern)|
+          mutated_report = Marshal.load(Marshal.dump(report))
+          mutation.call(mutated_report[:checks].first[:details].first)
+          expect { ReactOnRails::DoctorSchema.validate!(mutated_report) }
+            .to raise_error(ArgumentError, error_pattern), name
+        end
+      end
+    end
+
+    it "emits one entry per check section with stable snake_case ids" do
+      stub_check_sections(json_doctor)
+      report = run_and_parse_json(json_doctor)
+
+      expect(report["checks"].map { |check| check["id"] }).to eq(
+        %w[
+          environment_prerequisites
+          react_on_rails_versions
+          react_on_rails_packages
+          javascript_package_dependencies
+          key_configuration_files
+          configuration_analysis
+          bin_dev_launcher_setup
+          rails_integration
+          bundler_configuration
+          testing_setup
+          development_environment
+          react_on_rails_pro_setup
+          node_renderer_rollout_capacity
+          react_server_components
+        ]
+      )
+    end
+
+    it "maps message severities to pass/warn/fail statuses with summary counts" do
+      stub_check_sections(
+        json_doctor,
+        "environment_prerequisites" => [
+          { type: :success, content: "Node OK" },
+          { type: :error, content: "Missing package manager" }
+        ],
+        "react_on_rails_versions" => [{ type: :warning, content: "Version drift" }],
+        "rails_integration" => [{ type: :success, content: "Rails detected" }]
+      )
+      report = run_and_parse_json(json_doctor)
+      checks_by_id = report["checks"].to_h { |check| [check["id"], check] }
+
+      expect(checks_by_id["environment_prerequisites"]["status"]).to eq("fail")
+      expect(checks_by_id["react_on_rails_versions"]["status"]).to eq("warn")
+      expect(checks_by_id["rails_integration"]["status"]).to eq("pass")
+      expect(report["status"]).to eq("fail")
+      expect(report["summary"]).to eq("pass" => 12, "warn" => 1, "fail" => 1)
+      expect(report["checks"].map { |check| check["status"] }.uniq).to all(match(/\A(pass|warn|fail)\z/))
+    end
+
+    it "surfaces the most severe message and full details per check" do
+      stub_check_sections(
+        json_doctor,
+        "environment_prerequisites" => [
+          { type: :info, content: "Checking environment" },
+          { type: :warning, content: "Old Node version" },
+          { type: :error, content: "Missing package manager" }
+        ]
+      )
+      report = run_and_parse_json(json_doctor)
+      check = report["checks"].first
+
+      expect(check["message"]).to eq("Missing package manager")
+      expect(check).to include(
+        "severity" => "error",
+        "fix_command" => nil,
+        "docs_url" => "https://reactonrails.com/docs/api-reference/doctor#check-id-environment-prerequisites"
+      )
+      expect(check["details"]).to eq(
+        [
+          { "level" => "info", "content" => "Checking environment" },
+          { "level" => "warning", "content" => "Old Node version" },
+          { "level" => "error", "content" => "Missing package manager" }
+        ]
+      )
+      expect(check["remediation"]).to include(
+        "files" => ["package.json", "package manager lockfile"],
+        "expected_end_state" => /Node\.js/
+      )
+      expect(check.dig("remediation", "prompt")).to include(
+        "environment_prerequisites",
+        "Missing package manager",
+        "bin/rails react_on_rails:doctor FORMAT=json"
+      )
+    end
+
+    it "reports a null message for passing checks even when info/success details exist" do
+      stub_check_sections(
+        json_doctor,
+        "rails_integration" => [
+          { type: :info, content: "Checking Rails" },
+          { type: :success, content: "Rails detected" }
+        ]
+      )
+      report = run_and_parse_json(json_doctor)
+      check = report["checks"].find { |entry| entry["id"] == "rails_integration" }
+
+      expect(check["status"]).to eq("pass")
+      expect(check["severity"]).to eq("info")
+      expect(check["message"]).to be_nil
+      expect(check["remediation"]).to be_nil
+      expect(check["details"].length).to eq(2)
+    end
+
+    it "does not attach section-wide fix commands to unrelated failures" do
+      stub_check_sections(
+        json_doctor,
+        "react_on_rails_packages" => [{ type: :error, content: "Shakapacker is not configured" }],
+        "key_configuration_files" => [{ type: :warning, content: "Initializer is missing" }]
+      )
+      checks = run_and_parse_json(json_doctor)["checks"].to_h { |check| [check["id"], check] }
+
+      expect(checks["react_on_rails_packages"]["fix_command"]).to be_nil
+      expect(checks["key_configuration_files"]["fix_command"]).to be_nil
+      expect(checks["environment_prerequisites"]["fix_command"]).to be_nil
+    end
+
+    it "routes layout warnings to configuration analysis with layout remediation" do
+      routing_doctor = described_class.new(format: :json)
+      checker = routing_doctor.instance_variable_get(:@checker)
+      routed_methods = %i[check_key_files check_configuration_details]
+      described_class::CHECK_SECTIONS.each do |section|
+        next if routed_methods.include?(section[:method])
+
+        allow(routing_doctor).to receive(section[:method])
+      end
+
+      allow(File).to receive(:exist?).and_return(true)
+      allow(routing_doctor).to receive_messages(
+        resolved_webpack_config_path: "config/webpack",
+        check_server_rendering_engine: nil,
+        check_shakapacker_configuration_details: nil,
+        check_react_on_rails_configuration_details: nil,
+        check_server_bundle_prerender_consistency: nil
+      )
+      expect(routing_doctor).to receive(:check_layout_files).once do
+        checker.add_warning("Auto-loaded component CSS is not flushed")
+      end
+
+      checks = run_and_parse_json(routing_doctor)["checks"].to_h { |check| [check["id"], check] }
+
+      expect(checks["key_configuration_files"]["status"]).to eq("pass")
+      expect(checks["configuration_analysis"]).to include(
+        "status" => "warn",
+        "message" => "Auto-loaded component CSS is not flushed"
+      )
+      expect(checks["configuration_analysis"].dig("remediation", "files")).to include("app/views/layouts")
+      expect(checks["configuration_analysis"].dig("remediation", "prompt")).to include("app/views/layouts")
+    end
+
+    it "keeps checks and remediation output deterministic" do
+      messages = { "testing_setup" => [{ type: :warning, content: "No test helper" }] }
+      first_doctor = described_class.new(format: :json)
+      second_doctor = described_class.new(format: :json)
+      stub_check_sections(first_doctor, messages)
+      stub_check_sections(second_doctor, messages)
+
+      expect(run_and_parse_json(first_doctor)).to eq(run_and_parse_json(second_doctor))
+    end
+
+    it "reports warn overall status and exit code 0 when only warnings exist" do
+      stub_check_sections(json_doctor, "testing_setup" => [{ type: :warning, content: "No test helper" }])
+      allow(json_doctor).to receive(:puts)
+
+      expect(json_doctor).to receive(:exit).with(0)
+      json_doctor.run_diagnosis
+    end
+
+    it "publishes predictable exit codes for every report severity" do
+      expect(ReactOnRails::DoctorSchema::EXIT_CODES).to eq(pass: 0, warn: 0, fail: 1)
+    end
+
+    it "exits with status 1 when any check fails" do
+      stub_check_sections(json_doctor, "rails_integration" => [{ type: :error, content: "No Rails app" }])
+      allow(json_doctor).to receive(:puts)
+
+      expect(json_doctor).to receive(:exit).with(1)
+      json_doctor.run_diagnosis
+    end
+
+    it "redirects stray check output to stderr so stdout stays valid JSON" do
+      stub_check_sections(json_doctor)
+      checker = json_doctor.instance_variable_get(:@checker)
+      allow(json_doctor).to receive(:check_environment) do
+        puts "stray check output"
+        checker.messages << { type: :success, content: "Node OK" }
+      end
+      allow(json_doctor).to receive(:exit)
+
+      output = []
+      allow(json_doctor).to receive(:puts) { |arg| output << arg.to_s }
+
+      expect { json_doctor.run_diagnosis }.to output(/stray check output/).to_stderr
+      expect { JSON.parse(output.join("\n")) }.not_to raise_error
+      expect(output.join).not_to include("stray check output")
+    end
+
+    it "captures fd-level stdout writes (STDOUT/subprocesses), not just $stdout" do
+      stub_check_sections(json_doctor)
+      allow(json_doctor).to receive(:check_environment) do
+        STDOUT.puts "fd-level stray output" # rubocop:disable Style/GlobalStdStream
+        system("echo subprocess stray output")
+      end
+      allow(json_doctor).to receive(:exit)
+
+      output = []
+      allow(json_doctor).to receive(:puts) { |arg| output << arg.to_s }
+
+      expect { json_doctor.run_diagnosis }
+        .to output(/fd-level stray output.*subprocess stray output/m).to_stderr
+      expect { JSON.parse(output.join("\n")) }.not_to raise_error
+      expect(output.join).not_to include("stray output")
+    end
+
+    it "keeps the human-readable text format as the default" do
+      default_doctor = described_class.new
+      expect(default_doctor.send(:format)).to eq(:text)
+    end
+  end
+
+  describe "selected check sections" do
+    def stub_all_check_sections(doctor)
+      described_class::CHECK_SECTIONS.each do |section|
+        allow(doctor).to receive(section[:method])
+      end
+    end
+
+    it "runs only the selected check in human-readable output" do
+      rsc_doctor = described_class.new(only: "react_server_components")
+      checker = rsc_doctor.instance_variable_get(:@checker)
+      stub_all_check_sections(rsc_doctor)
+      allow(rsc_doctor).to receive(:check_rsc_setup) do
+        checker.messages << { type: :success, content: "RSC-only doctor check ran" }
+      end
+      allow(rsc_doctor).to receive(:exit)
+
+      expect { rsc_doctor.run_diagnosis }
+        .to output(/React Server Components:.*RSC-only doctor check ran/m).to_stdout
+
+      expect(rsc_doctor).to have_received(:check_rsc_setup)
+      expect(rsc_doctor).not_to have_received(:check_environment)
+    end
+
+    it "emits only the selected check in JSON output" do
+      rsc_doctor = described_class.new(format: :json, only: [:react_server_components])
+      checker = rsc_doctor.instance_variable_get(:@checker)
+      stub_all_check_sections(rsc_doctor)
+      allow(rsc_doctor).to receive(:check_rsc_setup) do
+        checker.messages << { type: :warning, content: "RSC artifact missing" }
+      end
+      allow(rsc_doctor).to receive(:exit)
+
+      output = []
+      allow(rsc_doctor).to receive(:puts) { |arg| output << arg.to_s }
+
+      rsc_doctor.run_diagnosis
+
+      report = JSON.parse(output.join("\n"))
+      expect(report["checks"].map { |check| check["id"] }).to eq(["react_server_components"])
+      expect(report["summary"]).to eq("pass" => 0, "warn" => 1, "fail" => 0)
+      expect(report["status"]).to eq("warn")
+    end
+
+    it "rejects unknown check selectors" do
+      expect { described_class.new(only: "missing_section") }
+        .to raise_error(ArgumentError, /Invalid doctor check selector/)
+    end
+  end
+
+  describe "#dev_server_label" do
+    it "uses the canonical webpack-dev-server spelling for webpack apps" do
+      allow(doctor).to receive(:configured_assets_bundler).and_return("webpack")
+
+      expect(doctor.send(:dev_server_label)).to eq("webpack-dev-server")
+    end
+  end
+
+  describe "#active_assets_bundler" do
+    around do |example|
+      previous_bundler = ENV.fetch("SHAKAPACKER_ASSETS_BUNDLER", nil)
+      example.run
+    ensure
+      if previous_bundler.nil?
+        ENV.delete("SHAKAPACKER_ASSETS_BUNDLER")
+      else
+        ENV["SHAKAPACKER_ASSETS_BUNDLER"] = previous_bundler
+      end
+    end
+
+    it "honors the command-level Shakapacker assets bundler override" do
+      ENV["SHAKAPACKER_ASSETS_BUNDLER"] = "rspack"
+      allow(doctor).to receive(:configured_assets_bundler).and_return("webpack")
+
+      expect(doctor.send(:active_assets_bundler)).to eq("rspack")
+    end
+
+    it "ignores unsupported command-level Shakapacker assets bundler values" do
+      ENV["SHAKAPACKER_ASSETS_BUNDLER"] = "vite"
+      allow(doctor).to receive(:configured_assets_bundler).and_return("webpack")
+
+      expect(doctor.send(:active_assets_bundler)).to eq("webpack")
+    end
+  end
+
+  describe "#parsed_shakapacker_config" do
+    it "reads and parses config/shakapacker.yml at most once per Doctor instance" do
+      # Exercises Doctor's memoizing super override: several checks consult the
+      # config through different private helpers, but one diagnosis must read and
+      # parse config/shakapacker.yml only once. Stubbing File keeps both the
+      # memoization and the shared helper implementation in the path under test.
+      config_path = "/tmp/myapp/config/shakapacker.yml"
+      allow(doctor).to receive(:shakapacker_config_path).and_return(config_path)
+      allow(File).to receive(:exist?).with(config_path).and_return(true)
+      allow(File).to receive(:read).with(config_path).and_return("default:\n  assets_bundler: rspack\n")
+
+      first = doctor.send(:parsed_shakapacker_config)
+      doctor.send(:active_assets_bundler)
+      doctor.send(:development_hmr_enabled?)
+      second = doctor.send(:parsed_shakapacker_config)
+
+      aggregate_failures do
+        expect(first).to be(second)
+        expect(File).to have_received(:read).with(config_path).once
+      end
+    end
+
+    it "memoizes nil when config/shakapacker.yml is missing" do
+      config_path = "/tmp/myapp/config/shakapacker.yml"
+      allow(doctor).to receive(:shakapacker_config_path).and_return(config_path)
+      allow(File).to receive(:exist?).with(config_path).and_return(false)
+
+      first = doctor.send(:parsed_shakapacker_config)
+      doctor.send(:active_assets_bundler)
+      second = doctor.send(:parsed_shakapacker_config)
+
+      aggregate_failures do
+        expect(first).to be_nil
+        expect(second).to be_nil
+        expect(File).to have_received(:exist?).with(config_path).once
+      end
+    end
+
+    it "memoizes nil when config/shakapacker.yml cannot be read" do
+      config_path = "/tmp/myapp/config/shakapacker.yml"
+      allow(doctor).to receive(:shakapacker_config_path).and_return(config_path)
+      allow(File).to receive(:exist?).with(config_path).and_return(true)
+      allow(File).to receive(:read).with(config_path).and_raise(Errno::EACCES)
+
+      first = doctor.send(:parsed_shakapacker_config)
+      doctor.send(:active_assets_bundler)
+      second = doctor.send(:parsed_shakapacker_config)
+
+      aggregate_failures do
+        expect(first).to be_nil
+        expect(second).to be_nil
+        expect(File).to have_received(:read).with(config_path).once
+      end
+    end
+  end
+
+  describe "#development_dev_server_config" do
+    it "defaults to HMR when development dev_server override omits mode keys" do
+      allow(doctor).to receive(:parsed_shakapacker_config).and_return(
+        "default" => { "dev_server" => { "hmr" => true, "host" => "0.0.0.0" } },
+        "development" => { "dev_server" => { "port" => 3035 } }
+      )
+
+      aggregate_failures do
+        expect(doctor.send(:development_dev_server_config)).to eq("port" => 3035)
+        expect(doctor.send(:development_hmr_enabled?)).to be(true)
+      end
+    end
+
+    it "normalizes selected dev_server keys to strings" do
+      allow(doctor).to receive(:parsed_shakapacker_config).and_return(
+        "default" => { dev_server: { hmr: true } },
+        "development" => { "dev_server" => { "hmr" => false } }
+      )
+
+      aggregate_failures do
+        expect(doctor.send(:development_dev_server_config)).to include("hmr" => false)
+        expect(doctor.send(:development_dev_server_config)).not_to have_key(:hmr)
+        expect(doctor.send(:development_hmr_enabled?)).to be(false)
+      end
+    end
+
+    it "treats hmr only mode as HMR" do
+      allow(doctor).to receive(:parsed_shakapacker_config).and_return(
+        "development" => { "dev_server" => { "hmr" => "only" } }
+      )
+
+      expect(doctor.send(:development_hmr_enabled?)).to be(true)
+    end
+  end
+
+  describe "#print_next_steps" do
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    it "uses the configured reload mode for bin/dev next steps" do
+      FileUtils.mkdir_p("bin")
+      FileUtils.touch("bin/dev")
+      File.write("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      doctor.instance_variable_set(
+        :@checker,
+        instance_double(ReactOnRails::SystemChecker, errors?: false, warnings?: false, messages: [])
+      )
+      allow(doctor).to receive_messages(
+        default_dev_server_mode: :live_reload,
+        npm_test_script?: false,
+        yarn_test_script?: false
+      )
+      allow(doctor).to receive(:puts)
+
+      expect(doctor).to receive(:puts).with(a_string_including("Start development with live reload:"))
+
+      doctor.send(:print_next_steps)
+    end
+  end
+
+  describe "#check_procfiles" do
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    it "preserves webpack-specific Procfile descriptions for webpack apps" do
+      write_project_file("config/shakapacker.yml", "default:\n  assets_bundler: webpack\n")
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("Procfile.dev-static-assets", "web: bin/rails server\njs: bin/shakapacker --watch\n")
+
+      doctor.send(:check_procfiles)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("Live reload development with webpack-dev-server"))
+      expect(success_messages).to include(a_string_including("Static development with webpack --watch"))
+    end
+
+    it "uses neutral/rspack Procfile descriptions for rspack live-reload apps" do
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        default:
+          assets_bundler: rspack
+        development:
+          dev_server:
+            hmr: false
+            live_reload: true
+      YAML
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("Procfile.dev-static-assets", "web: bin/rails server\njs: bin/shakapacker --watch\n")
+
+      doctor.send(:check_procfiles)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("Live reload development with Rspack dev server"))
+      expect(success_messages).to include(a_string_including("Static development with rspack watch"))
+      expect(success_messages).not_to include(a_string_including("webpack-dev-server"))
+      expect(success_messages).not_to include(a_string_including("webpack --watch"))
+    end
+
+    it "detects rspack Procfile descriptions from a custom SHAKAPACKER_CONFIG path" do
+      old_config_path = ENV.fetch("SHAKAPACKER_CONFIG", nil)
+      ENV["SHAKAPACKER_CONFIG"] = "config/custom_shakapacker.yml"
+
+      write_project_file("config/shakapacker.yml", "default:\n  assets_bundler: webpack\n")
+      write_project_file("config/custom_shakapacker.yml", <<~YAML)
+        default:
+          assets_bundler: rspack
+        development:
+          dev_server:
+            hmr: false
+      YAML
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("Procfile.dev-static-assets", "web: bin/rails server\njs: bin/shakapacker --watch\n")
+
+      doctor.send(:check_procfiles)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("Live reload development with Rspack dev server"))
+    ensure
+      old_config_path.nil? ? ENV.delete("SHAKAPACKER_CONFIG") : ENV["SHAKAPACKER_CONFIG"] = old_config_path
+    end
+
+    it "treats live_reload true without hmr as live reload" do
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        default:
+          assets_bundler: rspack
+        development:
+          dev_server:
+            live_reload: true
+      YAML
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("Procfile.dev-static-assets", "web: bin/rails server\njs: bin/shakapacker --watch\n")
+
+      doctor.send(:check_procfiles)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("Live reload development with Rspack dev server"))
+      expect(success_messages).not_to include(a_string_including("HMR development with Rspack dev server"))
+    end
+
+    it "falls back to webpack labels when shakapacker config cannot be parsed" do
+      write_project_file("config/shakapacker.yml", "default:\n  assets_bundler: [rspack\n")
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("Procfile.dev-static-assets", "web: bin/rails server\njs: bin/shakapacker --watch\n")
+
+      expect { doctor.send(:check_procfiles) }.not_to raise_error
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("HMR development with webpack-dev-server"))
+      expect(success_messages).to include(a_string_including("Static development with webpack --watch"))
+    end
+  end
+
+  describe "#check_react_on_rails_initializer" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:runtime_config) do
+      instance_double(
+        ReactOnRails::Configuration,
+        server_bundle_js_file: "runtime-server-bundle.js",
+        server_bundle_output_path: "runtime-ssr-output",
+        enforce_private_server_bundles: true,
+        prerender: true,
+        server_renderer_pool_size: 3,
+        server_renderer_timeout: 45,
+        raise_on_prerender_error: true,
+        generated_component_packs_loading_strategy: :async,
+        auto_load_bundle: true,
+        component_registry_timeout: 7000,
+        development_mode: false,
+        trace: false,
+        logging_on_server: false,
+        replay_console: false,
+        build_test_command: "RAILS_ENV=test bin/shakapacker",
+        build_production_command: "RAILS_ENV=production bin/shakapacker",
+        i18n_dir: nil,
+        i18n_yml_dir: nil,
+        i18n_output_format: nil,
+        components_subdirectory: nil,
+        same_bundle_for_client_and_server: false,
+        random_dom_id: nil,
+        rendering_extension: nil,
+        rendering_props_extension: nil
+      )
+    end
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    it "prefers runtime values over initializer regex parsing" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.server_bundle_js_file = "initializer-server-bundle.js"
+          config.prerender = false
+          config.auto_load_bundle = false
+        end
+      RUBY
+
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(info_messages).to include(a_string_including("Using loaded runtime configuration values"))
+      expect(info_messages).to include(a_string_including("server_bundle_js_file: runtime-server-bundle.js"))
+      expect(info_messages).to include(a_string_including("prerender: true"))
+      expect(info_messages).to include(a_string_including("auto_load_bundle: true"))
+      expect(info_messages).not_to include(a_string_including("random_dom_id:"))
+      expect(info_messages).not_to include(a_string_including("initializer-server-bundle.js"))
+    end
+
+    it "uses runtime values when initializer file is missing" do
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(warning_messages).not_to include(
+        a_string_including("React on Rails configuration file not found: config/initializers/react_on_rails.rb")
+      )
+      expect(info_messages).to include(
+        a_string_including("No config/initializers/react_on_rails.rb found (using runtime configuration)")
+      )
+      expect(info_messages).to include(a_string_including("Using loaded runtime configuration values"))
+      expect(info_messages).to include(a_string_including("server_bundle_js_file: runtime-server-bundle.js"))
+    end
+
+    it "shows initializer/default bundle value when runtime server_bundle_js_file is nil" do
+      allow(runtime_config).to receive(:server_bundle_js_file).and_return(nil)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(
+        a_string_including("server_bundle_js_file: server-bundle.js (initializer/default)")
+      )
+    end
+
+    it "treats whitespace-only runtime server_bundle_js_file as disabled" do
+      allow(runtime_config).to receive(:server_bundle_js_file).and_return("   ")
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(
+        a_string_including('server_bundle_js_file: "" (disabled)')
+      )
+    end
+
+    it "shows SSR-disabled default when runtime config is unavailable and initializer does not set server bundle" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.prerender = false
+        end
+      RUBY
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(nil)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(
+        a_string_including('server_bundle_js_file: "" (default, SSR disabled)')
+      )
+    end
+
+    it "omits component_registry_timeout when runtime value is the default" do
+      allow(runtime_config).to receive(:component_registry_timeout).and_return(5000)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(a_string_including("component_registry_timeout"))
+    end
+
+    it "omits auto_load_bundle when runtime value is the default" do
+      allow(runtime_config).to receive(:auto_load_bundle).and_return(false)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(a_string_including("auto_load_bundle"))
+    end
+
+    it "omits development/debugging runtime values when they match defaults" do
+      allow(runtime_config).to receive_messages(
+        development_mode: Rails.env.development?,
+        trace: Rails.env.development?,
+        logging_on_server: true,
+        replay_console: true
+      )
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(a_string_including("development_mode"))
+      expect(info_messages).not_to include(a_string_including("trace"))
+      expect(info_messages).not_to include(a_string_including("logging_on_server"))
+      expect(info_messages).not_to include(a_string_including("replay_console"))
+    end
+
+    it "reports nil logging/replay values explicitly when runtime config is unexpected" do
+      allow(runtime_config).to receive_messages(logging_on_server: nil, replay_console: nil)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(a_string_including("logging_on_server: nil"))
+      expect(info_messages).to include(a_string_including("replay_console: nil"))
+    end
+
+    it "omits enforce_private_server_bundles when runtime value is the default" do
+      allow(runtime_config).to receive(:enforce_private_server_bundles).and_return(false)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(a_string_including("enforce_private_server_bundles"))
+    end
+
+    it "omits raise_on_prerender_error when runtime value matches environment default" do
+      allow(runtime_config).to receive(:raise_on_prerender_error).and_return(Rails.env.development?)
+      allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+      doctor.send(:check_react_on_rails_initializer)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(a_string_including("raise_on_prerender_error"))
+    end
+  end
+
+  describe "server bundle path detection" do
+    let(:doctor) { described_class.new }
+
+    describe "#determine_server_bundle_path" do
+      context "when Shakapacker gem is available with relative paths" do
+        let(:shakapacker_config) do
+          instance_double(Shakapacker::Configuration, source_path: "client/app", source_entry_path: "packs")
+        end
+
+        before do
+          shakapacker_module = instance_double(Shakapacker, config: shakapacker_config)
+          stub_const("Shakapacker", shakapacker_module)
+          allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+          allow(doctor).to receive(:server_bundle_filename).and_return("server-bundle.js")
+          allow(File).to receive(:exist?).and_call_original
+          %w[.js .jsx .ts .tsx .mjs .cjs].each do |extension|
+            allow(File).to receive(:exist?).with("client/app/packs/server-bundle#{extension}").and_return(false)
+          end
+        end
+
+        it "uses Shakapacker API configuration with relative paths" do
+          path = doctor.send(:determine_server_bundle_path)
+          expect(path).to eq("client/app/packs/server-bundle.js")
+        end
+
+        it "accepts a TypeScript server bundle source file when the configured filename is .js" do
+          allow(File).to receive(:exist?).with("client/app/packs/server-bundle.ts").and_return(true)
+
+          path = doctor.send(:determine_server_bundle_path)
+
+          expect(path).to eq("client/app/packs/server-bundle.ts")
+        end
+      end
+
+      context "when Shakapacker gem is available with absolute paths" do
+        let(:rails_root) { "/Users/test/myapp" }
+        let(:shakapacker_config) do
+          instance_double(Shakapacker::Configuration, source_path: "#{rails_root}/client/app",
+                                                      source_entry_path: "packs")
+        end
+
+        before do
+          shakapacker_module = instance_double(Shakapacker, config: shakapacker_config)
+          stub_const("Shakapacker", shakapacker_module)
+          allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+          allow(doctor).to receive(:server_bundle_filename).and_return("server-bundle.js")
+          allow(Dir).to receive(:pwd).and_return(rails_root)
+          allow(File).to receive(:exist?).and_call_original
+          %w[.js .jsx .ts .tsx .mjs .cjs].each do |ext|
+            allow(File).to receive(:exist?).with("client/app/packs/server-bundle#{ext}").and_return(false)
+          end
+        end
+
+        it "converts absolute paths to relative paths" do
+          path = doctor.send(:determine_server_bundle_path)
+          expect(path).to eq("client/app/packs/server-bundle.js")
+        end
+      end
+
+      context "when Shakapacker gem returns nested absolute paths" do
+        let(:rails_root) { "/Users/test/myapp" }
+        let(:shakapacker_config) do
+          instance_double(Shakapacker::Configuration, source_path: "#{rails_root}/client/app",
+                                                      source_entry_path: "#{rails_root}/client/app/packs")
+        end
+
+        before do
+          shakapacker_module = instance_double(Shakapacker, config: shakapacker_config)
+          stub_const("Shakapacker", shakapacker_module)
+          allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+          allow(doctor).to receive(:server_bundle_filename).and_return("server-bundle.js")
+          allow(Dir).to receive(:pwd).and_return(rails_root)
+          allow(File).to receive(:exist?).and_call_original
+          %w[.js .jsx .ts .tsx .mjs .cjs].each do |ext|
+            allow(File).to receive(:exist?).with("client/app/packs/server-bundle#{ext}").and_return(false)
+          end
+        end
+
+        it "handles nested absolute paths correctly" do
+          path = doctor.send(:determine_server_bundle_path)
+          expect(path).to eq("client/app/packs/server-bundle.js")
+        end
+      end
+
+      context "when Shakapacker gem is not available" do
+        before do
+          allow(doctor).to receive(:require).with("shakapacker").and_raise(LoadError)
+          allow(doctor).to receive(:server_bundle_filename).and_return("server-bundle.js")
+          allow(File).to receive(:exist?).and_call_original
+          %w[.js .jsx .ts .tsx .mjs .cjs].each do |ext|
+            allow(File).to receive(:exist?).with("app/javascript/packs/server-bundle#{ext}").and_return(false)
+          end
+        end
+
+        it "uses default path" do
+          path = doctor.send(:determine_server_bundle_path)
+          expect(path).to eq("app/javascript/packs/server-bundle.js")
+        end
+
+        it "accepts a TypeScript server bundle source file" do
+          allow(File).to receive(:exist?).with("app/javascript/packs/server-bundle.ts").and_return(true)
+
+          path = doctor.send(:determine_server_bundle_path)
+
+          expect(path).to eq("app/javascript/packs/server-bundle.ts")
+        end
+      end
+    end
+
+    describe "#server_bundle_filename" do
+      context "when runtime config sets server_bundle_js_file to an empty string" do
+        let(:runtime_config) do
+          instance_double(ReactOnRails::Configuration, server_bundle_js_file: "")
+        end
+
+        before do
+          allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+        end
+
+        it "returns an empty string" do
+          filename = doctor.send(:server_bundle_filename)
+          expect(filename).to eq("")
+        end
+      end
+
+      context "when runtime config has nil server_bundle_js_file" do
+        let(:runtime_config) do
+          instance_double(ReactOnRails::Configuration, server_bundle_js_file: nil)
+        end
+
+        before do
+          allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(false)
+        end
+
+        it "falls back to the default filename" do
+          filename = doctor.send(:server_bundle_filename)
+          expect(filename).to eq("server-bundle.js")
+        end
+      end
+
+      context "when react_on_rails.rb has custom filename" do
+        let(:initializer_content) do
+          'config.server_bundle_js_file = "custom-server-bundle.js"'
+        end
+
+        before do
+          allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(nil)
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+          allow(File).to receive(:read).with("config/initializers/react_on_rails.rb").and_return(initializer_content)
+        end
+
+        it "extracts filename from initializer" do
+          filename = doctor.send(:server_bundle_filename)
+          expect(filename).to eq("custom-server-bundle.js")
+        end
+      end
+
+      context "when no custom filename is configured" do
+        before do
+          allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(nil)
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(false)
+        end
+
+        it "returns default filename" do
+          filename = doctor.send(:server_bundle_filename)
+          expect(filename).to eq("server-bundle.js")
+        end
+      end
+    end
+  end
+
+  describe "#check_javascript_bundles" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    it "treats whitespace server_bundle_js_file as disabled SSR" do
+      allow(doctor).to receive(:server_bundle_filename).and_return("   ")
+
+      doctor.send(:check_javascript_bundles)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+
+      expect(info_messages).to include(a_string_including("skipping SSR bundle existence check"))
+      expect(warning_messages).to be_empty
+    end
+  end
+
+  describe "#check_async_usage" do
+    let(:checker) { instance_double(ReactOnRails::SystemChecker) }
+
+    before do
+      allow(doctor).to receive(:checker).and_return(checker)
+      allow(checker).to receive_messages(add_error: true, add_warning: true, add_info: true)
+      allow(File).to receive(:exist?).and_call_original
+      allow(Dir).to receive(:glob).and_return([])
+    end
+
+    context "when Pro gem is installed" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      end
+
+      it "skips the check" do
+        doctor.send(:check_async_usage)
+        expect(checker).not_to have_received(:add_error)
+        expect(checker).not_to have_received(:add_warning)
+      end
+    end
+
+    context "when Pro gem is not installed" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      context "when async is used in view files" do
+        before do
+          allow(Dir).to receive(:glob).with("app/views/**/*.erb").and_return(["app/views/layouts/application.html.erb"])
+          allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+          allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+          allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+          allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                       .and_return('<%= javascript_pack_tag "application", :async %>')
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(false)
+          allow(doctor).to receive(:relativize_path).with("app/views/layouts/application.html.erb")
+                                                    .and_return("app/views/layouts/application.html.erb")
+        end
+
+        it "reports an error" do
+          doctor.send(:check_async_usage)
+          expect(checker).to have_received(:add_error).with("🚫 :async usage detected without React on Rails Pro")
+          expect(checker).to have_received(:add_error)
+            .with("  javascript_pack_tag with :async found in view files:")
+        end
+      end
+
+      context "when generated_component_packs_loading_strategy is :async" do
+        before do
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+          allow(File).to receive(:read).with("config/initializers/react_on_rails.rb")
+                                       .and_return("config.generated_component_packs_loading_strategy = :async")
+        end
+
+        it "reports an error" do
+          doctor.send(:check_async_usage)
+          expect(checker).to have_received(:add_error).with("🚫 :async usage detected without React on Rails Pro")
+          expect(checker).to have_received(:add_error)
+            .with("  config.generated_component_packs_loading_strategy = :async in initializer")
+        end
+      end
+
+      context "when no async usage is detected" do
+        before do
+          allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+          allow(File).to receive(:read).with("config/initializers/react_on_rails.rb")
+                                       .and_return("config.generated_component_packs_loading_strategy = :defer")
+        end
+
+        it "does not report any issues" do
+          doctor.send(:check_async_usage)
+          expect(checker).not_to have_received(:add_error)
+          expect(checker).not_to have_received(:add_warning)
+        end
+      end
+    end
+  end
+
+  describe "#check_layout_files" do
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:manifest_directory) { Dir.mktmpdir }
+    let(:manifest_path) { Pathname.new(manifest_directory).join("manifest.json") }
+
+    after { FileUtils.remove_entry(manifest_directory) }
+
+    def stub_layouts(layouts)
+      allow(Dir).to receive(:glob).and_call_original
+      allow(File).to receive(:exist?).and_call_original
+      allow(File).to receive(:read).and_call_original
+      allow(Dir).to receive(:glob).with("app/views/layouts/**/*.erb").and_return(layouts.keys)
+      stub_file_contents(layouts)
+    end
+
+    def stub_controllers_and_views(controllers:, views:)
+      allow(Dir).to receive(:glob).with("app/controllers/**/*_controller.rb").and_return(controllers.keys)
+      stub_file_contents(controllers.merge(views))
+    end
+
+    def stub_file_contents(files)
+      files.each do |path, content|
+        allow(File).to receive(:exist?).with(path).and_return(true)
+        allow(File).to receive(:read).with(path).and_return(content)
+      end
+    end
+
+    def stub_generated_controller_flow(controller:, view:)
+      stub_layouts(
+        "app/views/layouts/react_on_rails_default.html.erb" => "<%= javascript_pack_tag %>\n"
+      )
+      stub_controllers_and_views(
+        controllers: { "app/controllers/hello_world_controller.rb" => controller },
+        views: { "app/views/hello_world/index.html.erb" => view }
+      )
+    end
+
+    def stub_manifest_stylesheets(entrypoint, stylesheets)
+      stub_manifest_data(
+        "entrypoints" => {
+          entrypoint => { "assets" => { "js" => ["/packs/#{entrypoint}.js"], "css" => stylesheets } }
+        }
+      )
+    end
+
+    def stub_manifest_data(data)
+      File.write(
+        manifest_path,
+        JSON.generate(data)
+      )
+      shakapacker_config = instance_double(Shakapacker::Configuration, manifest_path:)
+      allow(Shakapacker).to receive(:config).and_return(shakapacker_config)
+    end
+
+    def stub_global_auto_load_bundle(value)
+      stub_react_on_rails_initializer(<<~RUBY)
+        ReactOnRails.configure do |config|
+          config.auto_load_bundle = #{value}
+        end
+      RUBY
+    end
+
+    def stub_react_on_rails_initializer(content)
+      initializer_path = "config/initializers/react_on_rails.rb"
+      allow(File).to receive(:exist?).with(initializer_path).and_return(true)
+      allow(File).to receive(:read).with(initializer_path).and_return(content)
+    end
+
+    context "when a component-level auto-loaded entrypoint emits CSS that the React layout does not flush" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: { card: { title: "Hello" } }, prerender: false, auto_load_bundle: true) %>
+            <%# stylesheet_pack_tag %>
+            <%# public_send("stylesheet_" + "pack_tag") %>
+            <!-- stylesheet_pack_tag -->
+            <!-- <%%= public_send(pack_helper_name) %> -->
+            <p>stylesheet_pack_tag is not configured here</p>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns once and names the generated entrypoint and emitted stylesheet asset" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(
+            content: a_string_including(
+              "generated/StyledComponent",
+              "/packs/generated/StyledComponent-a1b2c3.css"
+            )
+          )
+        )
+      end
+    end
+
+    context "when valid ERB closing-trim markers are used around pack helpers" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/trimmed_missing.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) -%>
+            <%= javascript_pack_tag -%>
+          ERB
+          "app/views/layouts/trimmed_flushed.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= stylesheet_pack_tag -%>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/trimmed_assigned.html.erb" => <<~ERB
+            <% component_html = react_component("StyledComponent", auto_load_bundle: true) -%>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "normalizes trim markers before proving component and pack-helper calls" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("trimmed_missing", "generated/StyledComponent")),
+          hash_including(content: a_string_including("trimmed_assigned", "generated/StyledComponent"))
+        )
+        expect(checker.messages).to include(
+          hash_including(
+            type: :info,
+            content: "  ✅ trimmed_flushed: has both stylesheet_pack_tag and javascript_pack_tag"
+          )
+        )
+      end
+    end
+
+    context "when valid raw-output ERB tags wrap component and pack helpers" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/raw_missing.html.erb" => <<~ERB,
+            <%== react_component("StyledComponent", auto_load_bundle: true) %>
+            <%== javascript_pack_tag %>
+          ERB
+          "app/views/layouts/raw_flushed.html.erb" => <<~ERB,
+            <%== react_component("StyledComponent", auto_load_bundle: true) %>
+            <%== stylesheet_pack_tag %>
+            <%== javascript_pack_tag %>
+          ERB
+          "app/views/layouts/raw_decoys.html.erb" => <<~ERB
+            <%%== react_component("StyledComponent", auto_load_bundle: true) %>
+            <%%== javascript_pack_tag %>
+            <!-- <%== react_component("StyledComponent", auto_load_bundle: true) %> -->
+            <!-- <%== stylesheet_pack_tag %> -->
+            <!-- <%== javascript_pack_tag %> -->
+          ERB
+        )
+      end
+
+      it "uses one output grammar while excluding escaped and commented raw tags" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("raw_missing", "generated/StyledComponent"))
+        )
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ✅ raw_flushed: has both stylesheet_pack_tag and javascript_pack_tag"),
+          hash_including(type: :info, content: "  ℹ️  raw_decoys: no pack tags found")
+        )
+      end
+    end
+
+    context "when a template uses an ISO-8859-1 coding header and source bytes" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        encoded_layout = <<~ERB.encode(Encoding::ISO_8859_1).force_encoding(Encoding::UTF_8)
+          # encoding: ISO-8859-1
+          <p>Café</p>
+          <%= react_component("StyledComponent", auto_load_bundle: true) %>
+          <%= javascript_pack_tag %>
+        ERB
+        stub_layouts("app/views/layouts/application.html.erb" => encoded_layout)
+      end
+
+      it "preserves static helper evidence without aborting on non-UTF-8 bytes" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when a component-bearing layout renders an uninspected static partial" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= render "shared/navigation" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "keeps the layout info but fails the targeted missing-CSS proof closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  application: has javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when a parent layout composes its React output through a layout partial" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB,
+            <%= stylesheet_pack_tag %>
+            <%= render "layouts/react" %>
+          ERB
+          "app/views/layouts/_react.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "analyzes the parent but does not treat its partial as an independent layout" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  application: has stylesheet_pack_tag")
+        )
+        expect(checker.messages).not_to include(
+          hash_including(content: a_string_including("_react"))
+        )
+      end
+    end
+
+    context "when globally enabled auto_load_bundle loads component CSS that the React layout does not flush" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: @props, prerender: false) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_global_auto_load_bundle(true)
+      end
+
+      it "warns once and names the generated entrypoint and emitted stylesheet asset" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(
+            content: a_string_including(
+              "generated/StyledComponent",
+              "/packs/generated/StyledComponent-a1b2c3.css"
+            )
+          )
+        )
+      end
+    end
+
+    context "when react_component is called through the proven self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= self.react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns for the exact self helper AST" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when react_component is called through an arbitrary receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= object.react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not infer a component from the receiver's method name" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when react_component auto-loads CSS from a direct non-output local assignment" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% component_html = react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns because invoking the exact helper eagerly queues the component bundle" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when react_component_hash auto-loads CSS from its documented assignment form" do
+      before do
+        stub_manifest_stylesheets("generated/HelmetComponent", ["/packs/generated/HelmetComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% helmet_data = react_component_hash("HelmetComponent", props: @props, auto_load_bundle: true) %>
+            <%= helmet_data["componentHtml"] %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns for the statically proven hash component entrypoint" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "generated/HelmetComponent",
+              "/packs/generated/HelmetComponent-a1b2c3.css"
+            )
+          )
+        )
+      end
+    end
+
+    context "when react_component_hash is a direct output helper call" do
+      before do
+        stub_manifest_stylesheets("generated/HelmetComponent", ["/packs/generated/HelmetComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component_hash("HelmetComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns for the exact direct helper AST" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/HelmetComponent"))
+        )
+      end
+    end
+
+    context "when react_component_hash is called through self before direct componentHtml access" do
+      before do
+        stub_manifest_stylesheets("generated/HelmetComponent", ["/packs/generated/HelmetComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= self.react_component_hash("HelmetComponent", auto_load_bundle: true)["componentHtml"] %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns for the exact self hash-helper and access AST" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/HelmetComponent"))
+        )
+      end
+    end
+
+    context "when react_component_hash uses an arbitrary receiver or dynamic result access" do
+      before do
+        stub_manifest_stylesheets("generated/HelmetComponent", ["/packs/generated/HelmetComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/arbitrary_receiver.html.erb" => <<~ERB,
+            <%= object.react_component_hash("HelmetComponent", auto_load_bundle: true)["componentHtml"] %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/dynamic_access.html.erb" => <<~ERB
+            <%= self.react_component_hash("HelmetComponent", auto_load_bundle: true)[component_key] %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not infer a component outside the exact self hash-helper and access AST" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when react_component_hash appears only as data or a dynamic dispatch target" do
+      before do
+        stub_manifest_stylesheets("generated/HelmetComponent", ["/packs/generated/HelmetComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% helper_name = "react_component_hash" %>
+            <%= public_send(helper_name, "HelmetComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not infer a component from helper-name text" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when component-level auto_load_bundle is explicitly false while the global setting is true" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: @props, auto_load_bundle: false) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_global_auto_load_bundle(true)
+      end
+
+      it "honors the component-level opt-out" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when unresolved component options follow a literal auto_load_bundle option" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true, **options) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed because the later options can override the literal" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    {
+      "a dynamic options variable" => 'react_component("StyledComponent", options)',
+      "a scalar options argument" => 'react_component("StyledComponent", 42)',
+      "a method call as an option value" => 'react_component("StyledComponent", props: build_props)',
+      "a hash-rocket option" => 'react_component("StyledComponent", { "auto_load_bundle" => true })',
+      "a dynamic option key" => 'react_component("StyledComponent", { option_key => true })'
+    }.each do |description, component_call|
+      context "when #{description} is passed to react_component" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= #{component_call} %>
+              <%= javascript_pack_tag %>
+            ERB
+          )
+          stub_global_auto_load_bundle(true)
+        end
+
+        it "fails closed for an unresolved component options shape" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when the global auto_load_bundle setting is dynamic" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: @props) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_react_on_rails_initializer(<<~RUBY)
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = Rails.env.development?
+          end
+        RUBY
+      end
+
+      it "fails closed instead of inferring that auto-loading is enabled" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a conditional write can override a literal global auto_load_bundle setting" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: @props) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_react_on_rails_initializer(<<~RUBY)
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            if Rails.env.development?
+              config.auto_load_bundle = development_auto_load_bundle
+            end
+          end
+        RUBY
+      end
+
+      it "fails closed instead of trusting the earlier literal" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    [
+      [
+        "the only setting write has a conditional modifier",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true if enable_auto_load_bundle?
+          end
+        RUBY
+      ],
+      [
+        "the setting write is deferred through a callback",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            callback { config.auto_load_bundle = true }
+          end
+        RUBY
+      ],
+      [
+        "a deferred setting reference follows the direct write",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            callback { config.auto_load_bundle }
+          end
+        RUBY
+      ],
+      [
+        "the setting is assigned twice directly",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            config.auto_load_bundle = true
+          end
+        RUBY
+      ],
+      [
+        "two top-level configure blocks assign the setting",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+          end
+
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+          end
+        RUBY
+      ],
+      [
+        "the configure block variable is passed to an unresolved method",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            mutate(config)
+          end
+        RUBY
+      ],
+      [
+        "the setting is overridden through send",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            config.send(:auto_load_bundle=, false)
+          end
+        RUBY
+      ],
+      [
+        "the setting is overridden through public_send",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            config.public_send(:auto_load_bundle=, false)
+          end
+        RUBY
+      ],
+      [
+        "a conditional configure block follows the direct configure block",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+          end
+
+          if enable_override?
+            ReactOnRails.configure do |config|
+              config.auto_load_bundle = false
+            end
+          end
+        RUBY
+      ],
+      [
+        "a reflective configure call follows the direct configure block",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+          end
+
+          ReactOnRails.public_send(:configure) do |other|
+            other.auto_load_bundle = false
+          end
+        RUBY
+      ],
+      [
+        "non-assignment code follows the direct setting assignment",
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+            eval("config.auto_load_bundle = false")
+          end
+        RUBY
+      ]
+    ].each do |description, initializer|
+      context "when #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent") %>
+              <%= javascript_pack_tag %>
+            ERB
+          )
+          stub_react_on_rails_initializer(initializer)
+        end
+
+        it "fails closed for an unresolved initializer shape" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when unrelated direct initializer assignments surround the static setting" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent") %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_react_on_rails_initializer(<<~RUBY)
+          ReactOnRails.configure do |config|
+            config.logging_on_server = false
+            config.auto_load_bundle = true
+            config.prerender_caching = false
+          end
+        RUBY
+      end
+
+      it "still proves the direct global setting" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(true)
+      end
+    end
+
+    context "when another generated configure assignment has a dynamic RHS" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent") %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_react_on_rails_initializer(<<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = resolve_server_bundle
+            config.auto_load_bundle = true
+            config.components_subdirectory = "ror_components"
+          end
+        RUBY
+      end
+
+      it "fails closed instead of evaluating the block as static configuration" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when auto_load_bundle appears only inside component props" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", props: { auto_load_bundle: true }) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not mistake the nested key for the helper option" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the auto-loaded component name is dynamic" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component(component_name, auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when separate ERB control tags make the component conditional" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% if show_component? %>
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% end %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed instead of inferring that the component is reachable" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when short-circuit punctuation spans separate ERB tags around a component" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% false && ( %>
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% ) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed because the component's reachability is unresolved" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a separate ERB return makes the component unreachable" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <% return %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed instead of inferring that the component is reachable" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when auto-loaded component calls appear only in template comments" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%# react_component("StyledComponent", auto_load_bundle: true) %>
+            <!-- <%= react_component("StyledComponent", auto_load_bundle: true) %> -->
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not treat commented calls as rendered components" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when removing one HTML comment exposes an overlapping outer comment" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <!<!-- spacer -->-- <%= react_component("StyledComponent", auto_load_bundle: true) %> -->
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "removes comments to a fixed point before scanning component evidence" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when HTML comments contain executable ERB" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/commented_binding.html.erb" => <<~ERB,
+            <!-- <% stylesheet_pack_tag = "shadow" %> -->
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/erb_comment.html.erb" => <<~ERB,
+            <%# stylesheet_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/pure_html_comment.html.erb" => <<~ERB,
+            <!-- stylesheet_pack_tag = "shadow" -->
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/escaped_erb.html.erb" => <<~ERB,
+            <!-- <%% stylesheet_pack_tag = "shadow" %> -->
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/commented_css_output.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <!-- <%= stylesheet_pack_tag %> -->
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/commented_js_output.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <!-- <%= javascript_pack_tag %> -->
+          ERB
+          "app/views/layouts/overlapping_comment.html.erb" => <<~ERB
+            <!<!-- spacer -->-- <% stylesheet_pack_tag = "shadow" %> -->
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails the targeted proof closed without treating browser-comment output as active" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("erb_comment", "generated/StyledComponent")),
+          hash_including(content: a_string_including("pure_html_comment", "generated/StyledComponent")),
+          hash_including(content: a_string_including("escaped_erb", "generated/StyledComponent"))
+        )
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  commented_css_output: has javascript_pack_tag"),
+          hash_including(type: :info, content: "  ℹ️  commented_js_output: no pack tags found")
+        )
+      end
+    end
+
+    context "when the JavaScript flush helper appears only in template comments" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%# javascript_pack_tag %>
+            <!-- <%= javascript_pack_tag %> -->
+          ERB
+        )
+      end
+
+      it "does not treat a commented helper as an active flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the JavaScript pack helper name is only assigned as a local variable" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag = "literal only" %>
+          ERB
+        )
+      end
+
+      it "does not treat the assignment as a JavaScript flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  application: no pack tags found")
+        )
+      end
+    end
+
+    context "when JavaScript helper output is direct or nested" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/direct.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/direct_named.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag "application" %>
+          ERB
+          "app/views/layouts/direct_parenthesized.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag("application") %>
+          ERB
+          "app/views/layouts/exact_self.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag %>
+          ERB
+          "app/views/layouts/exact_self_parenthesized.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag() %>
+          ERB
+          "app/views/layouts/exact_self_named.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag("application") %>
+          ERB
+          "app/views/layouts/safe_join.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= safe_join([javascript_pack_tag]) %>
+          ERB
+          "app/views/layouts/content_for.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% content_for :head do %>
+              <%= javascript_pack_tag %>
+            <% end %>
+          ERB
+          "app/views/layouts/discarded.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% javascript_pack_tag %>
+          ERB
+          "app/views/layouts/generic_wrapper.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= content_tag(:div, javascript_pack_tag) %>
+          ERB
+          "app/views/layouts/array.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= [javascript_pack_tag] %>
+          ERB
+          "app/views/layouts/hash.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= { pack: javascript_pack_tag } %>
+          ERB
+          "app/views/layouts/nested_self.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= safe_join([self.javascript_pack_tag]) %>
+          ERB
+          "app/views/layouts/reflective.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= public_send(:javascript_pack_tag) %>
+          ERB
+          "app/views/layouts/dynamic.html.erb" => <<~ERB
+            <% pack_helper_name = :javascript_pack_tag %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= safe_join([public_send(pack_helper_name)]) %>
+          ERB
+        )
+      end
+
+      it "proves response emission only for top-level direct helper calls" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("direct", "generated/StyledComponent")),
+          hash_including(content: a_string_including("direct_named", "generated/StyledComponent")),
+          hash_including(content: a_string_including("direct_parenthesized", "generated/StyledComponent")),
+          hash_including(content: a_string_including("exact_self", "generated/StyledComponent")),
+          hash_including(content: a_string_including("exact_self_parenthesized", "generated/StyledComponent")),
+          hash_including(content: a_string_including("exact_self_named", "generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when nested Ruby scopes use pack-helper local names" do
+      let(:scoped_binding_expressions) do
+        {
+          "block_parameter" => "values.each { |%<helper>s| %<helper>s }",
+          "block_local" => "values.each { |; %<helper>s| %<helper>s = 'shadow' }",
+          "block_assignment" => "values.each { %<helper>s = 'shadow' }",
+          "lambda_parameter" => "->(%<helper>s) { %<helper>s }",
+          "lambda_assignment" => "-> { %<helper>s = 'shadow' }"
+        }
+      end
+
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        pack_types = %w[stylesheet javascript]
+        layouts = scoped_binding_expressions.each_with_object({}) do |(scope_name, expression), result|
+          pack_types.each do |pack_type|
+            helper_name = "#{pack_type}_pack_tag"
+            javascript_flush = "<%= javascript_pack_tag %>" if pack_type == "stylesheet"
+            result["app/views/layouts/#{pack_type}_#{scope_name}.html.erb"] = <<~ERB
+              <%= #{format(expression, helper: helper_name)} %>
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              <%= #{helper_name} %>
+              #{javascript_flush}
+            ERB
+          end
+        end
+        layouts["app/views/layouts/stylesheet_nested_def.html.erb"] = <<~ERB
+          <% def scoped_helper(stylesheet_pack_tag); stylesheet_pack_tag = 'shadow'; end %>
+          <%= react_component("StyledComponent", auto_load_bundle: true) %>
+          <%= stylesheet_pack_tag %>
+          <%= javascript_pack_tag %>
+        ERB
+        layouts["app/views/layouts/javascript_nested_def.html.erb"] = <<~ERB
+          <% def scoped_helper(javascript_pack_tag); javascript_pack_tag = 'shadow'; end %>
+          <%= react_component("StyledComponent", auto_load_bundle: true) %>
+          <%= javascript_pack_tag %>
+        ERB
+        stub_layouts(layouts)
+      end
+
+      it "does not let nested-scope bindings shadow later template helper calls" do
+        doctor.send(:check_layout_files)
+
+        expected_warnings = scoped_binding_expressions.keys.map do |scope_name|
+          hash_including(content: a_string_including("javascript_#{scope_name}", "generated/StyledComponent"))
+        end
+        expected_css_info = scoped_binding_expressions.keys.map do |scope_name|
+          hash_including(
+            type: :info,
+            content: "  ✅ stylesheet_#{scope_name}: has both stylesheet_pack_tag and javascript_pack_tag"
+          )
+        end
+        expected_css_info << hash_including(
+          type: :info,
+          content: "  ✅ stylesheet_nested_def: has both stylesheet_pack_tag and javascript_pack_tag"
+        )
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to match_array(expected_warnings)
+        expect(checker.messages).to include(*expected_css_info)
+        expect(
+          doctor.send(
+            :erb_local_binding?,
+            "<% def scoped_helper(stylesheet_pack_tag); stylesheet_pack_tag = 'shadow'; end %>",
+            "stylesheet_pack_tag"
+          )
+        ).to be(false)
+        expect(
+          doctor.send(
+            :erb_local_binding?,
+            "<% def scoped_helper(javascript_pack_tag); javascript_pack_tag = 'shadow'; end %>",
+            "javascript_pack_tag"
+          )
+        ).to be(false)
+      end
+    end
+
+    context "when template-scope bindings coexist with explicit and nested helper syntax" do
+      let(:template_binding_expressions) do
+        {
+          "top_level" => "%<helper>s = 'shadow'",
+          "conditional" => "%<helper>s = 'shadow' if condition",
+          "for" => "for %<helper>s in values; nil; end",
+          "block_receiver" => "(%<helper>s = values).each {}"
+        }
+      end
+
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        bound_layout = lambda do |helper_name:, evidence:, javascript_flush: false, binding_expression: nil|
+          binding_expression ||= "#{helper_name} = 'shadow'"
+          flush = "<%= javascript_pack_tag %>" if javascript_flush
+          <<~ERB
+            <%= #{binding_expression} %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= #{evidence} %>
+            #{flush}
+          ERB
+        end
+
+        layouts = {
+          "app/views/layouts/css_nested_content_for.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "content_for(:head, stylesheet_pack_tag)",
+            javascript_flush: true
+          ),
+          "app/views/layouts/css_nested_array.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "[stylesheet_pack_tag]", javascript_flush: true
+          ),
+          "app/views/layouts/js_nested_content_for.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "content_for(:head, javascript_pack_tag)"
+          ),
+          "app/views/layouts/js_nested_array.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "[javascript_pack_tag]"
+          ),
+          "app/views/layouts/css_empty_parens.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "stylesheet_pack_tag()", javascript_flush: true
+          ),
+          "app/views/layouts/css_named_parens.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: 'stylesheet_pack_tag("application")',
+            javascript_flush: true
+          ),
+          "app/views/layouts/css_command.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: 'stylesheet_pack_tag "application"',
+            javascript_flush: true
+          ),
+          "app/views/layouts/css_exact_self.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "self.stylesheet_pack_tag", javascript_flush: true
+          ),
+          "app/views/layouts/js_empty_parens.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "javascript_pack_tag()"
+          ),
+          "app/views/layouts/js_named_parens.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: 'javascript_pack_tag("application")'
+          ),
+          "app/views/layouts/js_command.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: 'javascript_pack_tag "application"'
+          ),
+          "app/views/layouts/js_exact_self.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "self.javascript_pack_tag"
+          ),
+          "app/views/layouts/css_dynamic_reflection.html.erb" => bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "public_send(pack_helper_name)",
+            javascript_flush: true,
+            binding_expression: "stylesheet_pack_tag = 'shadow'; pack_helper_name = :stylesheet_pack_tag"
+          ),
+          "app/views/layouts/js_dynamic_reflection.html.erb" => bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "public_send(pack_helper_name)",
+            binding_expression: "javascript_pack_tag = 'shadow'; pack_helper_name = :javascript_pack_tag"
+          )
+        }
+        template_binding_expressions.each do |binding_name, binding_expression|
+          layouts["app/views/layouts/css_#{binding_name}_binding.html.erb"] = bound_layout.call(
+            helper_name: "stylesheet_pack_tag", evidence: "stylesheet_pack_tag", javascript_flush: true,
+            binding_expression: format(binding_expression, helper: "stylesheet_pack_tag")
+          )
+          layouts["app/views/layouts/js_#{binding_name}_binding.html.erb"] = bound_layout.call(
+            helper_name: "javascript_pack_tag", evidence: "javascript_pack_tag",
+            binding_expression: format(binding_expression, helper: "javascript_pack_tag")
+          )
+        end
+        stub_layouts(layouts)
+      end
+
+      it "ignores only bound bare vcalls while preserving explicit and ambiguous evidence" do
+        doctor.send(:check_layout_files)
+
+        warning_layouts = %w[
+          css_nested_content_for css_nested_array
+          js_empty_parens js_named_parens js_command js_exact_self
+          css_top_level_binding css_conditional_binding css_for_binding css_block_receiver_binding
+        ]
+        expected_warnings = warning_layouts.map do |layout_name|
+          hash_including(content: a_string_including(layout_name, "generated/StyledComponent"))
+        end
+        css_evidence_layouts = %w[
+          css_empty_parens css_named_parens css_command css_exact_self css_dynamic_reflection
+        ]
+        expected_css_info = css_evidence_layouts.map do |layout_name|
+          hash_including(
+            type: :info,
+            content: "  ✅ #{layout_name}: has both stylesheet_pack_tag and javascript_pack_tag"
+          )
+        end
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to match_array(expected_warnings)
+        expect(checker.messages).to include(*expected_css_info)
+      end
+    end
+
+    context "when active ERB may bind the JavaScript helper name as a local" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/shadow_before.html.erb" => <<~ERB,
+            <% javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/shadow_conditional.html.erb" => <<~ERB,
+            <% javascript_pack_tag = "shadow" if condition %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/output_shadow.html.erb" => <<~ERB,
+            <%= javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/raw_output_shadow.html.erb" => <<~ERB,
+            <%== javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/shadow_after.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+            <% javascript_pack_tag = "shadow" %>
+          ERB
+          "app/views/layouts/block_parameter.html.erb" => <<~ERB,
+            <% ["shadow"].each { |javascript_pack_tag| nil } %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/exact_self_after_shadow.html.erb" => <<~ERB,
+            <% javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag %>
+          ERB
+          "app/views/layouts/exact_self_after_output_shadow.html.erb" => <<~ERB,
+            <%= javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag %>
+          ERB
+          "app/views/layouts/unrelated_local.html.erb" => <<~ERB,
+            <% other_pack_tag = "javascript_pack_tag" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/ivar_decoy.html.erb" => <<~ERB,
+            <% @javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/string_decoy.html.erb" => <<~ERB,
+            <% label = "javascript_pack_tag = shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/comment_decoy.html.erb" => <<~ERB
+            <%# javascript_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails bare calls closed but preserves exact-self and non-binding evidence" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("exact_self_after_shadow", "generated/StyledComponent")),
+          hash_including(content: a_string_including("exact_self_after_output_shadow", "generated/StyledComponent")),
+          hash_including(content: a_string_including("unrelated_local", "generated/StyledComponent")),
+          hash_including(content: a_string_including("ivar_decoy", "generated/StyledComponent")),
+          hash_including(content: a_string_including("string_decoy", "generated/StyledComponent")),
+          hash_including(content: a_string_including("comment_decoy", "generated/StyledComponent")),
+          hash_including(content: a_string_including("block_parameter", "generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when javascript_pack_tag is called through the proven self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "recognizes the self call as a proven JavaScript flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when parenthesized javascript_pack_tag is called through the proven self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag() %>
+          ERB
+        )
+      end
+
+      it "recognizes the parenthesized self call as a proven JavaScript flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when named javascript_pack_tag is called through the proven self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.javascript_pack_tag("application") %>
+          ERB
+        )
+      end
+
+      it "recognizes the exact self call with arguments as a proven JavaScript flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    {
+      "a false conditional modifier" => "javascript_pack_tag if false",
+      "an arbitrary receiver" => "object.javascript_pack_tag",
+      "a parenthesized arbitrary receiver" => "object.javascript_pack_tag()",
+      "a named parenthesized arbitrary receiver" => 'object.javascript_pack_tag("application")',
+      "a defined check" => "defined?(javascript_pack_tag)",
+      "a short-circuited boolean expression" => "true || javascript_pack_tag",
+      "a local-variable assignment" => "pack_tag = javascript_pack_tag",
+      "dynamic reflective dispatch" => "public_send(pack_helper_name)"
+    }.each do |description, javascript_expression|
+      context "when the JavaScript helper appears through #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              <%= #{javascript_expression} %>
+              <%= pack_tag if defined?(pack_tag) %>
+            ERB
+          )
+        end
+
+        it "does not treat ambiguous JavaScript syntax as an active flush" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when a stylesheet helper result flows through a local variable" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= css_tag = stylesheet_pack_tag %>
+            <%= css_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails the missing-CSS proof closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when active ERB binds the stylesheet helper name as a local" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/shadowed.html.erb" => <<~ERB,
+            <% stylesheet_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/exact_self.html.erb" => <<~ERB
+            <% stylesheet_pack_tag = "shadow" %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not treat a shadowed bare call as CSS but preserves exact-self evidence" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("shadowed", "generated/StyledComponent")),
+          hash_including(type: :info, content: "  ✅ exact_self: has both stylesheet_pack_tag and javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when stylesheet_pack_tag is a command call through the proven self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.stylesheet_pack_tag "application" %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "recognizes the self command call as a proven stylesheet flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ✅ application: has both stylesheet_pack_tag and javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when a direct non-output stylesheet helper result is discarded" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns because the discarded helper result cannot flush CSS" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when exact-self stylesheet calls appear in non-output ERB" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/discarded_bare.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% self.stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/discarded_parenthesized.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% self.stylesheet_pack_tag() %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/discarded_command.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% self.stylesheet_pack_tag "application" %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/discarded_named_args.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% self.stylesheet_pack_tag(media: "all") %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/emitted.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/nested.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% safe_join([self.stylesheet_pack_tag]) %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/reflective.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% self.public_send(:stylesheet_pack_tag) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns only when a proven top-level helper result is discarded" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("discarded_bare", "generated/StyledComponent")),
+          hash_including(content: a_string_including("discarded_parenthesized", "generated/StyledComponent")),
+          hash_including(content: a_string_including("discarded_command", "generated/StyledComponent")),
+          hash_including(content: a_string_including("discarded_named_args", "generated/StyledComponent"))
+        )
+      end
+    end
+
+    {
+      "a false conditional" => "stylesheet_pack_tag if false",
+      "an arbitrary receiver" => "object.stylesheet_pack_tag"
+    }.each do |description, stylesheet_expression|
+      context "when the stylesheet helper appears through #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              <%= #{stylesheet_expression} %>
+              <%= javascript_pack_tag %>
+            ERB
+          )
+        end
+
+        it "fails the missing-CSS proof closed on ambiguous stylesheet syntax" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    {
+      "public_send with the helper name" => '<%= public_send("stylesheet_pack_tag") %>',
+      "a method alias invoked later" => <<~ERB,
+        <% css_pack = method(:stylesheet_pack_tag) %>
+        <%= css_pack.call %>
+      ERB
+      "a public method alias invoked inline" => "<%= public_method(:stylesheet_pack_tag).call %>"
+    }.each do |description, stylesheet_template|
+      context "when the stylesheet helper is referenced through #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              #{stylesheet_template}
+              <%= javascript_pack_tag %>
+            ERB
+          )
+        end
+
+        it "fails the missing-CSS proof closed on the active ambiguous reference" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when helper-name data and unrelated reflection do not call the stylesheet helper" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <% helper_name = "stylesheet_pack_tag" %>
+            <% helper_symbol = :stylesheet_pack_tag %>
+            <%= public_send(:content_tag, :div, helper_name) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns because static data and an unrelated call are not CSS flush evidence" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when public_send command syntax uses the exact self receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/static_dispatch.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.public_send :stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/dynamic_dispatch.html.erb" => <<~ERB,
+            <% helper_name = :stylesheet_pack_tag %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.public_send helper_name %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/unrelated_dispatch.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= self.public_send :content_tag, :div %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed for static or dynamic helper dispatch but not an unrelated static method" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("unrelated_dispatch", "generated/StyledComponent"))
+        )
+      end
+    end
+
+    context "when public_send command syntax uses an arbitrary receiver" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/static_dispatch.html.erb" => <<~ERB,
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= object.public_send :stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/dynamic_dispatch.html.erb" => <<~ERB,
+            <% helper_name = :stylesheet_pack_tag %>
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= object.public_send helper_name %>
+            <%= javascript_pack_tag %>
+          ERB
+          "app/views/layouts/unrelated_dispatch.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= object.public_send :content_tag, :div %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed for static or dynamic helper dispatch but not an unrelated static method" do
+        doctor.send(:check_layout_files)
+
+        warning_messages = checker.messages.select { |message| message[:type] == :warning }
+        expect(warning_messages).to contain_exactly(
+          hash_including(content: a_string_including("unrelated_dispatch", "generated/StyledComponent"))
+        )
+      end
+    end
+
+    {
+      "a concatenated public_send name" => '<%= public_send("stylesheet_" + "pack_tag") %>',
+      "a variable send name" => "<%= send(pack_helper_name) %>",
+      "a variable __send__ name" => "<%= __send__(pack_helper_name) %>",
+      "a variable method name" => "<%= method(pack_helper_name).call %>"
+    }.each do |description, stylesheet_template|
+      context "when the stylesheet helper may be dispatched through #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              #{stylesheet_template}
+              <%= javascript_pack_tag %>
+            ERB
+          )
+        end
+
+        it "fails the missing-CSS proof closed on active reflective dispatch" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when the component's React layout actively flushes both pack queues" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= stylesheet_pack_tag %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not warn" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the stylesheet pack helper is nested in another active helper call" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= content_for(:head, stylesheet_pack_tag) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "recognizes the nested stylesheet call as an active CSS flush" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ✅ application: has both stylesheet_pack_tag and javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when a generated controller's implicit view uses its named React layout" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+                @hello_world_props = { name: "Stranger", items: [1, true] }
+              end
+            end
+          RUBY
+          view: <<~ERB
+            <%= react_component("StyledComponent", props: @hello_world_props, prerender: true) %>
+          ERB
+        )
+        stub_global_auto_load_bundle(true)
+      end
+
+      it "warns with the generated entrypoint and emitted stylesheet asset" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "react_on_rails_default",
+              "generated/StyledComponent",
+              "/packs/generated/StyledComponent-a1b2c3.css"
+            )
+          )
+        )
+      end
+    end
+
+    context "when an implicit view's named layout has separate ERB control flow around pack helpers" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/conditional_javascript.html.erb" => <<~ERB,
+            <% if false %>
+              <%= javascript_pack_tag %>
+            <% end %>
+          ERB
+          "app/views/layouts/conditional_stylesheet.html.erb" => <<~ERB
+            <% if false %>
+              <%= stylesheet_pack_tag %>
+            <% end %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+        stub_controllers_and_views(
+          controllers: {
+            "app/controllers/hello_world_controller.rb" => <<~RUBY,
+              class HelloWorldController < ApplicationController
+                layout "conditional_javascript"
+
+                def index
+                end
+              end
+            RUBY
+            "app/controllers/marketing_controller.rb" => <<~RUBY
+              class MarketingController < ApplicationController
+                layout "conditional_stylesheet"
+
+                def index
+                end
+              end
+            RUBY
+          },
+          views: {
+            "app/views/hello_world/index.html.erb" =>
+              '<%= react_component("StyledComponent", auto_load_bundle: true) %>',
+            "app/views/marketing/index.html.erb" =>
+              '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+          }
+        )
+      end
+
+      it "fails the targeted proof closed without changing informational helper analysis" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  conditional_javascript: has javascript_pack_tag"),
+          hash_including(
+            type: :info,
+            content: "  ✅ conditional_stylesheet: has both stylesheet_pack_tag and javascript_pack_tag"
+          )
+        )
+      end
+    end
+
+    context "when a generated controller's implicit component view renders an uninspected partial" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+                @hello_world_props = { name: "Stranger", items: [1, true] }
+              end
+            end
+          RUBY
+          view: <<~ERB
+            <%= react_component("StyledComponent", props: @hello_world_props, auto_load_bundle: true) %>
+            <%= render "shared/packs" %>
+          ERB
+        )
+      end
+
+      it "fails the implicit-view missing-CSS proof closed without resolving the partial" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  react_on_rails_default: has javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when the generated controller's implicit view flushes the auto-loaded component CSS" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+                @hello_world_props = { name: "Stranger", items: [1, true] }
+              end
+            end
+          RUBY
+          view: <<~ERB
+            <%= react_component("StyledComponent", props: @hello_world_props, prerender: true) %>
+            <%= stylesheet_pack_tag %>
+          ERB
+        )
+        stub_global_auto_load_bundle(true)
+      end
+
+      it "does not report the selected view's flushed CSS as missing" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the controller's literal layout declaration is conditional" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default" if Rails.env.development?
+
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not infer a view-to-layout association" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the controller layout is selected dynamically" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout -> { "react_on_rails_default" }
+
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not infer a view-to-layout association" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the controller may inherit its layout" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not assume which layout renders the view" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the action explicitly renders with a layout override" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+                render :index, layout: "application"
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not associate the implicit view with the controller layout" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    [
+      [
+        "the action is redefined",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+              @hello_world_props = { name: "First" }
+            end
+
+            def index
+              @hello_world_props = { name: "Second" }
+            end
+          end
+        RUBY
+      ],
+      [
+        "the action body calls a method",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+              @hello_world_props = build_props
+            end
+          end
+        RUBY
+      ],
+      [
+        "the action body contains control flow",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+              if condition
+                @hello_world_props = { name: "Conditional" }
+              end
+            end
+          end
+        RUBY
+      ],
+      [
+        "remove_method invalidates the action",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+            end
+
+            remove_method :index
+          end
+        RUBY
+      ],
+      [
+        "send changes the action visibility",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+            end
+
+            send(:private, "index")
+          end
+        RUBY
+      ],
+      [
+        "send performs an explicit render",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+              send(:render, :other)
+            end
+          end
+        RUBY
+      ],
+      [
+        "the action is parameterized",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index(id)
+              @hello_world_props = { id: id }
+            end
+          end
+        RUBY
+      ],
+      [
+        "unknown top-level reflection follows the action",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+            end
+
+            define_method(:other) { index }
+          end
+        RUBY
+      ],
+      [
+        "a second distinct action is declared",
+        <<~RUBY
+          class HelloWorldController < ApplicationController
+            layout "react_on_rails_default"
+
+            def index
+            end
+
+            def other
+            end
+          end
+        RUBY
+      ]
+    ].each do |description, controller_source|
+      context "when #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+          stub_generated_controller_flow(
+            controller: controller_source,
+            view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+          )
+        end
+
+        it "fails closed under the exact generated controller grammar" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when the component call appears only in a partial" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/react_on_rails_default.html.erb" => "<%= javascript_pack_tag %>\n"
+        )
+        stub_controllers_and_views(
+          controllers: {
+            "app/controllers/hello_world_controller.rb" => <<~RUBY
+              class HelloWorldController < ApplicationController
+                layout "react_on_rails_default"
+
+                def index
+                end
+              end
+            RUBY
+          },
+          views: {
+            "app/views/hello_world/_card.html.erb" =>
+              '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+          }
+        )
+      end
+
+      it "does not infer that the partial renders through the named layout" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the controller class cannot be associated with its path" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class OtherController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "fails closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the matching controller does not inherit from ApplicationController" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < Object
+              layout "react_on_rails_default"
+
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not infer the generated controller association" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a controller's basename-only layout does not name a nested layout" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/admin/foo.html.erb" => "<%= javascript_pack_tag %>\n"
+        )
+        stub_controllers_and_views(
+          controllers: {
+            "app/controllers/hello_world_controller.rb" => <<~RUBY
+              class HelloWorldController < ApplicationController
+                layout "foo"
+
+                def index
+                end
+              end
+            RUBY
+          },
+          views: {
+            "app/views/hello_world/index.html.erb" =>
+              '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+          }
+        )
+      end
+
+      it "does not associate the view with the nested layout" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a controller names the exact nested layout path" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_layouts(
+          "app/views/layouts/admin/foo.html.erb" => "<%= javascript_pack_tag %>\n"
+        )
+        stub_controllers_and_views(
+          controllers: {
+            "app/controllers/hello_world_controller.rb" => <<~RUBY
+              class HelloWorldController < ApplicationController
+                layout "admin/foo"
+
+                def index
+                end
+              end
+            RUBY
+          },
+          views: {
+            "app/views/hello_world/index.html.erb" =>
+              '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+          }
+        )
+      end
+
+      it "warns for the exact controller-view-layout association" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including("admin/foo", "generated/StyledComponent")
+          )
+        )
+      end
+    end
+
+    context "when the matching controller method is private" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              private
+
+              def index
+              end
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not treat the method as a controller action" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the matching controller method is private through a string argument" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+              end
+
+              private "index"
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "does not treat the method as a controller action" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when controller visibility has an unresolved method argument" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", ["/packs/generated/StyledComponent-a1b2c3.css"])
+        stub_generated_controller_flow(
+          controller: <<~RUBY,
+            class HelloWorldController < ApplicationController
+              layout "react_on_rails_default"
+
+              def index
+              end
+
+              private action_name
+            end
+          RUBY
+          view: '<%= react_component("StyledComponent", auto_load_bundle: true) %>'
+        )
+      end
+
+      it "fails the controller association closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a layout uses javascript_pack_tag with Propshaft stylesheet_link_tag (fresh RSC app)" do
+      before do
+        stub_layouts(
+          "app/views/layouts/application.html.erb" =>
+            %(<%= stylesheet_link_tag :app %>\n<%= javascript_pack_tag "application" %>)
+        )
+      end
+
+      it "does not warn about a missing stylesheet_pack_tag" do
+        doctor.send(:check_layout_files)
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(type: :info, content: "  ℹ️  application: has javascript_pack_tag")
+        )
+      end
+    end
+
+    context "when a layout is JavaScript-pack only" do
+      before do
+        stub_manifest_stylesheets("generated/PlainComponent", [])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("PlainComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag "application" %>
+          ERB
+        )
+      end
+
+      it "does not emit a symmetry warning" do
+        doctor.send(:check_layout_files)
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the manifest CSS list contains only an empty asset string" do
+      before do
+        stub_manifest_stylesheets("generated/StyledComponent", [""])
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "does not claim that the entrypoint emits CSS" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the manifest CSS list uses Shakapacker SRI asset objects" do
+      before do
+        stub_manifest_stylesheets(
+          "generated/StyledComponent",
+          [
+            { "src" => "/packs/generated/StyledComponent-a1b2c3.css", "integrity" => "sha384-first" },
+            { "src" => "/packs/generated/StyledComponent-d4e5f6.css", "integrity" => "sha384-second" }
+          ]
+        )
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "warns with the normalized stylesheet asset paths" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "/packs/generated/StyledComponent-a1b2c3.css",
+              "/packs/generated/StyledComponent-d4e5f6.css"
+            )
+          )
+        )
+      end
+    end
+
+    context "when the manifest CSS list mixes legacy strings and valid SRI asset objects" do
+      before do
+        stub_manifest_stylesheets(
+          "generated/StyledComponent",
+          [
+            "/packs/generated/StyledComponent-a1b2c3.css",
+            { "src" => "/packs/generated/StyledComponent-d4e5f6.css", "integrity" => "sha384-second" }
+          ]
+        )
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed for the heterogeneous stylesheet schema" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when the manifest CSS list contains a malformed asset value" do
+      before do
+        stub_manifest_stylesheets(
+          "generated/StyledComponent",
+          ["/packs/generated/StyledComponent-a1b2c3.css", nil]
+        )
+        stub_layouts(
+          "app/views/layouts/application.html.erb" => <<~ERB
+            <%= react_component("StyledComponent", auto_load_bundle: true) %>
+            <%= javascript_pack_tag %>
+          ERB
+        )
+      end
+
+      it "fails closed" do
+        doctor.send(:check_layout_files)
+
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    {
+      "an SRI object with an empty src" => [{ "src" => "", "integrity" => "sha384-empty" }],
+      "an SRI object without src" => [{ "integrity" => "sha384-missing" }],
+      "a valid SRI object mixed with a malformed entry" => [
+        { "src" => "/packs/generated/StyledComponent-a1b2c3.css", "integrity" => "sha384-valid" },
+        { "src" => nil, "integrity" => "sha384-invalid" }
+      ]
+    }.each do |description, stylesheets|
+      context "when the manifest CSS list contains #{description}" do
+        before do
+          stub_manifest_stylesheets("generated/StyledComponent", stylesheets)
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              <%= javascript_pack_tag %>
+            ERB
+          )
+        end
+
+        it "fails closed for the entire stylesheet list" do
+          doctor.send(:check_layout_files)
+
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    {
+      "the manifest root is an array" => [],
+      "the manifest entrypoints container is an array" => { "entrypoints" => [] },
+      "the manifest assets container is an array" => {
+        "entrypoints" => { "generated/StyledComponent" => { "assets" => [] } }
+      }
+    }.each do |description, manifest_data|
+      context "when #{description}" do
+        before do
+          stub_manifest_data(manifest_data)
+          stub_layouts(
+            "app/views/layouts/application.html.erb" => <<~ERB
+              <%= react_component("StyledComponent", auto_load_bundle: true) %>
+              <%= javascript_pack_tag %>
+            ERB
+          )
+        end
+
+        it "fails closed without raising" do
+          expect { doctor.send(:check_layout_files) }.not_to raise_error
+          expect(checker.warnings?).to be(false)
+        end
+      end
+    end
+
+    context "when a layout is stylesheet-pack only" do
+      before do
+        stub_layouts(
+          "app/views/layouts/marketing.html.erb" => %(<%= stylesheet_pack_tag "marketing" %>)
+        )
+      end
+
+      it "does not emit a symmetry warning" do
+        doctor.send(:check_layout_files)
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when a layout contains both flush helpers" do
+      before do
+        stub_layouts(
+          "app/views/layouts/react_on_rails_default.html.erb" =>
+            %(<%= stylesheet_pack_tag %>\n<%= javascript_pack_tag %>)
+        )
+      end
+
+      it "reports the layout as correctly configured without warning" do
+        doctor.send(:check_layout_files)
+        expect(checker.warnings?).to be(false)
+        expect(checker.messages).to include(
+          hash_including(
+            type: :info,
+            content: "  ✅ react_on_rails_default: has both stylesheet_pack_tag and javascript_pack_tag"
+          )
+        )
+      end
+    end
+
+    context "with the fresh generated app's two layouts (Propshaft application + RoR default)" do
+      before do
+        stub_layouts(
+          "app/views/layouts/application.html.erb" =>
+            %(<%= stylesheet_link_tag :app %>\n<%= javascript_pack_tag "application" %>),
+          "app/views/layouts/react_on_rails_default.html.erb" =>
+            %(<%= stylesheet_pack_tag %>\n<%= javascript_pack_tag %>)
+        )
+      end
+
+      it "does not increase the Doctor warning count" do
+        doctor.send(:check_layout_files)
+        expect(checker.warnings?).to be(false)
+      end
+    end
+
+    context "when no layout files are present" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/layouts/**/*.erb").and_return([])
+      end
+
+      it "produces no messages" do
+        doctor.send(:check_layout_files)
+        expect(checker.messages).to be_empty
+      end
+    end
+  end
+
+  describe "#scan_view_files_for_async_pack_tag" do
+    before do
+      allow(Dir).to receive(:glob).and_call_original
+      allow(File).to receive(:exist?).and_call_original
+      allow(File).to receive(:read).and_call_original
+    end
+
+    context "when view files contain javascript_pack_tag with :async" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%= javascript_pack_tag "app", :async %>')
+        allow(doctor).to receive(:relativize_path).with("app/views/layouts/application.html.erb")
+                                                  .and_return("app/views/layouts/application.html.erb")
+      end
+
+      it "returns files with async" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to include("app/views/layouts/application.html.erb")
+      end
+    end
+
+    context "when view files contain javascript_pack_tag with async: true" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%= javascript_pack_tag "app", async: true %>')
+        allow(doctor).to receive(:relativize_path).with("app/views/layouts/application.html.erb")
+                                                  .and_return("app/views/layouts/application.html.erb")
+      end
+
+      it "returns files with async" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to include("app/views/layouts/application.html.erb")
+      end
+    end
+
+    context "when view files contain defer: \"async\" (false positive check)" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%= javascript_pack_tag "app", defer: "async" %>')
+      end
+
+      it "does not return files (async is a string value, not the option)" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when view files do not contain async" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%= javascript_pack_tag "app" %>')
+      end
+
+      it "returns empty array" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when file has uncommented pack tag without :async and commented one with :async" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%= javascript_pack_tag "app", defer: true %>
+<%# javascript_pack_tag "other", :async %>')
+      end
+
+      it "does not return files (only commented line has :async)" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when async is only in ERB comments" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<%# javascript_pack_tag "app", :async %>')
+      end
+
+      it "returns empty array" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when async is only in HAML comments" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml")
+                                    .and_return(["app/views/layouts/application.html.haml"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.haml").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.haml")
+                                     .and_return('-# javascript_pack_tag "app", :async')
+      end
+
+      it "returns empty array" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when async is only in HTML comments" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return('<!-- <%= javascript_pack_tag "app", :async %> -->')
+      end
+
+      it "returns empty array" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when async is only in Slim comments" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim")
+                                    .and_return(["app/views/layouts/application.html.slim"])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.slim").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.slim")
+                                     .and_return('/ = javascript_pack_tag "app", :async')
+      end
+
+      it "returns empty array" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to be_empty
+      end
+    end
+
+    context "when view files contain Slim javascript_pack_tag with :async" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim")
+                                    .and_return(["app/views/layouts/application.html.slim"])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.slim").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.slim")
+                                     .and_return('= javascript_pack_tag "app", :async')
+        allow(doctor).to receive(:relativize_path).with("app/views/layouts/application.html.slim")
+                                                  .and_return("app/views/layouts/application.html.slim")
+      end
+
+      it "returns files with async" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to include("app/views/layouts/application.html.slim")
+      end
+    end
+
+    context "when javascript_pack_tag spans multiple lines" do
+      before do
+        allow(Dir).to receive(:glob).with("app/views/**/*.erb")
+                                    .and_return(["app/views/layouts/application.html.erb"])
+        allow(Dir).to receive(:glob).with("app/views/**/*.haml").and_return([])
+        allow(Dir).to receive(:glob).with("app/views/**/*.slim").and_return([])
+        allow(File).to receive(:exist?).with("app/views/layouts/application.html.erb").and_return(true)
+        allow(File).to receive(:read).with("app/views/layouts/application.html.erb")
+                                     .and_return("<%= javascript_pack_tag \"app\",\n  :async %>")
+        allow(doctor).to receive(:relativize_path).with("app/views/layouts/application.html.erb")
+                                                  .and_return("app/views/layouts/application.html.erb")
+      end
+
+      it "returns files with async" do
+        files = doctor.send(:scan_view_files_for_async_pack_tag)
+        expect(files).to include("app/views/layouts/application.html.erb")
+      end
+    end
+  end
+
+  describe "#config_has_async_loading_strategy?" do
+    context "when config file has :async strategy" do
+      before do
+        allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+        allow(File).to receive(:read).with("config/initializers/react_on_rails.rb")
+                                     .and_return("config.generated_component_packs_loading_strategy = :async")
+      end
+
+      it "returns true" do
+        expect(doctor.send(:config_has_async_loading_strategy?)).to be true
+      end
+    end
+
+    context "when config file has different strategy" do
+      before do
+        allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+        allow(File).to receive(:read).with("config/initializers/react_on_rails.rb")
+                                     .and_return("config.generated_component_packs_loading_strategy = :defer")
+      end
+
+      it "returns false" do
+        expect(doctor.send(:config_has_async_loading_strategy?)).to be false
+      end
+    end
+
+    context "when config file does not exist" do
+      before do
+        allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(false)
+      end
+
+      it "returns false" do
+        expect(doctor.send(:config_has_async_loading_strategy?)).to be false
+      end
+    end
+
+    context "when :async strategy is commented out" do
+      before do
+        allow(File).to receive(:exist?).with("config/initializers/react_on_rails.rb").and_return(true)
+        allow(File).to receive(:read).with("config/initializers/react_on_rails.rb")
+                                     .and_return("# config.generated_component_packs_loading_strategy = :async")
+      end
+
+      it "returns false" do
+        expect(doctor.send(:config_has_async_loading_strategy?)).to be false
+      end
+    end
+  end
+
+  describe "test asset compilation consistency" do
+    let(:doctor) { described_class.new(verbose: false, fix: fix_mode) }
+    let(:fix_mode) { false }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    it "warns when build_test_command is set but minitest helper is missing in mixed setup" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        test:
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+      write_project_file("test/test_helper.rb", <<~RUBY)
+        require "rails/test_help"
+      RUBY
+
+      doctor.send(:check_build_test_configuration)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("missing for Minitest"))
+    end
+
+    it "reports separate development/test output paths as recommended" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        development:
+          public_output_path: packs
+
+        test:
+          public_output_path: packs-test
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+
+      doctor.send(:check_build_test_configuration)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("separate public_output_path values"))
+    end
+
+    it "uses inherited default output paths when analyzing test/dev workflow" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        default: &default
+          public_output_path: packs
+
+        development:
+          <<: *default
+
+        test:
+          <<: *default
+          public_output_path: packs-test
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+
+      doctor.send(:check_build_test_configuration)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("separate public_output_path values"))
+    end
+
+    it "warns when development and test share public_output_path" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        default:
+          private_output_path: ssr-generated
+
+        development:
+          public_output_path: packs
+
+        test:
+          public_output_path: packs
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+
+      doctor.send(:check_build_test_configuration)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("share public_output_path 'packs'"))
+      expect(info_messages).to include(a_string_including("advanced workflow meant for bin/dev static"))
+    end
+
+    it "raises an error for shared output path when HMR Procfile exists without static Procfile" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        development:
+          public_output_path: packs
+          dev_server:
+            hmr: true
+
+        test:
+          public_output_path: packs
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        dev-server: bin/shakapacker-dev-server
+      PROCFILE
+
+      doctor.send(:check_build_test_configuration)
+
+      error_messages = checker.messages.select { |msg| msg[:type] == :error }.map { |msg| msg[:content] }
+      expect(error_messages).to include(a_string_including("Procfile.dev-static-assets is missing"))
+      expect(error_messages).to include(a_string_including("Shared output path + HMR Procfile.dev detected"))
+    end
+
+    it "uses the detected Procfile.dev mode when shared output path can use static mode" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        development:
+          public_output_path: packs
+          dev_server:
+            hmr: false
+            live_reload: true
+
+        test:
+          public_output_path: packs
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        dev-server: bin/shakapacker-dev-server
+      PROCFILE
+      write_project_file("Procfile.dev-static-assets", <<~PROCFILE)
+        assets: bin/shakapacker --watch
+      PROCFILE
+
+      doctor.send(:check_build_test_configuration)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("Live reload Procfile.dev is present. Shared output path is high-risk")
+      )
+      expect(warning_messages).not_to include(a_string_including("Development server Procfile.dev"))
+    end
+
+    context "with fix enabled" do
+      let(:fix_mode) { true }
+
+      it "adds missing minitest helper wiring in mixed setup" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+          end
+        RUBY
+        write_project_file("config/shakapacker.yml", <<~YAML)
+          test:
+            compile: false
+        YAML
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+        write_project_file("test/test_helper.rb", <<~RUBY)
+          require "rails/test_help"
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+
+        helper_content = File.read("test/test_helper.rb")
+        expect(helper_content).to include('require "react_on_rails/test_helper"')
+        expect(helper_content).to include("ReactOnRails::TestHelper.ensure_assets_compiled")
+      end
+
+      it "sets test compile to false when both approaches are configured" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+          end
+        RUBY
+        write_project_file("config/shakapacker.yml", <<~YAML)
+          default: &default
+            source_path: app/javascript
+
+          test:
+            <<: *default
+            compile: true
+        YAML
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+
+        expect(File.read("config/shakapacker.yml")).to include("compile: false")
+      end
+
+      it "adds build_test_command when helper is configured without it" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.auto_load_bundle = true
+          end
+        RUBY
+        write_project_file("config/shakapacker.yml", <<~YAML)
+          test:
+            compile: false
+        YAML
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+
+        expect(File.read("config/initializers/react_on_rails.rb")).to include(
+          'config.build_test_command = "RAILS_ENV=test bin/shakapacker"'
+        )
+      end
+    end
+
+    it "reports helper status per framework" do
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "react_on_rails/test_helper"
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+      write_project_file("test/test_helper.rb", <<~RUBY)
+        require "rails/test_help"
+      RUBY
+
+      doctor.send(:check_test_helper_setup)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(success_messages).to include(
+        a_string_including("configured for RSpec in spec/rails_helper.rb")
+      )
+      expect(info_messages).to include(
+        a_string_including("missing for Minitest in test/test_helper.rb")
+      )
+    end
+
+    it "detects RSpec helper setup from spec/spec_helper.rb when rails_helper.rb exists" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        test:
+          compile: false
+      YAML
+      write_project_file("spec/rails_helper.rb", <<~RUBY)
+        require "spec_helper"
+        RSpec.configure do |config|
+          config.example_status_persistence_file_path = "spec/examples.txt"
+        end
+      RUBY
+      write_project_file("spec/spec_helper.rb", <<~RUBY)
+        RSpec.configure do |config|
+          ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+        end
+      RUBY
+
+      doctor.send(:check_build_test_configuration)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).not_to include(a_string_including("missing for RSpec"))
+    end
+
+    it "does not emit helper-missing warning when both compile:true and build_test_command are set" do
+      write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+        ReactOnRails.configure do |config|
+          config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+        end
+      RUBY
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        test:
+          compile: true
+      YAML
+
+      doctor.send(:check_build_test_configuration)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Both build_test_command and shakapacker compile: true"))
+      expect(warning_messages).not_to include(a_string_including("no test helper files were found"))
+    end
+
+    describe "#check_shared_output_paths_with_hmr" do
+      let(:shared_hmr_shakapacker) do
+        <<~YAML
+          default: &default
+            source_path: client/app
+
+          development:
+            <<: *default
+            public_output_path: packs
+            dev_server:
+              hmr: true
+
+          test:
+            <<: *default
+            public_output_path: packs
+            compile: false
+        YAML
+      end
+
+      let(:default_initializer) do
+        <<~RUBY
+          ReactOnRails.configure do |config|
+            config.build_test_command = "RAILS_ENV=test bin/shakapacker"
+          end
+        RUBY
+      end
+
+      def setup_shared_hmr_config
+        write_project_file("config/shakapacker.yml", shared_hmr_shakapacker)
+        write_project_file("config/initializers/react_on_rails.rb", default_initializer)
+      end
+
+      it "warns when shared output paths AND hmr: true AND Capybara uses own server" do
+        setup_shared_hmr_config
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          require "react_on_rails/test_helper"
+          Capybara.register_driver :selenium_chrome_headless do |app|
+            Capybara::Selenium::Driver.new(app, browser: :chrome)
+          end
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).to include(a_string_including("Shared output paths with dev_server.hmr: true"))
+      end
+
+      it "does not warn when development overrides the default dev_server without hmr" do
+        write_project_file("config/shakapacker.yml", <<~YAML)
+          default: &default
+            source_path: client/app
+            dev_server:
+              hmr: true
+
+          development:
+            <<: *default
+            public_output_path: packs
+            dev_server:
+              port: 3035
+
+          test:
+            <<: *default
+            public_output_path: packs
+            compile: false
+        YAML
+        write_project_file("config/initializers/react_on_rails.rb", default_initializer)
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).not_to include(a_string_including("Shared output paths with dev_server.hmr"))
+      end
+
+      it "does not warn when separate output paths AND hmr: true" do
+        write_project_file("config/shakapacker.yml", <<~YAML)
+          development:
+            public_output_path: packs
+            dev_server:
+              hmr: true
+
+          test:
+            public_output_path: packs-test
+            compile: false
+        YAML
+        write_project_file("config/initializers/react_on_rails.rb", default_initializer)
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).not_to include(a_string_including("Shared output paths with dev_server.hmr"))
+      end
+
+      it "does not warn when Capybara uses run_server = false (external server mode)" do
+        setup_shared_hmr_config
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          require "react_on_rails/test_helper"
+          Capybara.app_host = "http://localhost:3000"
+          Capybara.run_server = false
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).not_to include(a_string_including("Shared output paths with dev_server.hmr"))
+      end
+
+      it "does not warn when no Capybara is configured (Playwright/Cypress only)" do
+        setup_shared_hmr_config
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "react_on_rails/test_helper"
+          RSpec.configure do |config|
+            ReactOnRails::TestHelper.configure_rspec_to_compile_assets(config)
+          end
+        RUBY
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).not_to include(a_string_including("Shared output paths with dev_server.hmr"))
+      end
+
+      it "does not warn when no test helper files exist (Playwright/Cypress only)" do
+        setup_shared_hmr_config
+
+        doctor.send(:check_build_test_configuration)
+        doctor.send(:check_shared_output_paths_with_hmr)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).not_to include(a_string_including("Shared output paths with dev_server.hmr"))
+      end
+    end
+
+    describe "#check_minitest_system_test_wiring" do
+      it "warns when application_system_test_case.rb exists but ensure_assets_compiled is missing" do
+        write_project_file("test/application_system_test_case.rb", <<~RUBY)
+          class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+            driven_by :selenium, using: :chrome
+          end
+        RUBY
+        write_project_file("test/test_helper.rb", <<~RUBY)
+          require "rails/test_help"
+        RUBY
+
+        doctor.send(:check_minitest_system_test_wiring)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).to include(
+          a_string_including("ensure_assets_compiled")
+        )
+      end
+
+      it "reports success when system test case and ensure_assets_compiled are both present" do
+        write_project_file("test/application_system_test_case.rb", <<~RUBY)
+          class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+            driven_by :selenium, using: :chrome
+          end
+        RUBY
+        write_project_file("test/test_helper.rb", <<~RUBY)
+          require "react_on_rails/test_helper"
+          ActiveSupport::TestCase.setup do
+            ReactOnRails::TestHelper.ensure_assets_compiled
+          end
+        RUBY
+
+        doctor.send(:check_minitest_system_test_wiring)
+
+        success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+        expect(success_messages).to include(
+          a_string_including("Minitest system tests detected with ensure_assets_compiled")
+        )
+      end
+
+      it "does nothing when no application_system_test_case.rb exists" do
+        initial_count = checker.messages.length
+        doctor.send(:check_minitest_system_test_wiring)
+        expect(checker.messages.length).to eq(initial_count)
+      end
+
+      context "with fix enabled" do
+        let(:fix_mode) { true }
+
+        it "adds ensure_assets_compiled to test_helper.rb" do
+          write_project_file("test/application_system_test_case.rb", <<~RUBY)
+            class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+              driven_by :selenium, using: :chrome
+            end
+          RUBY
+          write_project_file("test/test_helper.rb", <<~RUBY)
+            require "rails/test_help"
+          RUBY
+
+          doctor.send(:check_minitest_system_test_wiring)
+
+          helper_content = File.read("test/test_helper.rb")
+          expect(helper_content).to include("ensure_assets_compiled")
+        end
+      end
+    end
+
+    describe "#check_capybara_external_server_mode" do
+      it "detects Capybara.run_server = false in rails_helper.rb" do
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          Capybara.app_host = "http://localhost:3000"
+          Capybara.run_server = false
+        RUBY
+
+        doctor.send(:check_capybara_external_server_mode)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(
+          a_string_including("Capybara.run_server = false")
+        )
+        expect(info_messages).to include(
+          a_string_including("bin/dev")
+        )
+      end
+
+      it "reports custom driver registrations" do
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          Capybara.register_driver :selenium_chrome_headless do |app|
+            Capybara::Selenium::Driver.new(app, browser: :chrome)
+          end
+        RUBY
+
+        doctor.send(:check_capybara_external_server_mode)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(
+          a_string_including(":selenium_chrome_headless")
+        )
+      end
+
+      it "notes dev-server asset limitation for standard Capybara mode" do
+        write_project_file("spec/rails_helper.rb", <<~RUBY)
+          require "capybara/rails"
+          Capybara.default_driver = :selenium_chrome_headless
+        RUBY
+
+        doctor.send(:check_capybara_external_server_mode)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(
+          a_string_including("dev-server assets won't work")
+        )
+      end
+
+      it "does nothing when no helper files mention capybara" do
+        initial_count = checker.messages.length
+        doctor.send(:check_capybara_external_server_mode)
+        expect(checker.messages.length).to eq(initial_count)
+      end
+    end
+  end
+
+  describe "#check_server_bundle_prerender_consistency" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    context "when runtime config conflicts with initializer text" do
+      let(:runtime_config) do
+        instance_double(
+          ReactOnRails::Configuration,
+          server_bundle_js_file: "",
+          prerender: true
+        )
+      end
+
+      it "uses runtime values and reports missing server bundle" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = "server-bundle.js"
+            config.prerender = false
+          end
+        RUBY
+
+        allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).to include(
+          a_string_including("Server rendering is enabled but server_bundle_js_file is not configured")
+        )
+      end
+    end
+
+    context "when initializer is missing but runtime config is available" do
+      let(:runtime_config) do
+        instance_double(
+          ReactOnRails::Configuration,
+          server_bundle_js_file: "",
+          prerender: true
+        )
+      end
+
+      it "still performs the consistency check" do
+        allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        expect(warning_messages).to include(
+          a_string_including("Server rendering is enabled but server_bundle_js_file is not configured")
+        )
+      end
+    end
+
+    context "when runtime server_bundle_js_file is nil and prerender is enabled" do
+      let(:runtime_config) do
+        instance_double(
+          ReactOnRails::Configuration,
+          server_bundle_js_file: nil,
+          prerender: true
+        )
+      end
+
+      it "treats nil as initializer/default fallback instead of disabled" do
+        allow(doctor).to receive(:react_on_rails_runtime_configuration).and_return(runtime_config)
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+        success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+
+        expect(warning_messages).not_to include(
+          a_string_including("Server rendering is enabled but server_bundle_js_file is not configured")
+        )
+        expect(success_messages).to include(a_string_including("Server rendering configuration is consistent"))
+      end
+    end
+
+    context "when views use stream_react_component (RSC/streaming apps)" do
+      it "reports consistent configuration" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = "server-bundle.js"
+          end
+        RUBY
+        write_project_file("app/views/hello_server/index.html.erb", <<~ERB)
+          <h1>Hello Server</h1>
+          <%= stream_react_component('HelloServer', props: @hello_server_props) %>
+        ERB
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+        expect(success_messages).to include(a_string_including("Server rendering configuration is consistent"))
+        expect(info_messages).not_to include(a_string_including("remove server_bundle_js_file"))
+      end
+    end
+
+    context "when views use cached_stream_react_component" do
+      it "reports consistent configuration" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = "server-bundle.js"
+          end
+        RUBY
+        write_project_file("app/views/posts/show.html.erb", <<~ERB)
+          <%= cached_stream_react_component('PostDetail', props: @post_props) %>
+        ERB
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+        expect(success_messages).to include(a_string_including("Server rendering configuration is consistent"))
+      end
+    end
+
+    context "when views use rsc_payload_react_component" do
+      it "reports consistent configuration" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = "server-bundle.js"
+          end
+        RUBY
+        write_project_file("app/views/posts/show.html.erb", <<~ERB)
+          <%= rsc_payload_react_component('PostDetail', props: @post_props) %>
+        ERB
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+        expect(success_messages).to include(a_string_including("Server rendering configuration is consistent"))
+      end
+    end
+
+    context "when views have no prerender or streaming helpers" do
+      it "suggests removing server_bundle_js_file" do
+        write_project_file("config/initializers/react_on_rails.rb", <<~RUBY)
+          ReactOnRails.configure do |config|
+            config.server_bundle_js_file = "server-bundle.js"
+          end
+        RUBY
+        write_project_file("app/views/hello_world/index.html.erb", <<~ERB)
+          <h1>Hello World</h1>
+          <%= react_component("HelloWorld", props: @hello_world_props) %>
+        ERB
+
+        doctor.send(:check_server_bundle_prerender_consistency)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("remove server_bundle_js_file"))
+      end
+    end
+  end
+
+  describe "#check_server_rendering_engine" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:execjs_runtime) { Struct.new(:name).new("Node.js (V8)") }
+    let(:execjs_module) { Struct.new(:runtime).new(execjs_runtime) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    context "when Pro runtime config reports NodeRenderer without initializer text" do
+      before do
+        allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      end
+
+      it "treats ExecJS as fallback without rechecking Pro availability" do
+        stub_const("ExecJS", execjs_module)
+        expect(ReactOnRails::Utils).not_to receive(:react_on_rails_pro?)
+
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("Pro uses NodeRenderer"))
+        expect(info_messages).to include(a_string_including("ExecJS available as fallback"))
+        expect(info_messages).not_to include(a_string_matching(/^\s+ExecJS Runtime:/))
+      end
+    end
+
+    context "when Pro initializer has NodeRenderer" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        write_project_file("config/initializers/react_on_rails_pro.rb", <<~RUBY)
+          ReactOnRailsPro.configure do |config|
+            config.server_renderer = "NodeRenderer"
+          end
+        RUBY
+      end
+
+      it "labels ExecJS as fallback" do
+        stub_const("ExecJS", execjs_module)
+
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("Pro uses NodeRenderer"))
+        expect(info_messages).to include(a_string_including("ExecJS available as fallback"))
+        expect(info_messages).not_to include(a_string_matching(/^\s+ExecJS Runtime:/))
+      end
+    end
+
+    context "when Pro initializer has NodeRenderer and ExecJS is absent" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        write_project_file("config/initializers/react_on_rails_pro.rb", <<~RUBY)
+          ReactOnRailsPro.configure do |config|
+            config.server_renderer = "NodeRenderer"
+          end
+        RUBY
+        hide_const("ExecJS")
+      end
+
+      it "warns about missing ExecJS fallback" do
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        warning_messages = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+        expect(info_messages).to include(a_string_including("Pro uses NodeRenderer"))
+        expect(warning_messages).to include(
+          a_string_including("ExecJS fallback is enabled but ExecJS is not available")
+        )
+      end
+    end
+
+    context "when Pro initializer has NodeRenderer, ExecJS is absent, and fallback is disabled" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        write_project_file("config/initializers/react_on_rails_pro.rb", <<~RUBY)
+          ReactOnRailsPro.configure do |config|
+            config.server_renderer = "NodeRenderer"
+            config.renderer_use_fallback_exec_js = false
+          end
+        RUBY
+        hide_const("ExecJS")
+      end
+
+      it "does not warn about missing ExecJS fallback" do
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        warning_messages = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+        expect(info_messages).to include(a_string_including("Pro uses NodeRenderer"))
+        expect(info_messages).to include(
+          a_string_including("ExecJS fallback is disabled (renderer_use_fallback_exec_js = false)")
+        )
+        expect(warning_messages).not_to include(
+          a_string_including("ExecJS fallback is enabled but ExecJS is not available")
+        )
+      end
+    end
+
+    context "when Pro initializer does not have NodeRenderer" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        write_project_file("config/initializers/react_on_rails_pro.rb", <<~RUBY)
+          ReactOnRailsPro.configure do |config|
+            config.prerender_caching = true
+          end
+        RUBY
+      end
+
+      it "reports ExecJS as primary engine" do
+        stub_const("ExecJS", execjs_module)
+
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("ExecJS Runtime:"))
+        expect(info_messages).not_to include(a_string_including("Pro uses NodeRenderer"))
+      end
+    end
+
+    context "when no Pro initializer exists" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      end
+
+      it "reports ExecJS as primary engine" do
+        stub_const("ExecJS", execjs_module)
+
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("ExecJS Runtime:"))
+      end
+    end
+
+    context "when Pro gem is not installed" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "reports ExecJS as primary engine" do
+        stub_const("ExecJS", execjs_module)
+
+        doctor.send(:check_server_rendering_engine)
+
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("ExecJS Runtime:"))
+      end
+    end
+  end
+
+  describe "#check_bin_dev_launcher_setup" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    def write_project_file(path, content)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.write(path, content)
+    end
+
+    it "warns instead of erroring when the generated launcher is missing" do
+      doctor.send(:check_bin_dev_launcher_setup)
+
+      error_messages = checker.messages.select { |msg| msg[:type] == :error }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(error_messages).to be_empty
+      expect(warning_messages).to include(a_string_including("Official React on Rails bin/dev launcher not found"))
+      expect(info_messages).to include(a_string_including("rails generate react_on_rails:install"))
+    end
+
+    it "acknowledges custom launchers when bin/dev is missing" do
+      write_project_file("dev", <<~SH)
+        #!/usr/bin/env bash
+        bundle exec overmind start -f Procfile.dev
+      SH
+
+      doctor.send(:check_bin_dev_launcher_setup)
+
+      error_messages = checker.messages.select { |msg| msg[:type] == :error }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(error_messages).to be_empty
+      expect(info_messages).to include(a_string_including("Custom launcher detected"))
+      expect(info_messages).to include(a_string_including("./dev"))
+      expect(info_messages).to include(a_string_including("To use the official launcher instead"))
+    end
+
+    it "does not detect a dev/ directory as a custom launcher" do
+      FileUtils.mkdir_p("dev")
+
+      doctor.send(:check_bin_dev_launcher_setup)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+
+      expect(info_messages).not_to include(a_string_including("Custom launcher detected"))
+    end
+
+    it "skips Procfile checks for custom projects via check_bin_dev_launcher" do
+      write_project_file("dev", <<~SH)
+        #!/usr/bin/env bash
+        bundle exec overmind start -f Procfile.dev
+      SH
+
+      doctor.send(:check_bin_dev_launcher)
+
+      all_messages = checker.messages.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+
+      expect(warning_messages).not_to include(a_string_including("Missing Procfile.dev"))
+      expect(warning_messages).not_to include(a_string_including("Missing Procfile.dev-static-assets"))
+      expect(warning_messages).not_to include(a_string_including("Missing Procfile.dev-prod-assets"))
+      expect(all_messages).not_to include(a_string_including("Launcher Procfiles"))
+    end
+
+    it "warns when NodeRenderer static and prod Procfiles do not start the renderer on RENDERER_PORT" do
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        node-renderer: RENDERER_LOG_LEVEL=debug RENDERER_PORT=${RENDERER_PORT:-3800} node renderer/node-renderer.js
+      PROCFILE
+      write_project_file("Procfile.dev-static-assets", <<~PROCFILE)
+        web: bin/rails server -p ${PORT:-3000}
+        js: bin/shakapacker-watch --watch
+      PROCFILE
+      write_project_file("Procfile.dev-prod-assets", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3001}
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Procfile.dev-static-assets"))
+      expect(warning_messages).to include(a_string_including("Procfile.dev-prod-assets"))
+      expect(warning_messages).to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "warns when a common Rack server command starts without the Node Renderer" do
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        web: bundle exec puma -C config/puma.rb
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Procfile.dev"))
+      expect(warning_messages).to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "accepts complete NodeRenderer Procfiles for all bin/dev modes" do
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} node renderer/node-renderer.js
+      PROCFILE
+      write_project_file("Procfile.dev-static-assets", <<~PROCFILE)
+        web: bin/rails server -p ${PORT:-3000}
+        custom-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} node renderer/node-renderer.js
+      PROCFILE
+      write_project_file("Procfile.dev-prod-assets", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3001}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} pnpm run node-renderer
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).not_to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "accepts npm and yarn NodeRenderer package scripts" do
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} npm run node-renderer
+      PROCFILE
+      write_project_file("Procfile.dev-static-assets", <<~PROCFILE)
+        web: bin/rails server -p ${PORT:-3000}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} yarn node-renderer
+      PROCFILE
+      write_project_file("Procfile.dev-prod-assets", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3001}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} yarn run node-renderer
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).not_to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "warns when a renderer process uses RENDERER_PORT but does not start the Node Renderer" do
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        renderer: RENDERER_PORT=${RENDERER_PORT:-3800} vite
+      PROCFILE
+      write_project_file("Procfile.dev-static-assets", <<~PROCFILE)
+        web: bin/rails server -p ${PORT:-3000}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} node renderer/node-renderer.js
+      PROCFILE
+      write_project_file("Procfile.dev-prod-assets", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3001}
+        node-renderer: RENDERER_PORT=${RENDERER_PORT:-3800} pnpm run node-renderer
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Procfile.dev"))
+      expect(warning_messages).to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "warns when a node-renderer entry omits RENDERER_PORT (matches generator's update-it-manually decision)" do
+      # Mirrors the install_generator_spec case: NEW_RENDERER_COMMAND_REGEX now requires
+      # RENDERER_PORT, so the generator surfaces "Update it manually" for this Procfile.
+      # The doctor must agree by warning, otherwise the user gets contradictory feedback.
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("Procfile.dev", <<~PROCFILE)
+        rails: bundle exec rails s -p ${PORT:-3000}
+        node-renderer: node renderer/node-renderer.js
+      PROCFILE
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Procfile.dev"))
+      expect(warning_messages).to include(a_string_including("Node Renderer on RENDERER_PORT"))
+    end
+
+    it "suggests the legacy client/node-renderer.js path when that is the only renderer file present" do
+      # Pro setup skips Procfile rewrites when it detects a legacy client/node-renderer.js,
+      # so the doctor's suggested fix must reference the file that actually exists rather
+      # than pointing the user at the renderer/ path that the generator didn't create.
+      allow(doctor).to receive(:resolved_pro_server_renderer).and_return("NodeRenderer")
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager\n")
+      write_project_file("client/node-renderer.js", "// legacy renderer\n")
+      write_project_file("Procfile.dev", "rails: bundle exec rails s -p ${PORT:-3000}\n")
+
+      doctor.send(:check_bin_dev_launcher)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("client/node-renderer.js"))
+      expect(warning_messages).not_to include(a_string_including("node renderer/node-renderer.js"))
+    end
+
+    it "labels launcher Procfile.dev as live reload when Shakapacker disables HMR" do
+      write_project_file("bin/dev", "ReactOnRails::Dev::ServerManager.run_from_command_line\n")
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        development:
+          dev_server:
+            hmr: false
+            live_reload: true
+      YAML
+
+      doctor.send(:check_bin_dev_launcher)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(
+        a_string_including("Procfile.dev - Live reload development (bin/dev default)")
+      )
+      expect(success_messages).not_to include(a_string_including("Procfile.dev - HMR development"))
+    end
+
+    it "labels Procfile.dev diagnostics as live reload when Shakapacker disables HMR" do
+      write_project_file("Procfile.dev", "web: bin/rails server\njs: bin/shakapacker-dev-server\n")
+      write_project_file("config/shakapacker.yml", <<~YAML)
+        development:
+          dev_server:
+            hmr: false
+            live_reload: true
+      YAML
+
+      doctor.send(:check_procfiles)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(
+        a_string_including("Procfile.dev exists (Live reload development with webpack-dev-server)")
+      )
+      expect(success_messages).not_to include(a_string_including("HMR development with webpack-dev-server"))
+    end
+
+    it "reuses the computed Procfile.dev description when reporting missing shakapacker-dev-server" do
+      write_project_file("Procfile.dev", "web: bin/rails server\n")
+      config = {
+        description: "Live reload development with webpack-dev-server",
+        required_for: "bin/dev (default mode)"
+      }
+
+      doctor.send(:check_individual_procfile, "Procfile.dev", config)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including(
+          "Live reload development with webpack-dev-server (Procfile.dev) requires shakapacker-dev-server"
+        )
+      )
+    end
+
+    it "memoizes the default dev server mode for a doctor run" do
+      expect(ReactOnRails::Dev::ServerMode).to receive(:detect).once.and_return(:hmr)
+
+      2.times { doctor.send(:default_dev_server_mode) }
+    end
+  end
+
+  describe "#shakapacker_config_path" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:rails_root) { Pathname.new(Dir.mktmpdir("doctor-rails-root")) }
+
+    around do |example|
+      original_config_path = ENV.fetch("SHAKAPACKER_CONFIG", nil)
+      original_cwd = Dir.pwd
+      ENV.delete("SHAKAPACKER_CONFIG")
+      example.run
+    ensure
+      ENV["SHAKAPACKER_CONFIG"] = original_config_path
+      Dir.chdir(original_cwd)
+      FileUtils.remove_entry(rails_root) if rails_root.exist?
+    end
+
+    before do
+      allow(Rails).to receive(:root).and_return(rails_root)
+    end
+
+    it "defaults to config/shakapacker.yml under Rails.root" do
+      expect(doctor.send(:shakapacker_config_path)).to eq(
+        rails_root.join("config", "shakapacker.yml").to_s
+      )
+    end
+
+    # Regression guard: doctor must resolve SHAKAPACKER_CONFIG the same way Engine/ServerManager do,
+    # so a relative path does not silently fall back to HMR labels when doctor runs from another dir.
+    it "resolves a relative SHAKAPACKER_CONFIG path against Rails.root" do
+      ENV["SHAKAPACKER_CONFIG"] = "config/custom-shakapacker.yml"
+
+      Dir.mktmpdir("doctor-cwd") do |unrelated_cwd|
+        Dir.chdir(unrelated_cwd) do
+          expect(doctor.send(:shakapacker_config_path)).to eq(
+            rails_root.join("config", "custom-shakapacker.yml").to_s
+          )
+        end
+      end
+    end
+
+    it "preserves an absolute SHAKAPACKER_CONFIG path" do
+      config_path = "/tmp/custom-shakapacker.yml"
+      ENV["SHAKAPACKER_CONFIG"] = config_path
+
+      expect(doctor.send(:shakapacker_config_path)).to eq(config_path)
+    end
+
+    it "uses the current working directory for relative config when Rails is not booted" do
+      allow(Rails).to receive(:root).and_return(nil)
+      ENV["SHAKAPACKER_CONFIG"] = "config/custom-shakapacker.yml"
+
+      Dir.mktmpdir("doctor-cwd") do |cwd|
+        Dir.chdir(cwd) do
+          expect(doctor.send(:shakapacker_config_path)).to eq(
+            File.expand_path("config/custom-shakapacker.yml", Dir.pwd)
+          )
+        end
+      end
+    end
+  end
+
+  describe "server bundle path Shakapacker integration" do
+    let(:doctor) { described_class.new }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      allow(checker).to receive(:add_info)
+      allow(checker).to receive(:add_success)
+      allow(checker).to receive(:add_warning)
+    end
+
+    describe "#check_shakapacker_private_output_path" do
+      context "when Shakapacker is not defined" do
+        before do
+          hide_const("::Shakapacker")
+        end
+
+        it "reports manual configuration" do
+          expect(checker).to receive(:add_info).with("\n  ℹ️  Shakapacker not detected - using manual configuration")
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+      end
+
+      context "when Shakapacker does not support private_output_path (pre-9.0)" do
+        let(:shakapacker_module) { Module.new }
+        let(:shakapacker_config) { instance_double(Shakapacker::Configuration) }
+
+        before do
+          config = shakapacker_config
+          stub_const("::Shakapacker", shakapacker_module)
+          shakapacker_module.define_singleton_method(:config) { config }
+          allow(shakapacker_config).to receive(:respond_to?).with(:private_output_path).and_return(false)
+        end
+
+        it "recommends upgrading to Shakapacker 9.0+" do
+          expect(checker).to receive(:add_info).with(/Recommendation: Upgrade to Shakapacker 9\.0\+/)
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+      end
+
+      context "when Shakapacker 9.0+ is available" do
+        let(:shakapacker_module) { Module.new }
+        let(:shakapacker_config) { instance_double(Shakapacker::Configuration) }
+        let(:rails_module) { Module.new }
+        let(:rails_root) { instance_double(Pathname, to_s: "/app") }
+
+        before do
+          config = shakapacker_config
+          root = rails_root
+          stub_const("::Shakapacker", shakapacker_module)
+          stub_const("Rails", rails_module)
+          shakapacker_module.define_singleton_method(:config) { config }
+          rails_module.define_singleton_method(:root) { root }
+          allow(shakapacker_config).to receive(:respond_to?).with(:private_output_path).and_return(true)
+        end
+
+        it "reports success when private_output_path matches" do
+          private_path = instance_double(Pathname, to_s: "/app/ssr-generated")
+          allow(shakapacker_config).to receive(:private_output_path).and_return(private_path)
+
+          success_msg = "\n  ✅ Using Shakapacker 9.0+ private_output_path: 'ssr-generated'"
+          info_msg = "     Auto-detected from shakapacker.yml - no manual config needed"
+          expect(checker).to receive(:add_success).with(success_msg)
+          expect(checker).to receive(:add_info).with(info_msg)
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+
+        it "warns when private_output_path doesn't match" do
+          private_path = instance_double(Pathname, to_s: "/app/server-bundles")
+          allow(shakapacker_config).to receive(:private_output_path).and_return(private_path)
+
+          expect(checker).to receive(:add_warning).with(/Configuration mismatch detected/)
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+
+        it "includes both paths in mismatch warning" do
+          private_path = instance_double(Pathname, to_s: "/app/server-bundles")
+          allow(shakapacker_config).to receive(:private_output_path).and_return(private_path)
+
+          expect(checker).to receive(:add_warning) do |msg|
+            expect(msg).to include("Shakapacker private_output_path: 'server-bundles'")
+            expect(msg).to include("React on Rails server_bundle_output_path: 'ssr-generated'")
+          end
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+
+        it "recommends configuring when private_output_path not set" do
+          allow(shakapacker_config).to receive(:private_output_path).and_return(nil)
+
+          recommendation_msg = /Recommendation: Configure private_output_path in shakapacker\.yml/
+          expect(checker).to receive(:add_info).with(recommendation_msg)
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+
+        it "provides configuration example when not set" do
+          allow(shakapacker_config).to receive(:private_output_path).and_return(nil)
+
+          expect(checker).to receive(:add_info) do |msg|
+            expect(msg).to include("private_output_path: ssr-generated")
+          end
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+
+        it "handles errors gracefully" do
+          allow(shakapacker_config).to receive(:private_output_path).and_raise(StandardError, "Config error")
+
+          expect(checker).to receive(:add_info).with("\n  ℹ️  Could not check Shakapacker config: Config error")
+          doctor.send(:check_shakapacker_private_output_path, "ssr-generated")
+        end
+      end
+    end
+  end
+
+  describe "Pro package consistency checks" do
+    let(:doctor) { described_class.new }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:package_json_path) { "/tmp/myapp/package.json" }
+
+    before do
+      allow(File).to receive(:exist?).and_call_original
+      allow(doctor).to receive(:resolved_package_json_path).and_return(package_json_path)
+      allow(File).to receive(:exist?).with(package_json_path).and_return(true)
+    end
+
+    context "when both react-on-rails and react-on-rails-pro npm packages are installed" do
+      before do
+        allow(File).to receive(:read).with(package_json_path).and_return(
+          JSON.generate({ "dependencies" => { "react-on-rails" => "16.4.0", "react-on-rails-pro" => "16.4.0" } })
+        )
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        allow(ReactOnRails::Utils).to receive(:package_manager_remove_command)
+          .with("react-on-rails").and_return("npm remove react-on-rails")
+      end
+
+      it "reports an error about duplicate packages" do
+        expect(checker).to receive(:add_error).with(/Both 'react-on-rails' and 'react-on-rails-pro'/)
+        doctor.send(:check_pro_package_consistency)
+      end
+    end
+
+    context "when Pro gem is installed but using base npm package" do
+      before do
+        allow(File).to receive(:read).with(package_json_path).and_return(
+          JSON.generate({ "dependencies" => { "react-on-rails" => "16.4.0" } })
+        )
+        allow(ReactOnRails::Utils).to receive_messages(
+          react_on_rails_pro?: true,
+          react_on_rails_pro_version: "16.4.0",
+          package_manager_install_exact_command: "npm install react-on-rails-pro@16.4.0"
+        )
+      end
+
+      it "reports an error about gem/package mismatch" do
+        expect(checker).to receive(:add_error).with(/Pro gem is installed but using the base/)
+        doctor.send(:check_pro_package_consistency)
+      end
+    end
+
+    context "when Pro npm package is installed without Pro gem" do
+      before do
+        allow(File).to receive(:read).with(package_json_path).and_return(
+          JSON.generate({ "dependencies" => { "react-on-rails-pro" => "16.4.0" } })
+        )
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "reports an error about missing Pro gem" do
+        expect(checker).to receive(:add_error).with(/npm package is installed but the Pro gem is not/)
+        doctor.send(:check_pro_package_consistency)
+      end
+    end
+
+    context "when packages and gems are consistent" do
+      before do
+        allow(File).to receive(:read).with(package_json_path).and_return(
+          JSON.generate({ "dependencies" => { "react-on-rails" => "16.4.0" } })
+        )
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "reports no errors" do
+        expect(checker).not_to receive(:add_error)
+        doctor.send(:check_pro_package_consistency)
+      end
+    end
+
+    context "when package.json is located in a configured JS workspace" do
+      before do
+        rails_root = Pathname.new("/tmp/myapp")
+        package_json_path = rails_root.join("client", "package.json").to_s
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(ReactOnRails).to receive(:configuration).and_return(
+          instance_double(ReactOnRails::Configuration, node_modules_location: "client")
+        )
+        allow(doctor).to receive(:resolved_package_json_path).and_return(package_json_path)
+        allow(File).to receive(:exist?).with(package_json_path).and_return(true)
+        allow(File).to receive(:read).with(package_json_path).and_return(
+          JSON.generate({ "dependencies" => { "react-on-rails-pro" => "16.4.0" } })
+        )
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "uses the configured workspace package.json path" do
+        expect(checker).to receive(:add_error).with(/npm package is installed but the Pro gem is not/)
+        doctor.send(:check_pro_package_consistency)
+      end
+    end
+
+    context "when node_modules_location points to a missing JS workspace" do
+      let(:rails_root) { Pathname.new("/tmp/myapp") }
+      let(:package_root) { rails_root.join("client") }
+      let(:workspace_package_json_path) { package_root.join("package.json").to_s }
+
+      before do
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(ReactOnRails).to receive(:configuration).and_return(
+          instance_double(ReactOnRails::Configuration, node_modules_location: "client")
+        )
+        allow(doctor).to receive(:resolved_package_json_path).and_call_original
+        allow(File).to receive(:exist?).with(workspace_package_json_path).and_return(false)
+        allow(Dir).to receive(:exist?).with(package_root.to_s).and_return(false)
+      end
+
+      it "warns instead of silently skipping the Pro package check" do
+        doctor.send(:check_pro_package_consistency)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("node_modules_location points to #{package_root}") })
+          .to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("all diagnostics that read from it are skipped") })
+          .to be true
+      end
+
+      it "warns once when checker and doctor see the same missing package root" do
+        allow(checker).to receive(:cli_exists?).with("npm").and_return(true)
+        allow(checker).to receive(:cli_exists?).with("pnpm").and_return(false)
+        allow(checker).to receive(:cli_exists?).with("yarn").and_return(false)
+        allow(checker).to receive(:cli_exists?).with("bun").and_return(false)
+
+        checker.check_package_manager
+        doctor.send(:check_pro_package_consistency)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        root_warnings = warning_msgs.select do |message|
+          message[:content].include?("node_modules_location points to #{package_root}")
+        end
+        expect(root_warnings.length).to eq(1)
+      end
+    end
+
+    context "when the configured JS workspace exists without package.json" do
+      let(:rails_root) { Pathname.new("/tmp/myapp") }
+      let(:package_root) { rails_root.join("client") }
+      let(:workspace_package_json_path) { package_root.join("package.json").to_s }
+
+      before do
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(ReactOnRails).to receive(:configuration).and_return(
+          instance_double(ReactOnRails::Configuration, node_modules_location: "client")
+        )
+        allow(doctor).to receive(:resolved_package_json_path).and_call_original
+        allow(File).to receive(:exist?).with(workspace_package_json_path).and_return(false)
+        allow(Dir).to receive(:exist?).with(package_root.to_s).and_return(true)
+      end
+
+      it "warns instead of silently skipping the Pro package check" do
+        doctor.send(:check_pro_package_consistency)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("#{workspace_package_json_path} not found") })
+          .to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("Pro package consistency") }).to be true
+      end
+    end
+  end
+
+  describe "#check_gem_wildcard_for" do
+    let(:doctor) { described_class.new }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      stub_const("ReactOnRails::VERSION", "16.5.0")
+    end
+
+    it "accepts multiline Gemfile declarations with comment-only continuation lines" do
+      gemfile_content = <<~RUBY
+        gem 'react_on_rails',
+            # pinned for compatibility
+            '16.5.0'
+      RUBY
+
+      doctor.send(:check_gem_wildcard_for, gemfile_content, "react_on_rails")
+
+      expect(checker.messages.any? do |msg|
+        msg[:type] == :success && msg[:content].include?("Gemfile uses exact version for react_on_rails")
+      end).to be true
+      expect(checker.messages.any? do |msg|
+        msg[:type] == :error && msg[:content].include?("Gemfile specifies no version for react_on_rails")
+      end).to be false
+    end
+
+    it "accepts keyword-style Gemfile version declarations" do
+      gemfile_content = "gem 'react_on_rails', version: '16.5.0'\n"
+
+      doctor.send(:check_gem_wildcard_for, gemfile_content, "react_on_rails")
+
+      expect(checker.messages.any? do |msg|
+        msg[:type] == :success && msg[:content].include?("Gemfile uses exact version for react_on_rails")
+      end).to be true
+    end
+  end
+
+  describe "#check_npm_alias_version" do
+    let(:doctor) { described_class.new }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      stub_const("ReactOnRails::VERSION", "16.5.0")
+      allow(ReactOnRails::Utils).to receive_messages(
+        react_on_rails_pro_version: "16.5.0",
+        package_manager_install_exact_command: "pnpm add react-on-rails-pro@16.5.0"
+      )
+      allow(ReactOnRails::Utils).to receive(:package_manager_install_exact_command) do |package_name, version|
+        "pnpm add #{package_name}@#{version}"
+      end
+    end
+
+    it "reports an error for non-exact npm alias specs" do
+      expect(checker).to receive(:add_error).with(
+        include(
+          "non-exact version in npm alias for react-on-rails-pro: npm:@scope/react-on-rails-pro@^16.5.0",
+          "will cause a runtime error on app startup",
+          "Fix: pnpm add react-on-rails-pro@16.5.0",
+          "bundle exec rake react_on_rails:sync_versions WRITE=true"
+        )
+      )
+
+      doctor.send(:check_npm_alias_version, "npm:@scope/react-on-rails-pro@^16.5.0", "react-on-rails-pro")
+    end
+
+    it "reports success for exact npm alias specs" do
+      expect(checker).to receive(:add_success).with("✅ package.json uses exact version for react-on-rails")
+
+      doctor.send(:check_npm_alias_version, "npm:@scope/react-on-rails@16.5.0", "react-on-rails")
+    end
+
+    it "reports an error for exact npm alias versions that do not match expected version" do
+      expect(checker).to receive(:add_error).with(
+        include(
+          "npm alias version mismatch for react-on-rails: npm:@scope/react-on-rails@16.4.0",
+          "Expected exact version: 16.5.0",
+          "Fix: pnpm add react-on-rails@16.5.0"
+        )
+      )
+
+      doctor.send(:check_npm_alias_version, "npm:@scope/react-on-rails@16.4.0", "react-on-rails")
+    end
+
+    it "reports an error for npm aliases without a parseable trailing version" do
+      expect(checker).to receive(:add_error).with(
+        include(
+          "npm alias without a parseable version for react-on-rails: npm:@scope/react-on-rails",
+          "Fix: pnpm add react-on-rails@16.5.0"
+        )
+      )
+
+      doctor.send(:check_npm_alias_version, "npm:@scope/react-on-rails", "react-on-rails")
+    end
+  end
+
+  describe "#auto_fix_versions" do
+    let(:doctor) { described_class.new(verbose: false, fix: true) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    def stub_synchronizer(result)
+      synchronizer = instance_double(ReactOnRails::VersionSynchronizer, sync: result)
+
+      allow(doctor).to receive(:package_json_path_for)
+        .with("package version auto-sync")
+        .and_return("package.json")
+      allow(ReactOnRails::VersionSynchronizer).to receive(:new).and_return(synchronizer)
+    end
+
+    it "adds explicit guidance that Gemfile constraints are not auto-fixed when changes are applied" do
+      result = ReactOnRails::VersionSynchronizer::Result.new(
+        changes: [{ section: "dependencies", package: "react-on-rails", from: "^16.4.0", to: "16.5.0" }],
+        changed_files: ["package.json"],
+        unsupported_specs: [],
+        missing_source_specs: []
+      )
+      stub_synchronizer(result)
+
+      doctor.send(:auto_fix_versions)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(
+        a_string_including("FIX=true only updates package.json; update Gemfile constraints manually if needed.")
+      )
+    end
+
+    # Regression: previously emitted unconditionally, producing misleading noise
+    # alongside `report_sync_changes`'s "No package.json version changes needed".
+    it "skips the Gemfile-constraints info message when there are no changes" do
+      result = ReactOnRails::VersionSynchronizer::Result.new(
+        changes: [],
+        changed_files: [],
+        unsupported_specs: [],
+        missing_source_specs: []
+      )
+      stub_synchronizer(result)
+
+      doctor.send(:auto_fix_versions)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).not_to include(
+        a_string_including("FIX=true only updates package.json; update Gemfile constraints manually if needed.")
+      )
+    end
+  end
+
+  describe "private path resolution helpers" do
+    describe "#resolved_package_root" do
+      let(:rails_root) { Pathname.new("/tmp/myapp") }
+
+      before do
+        allow(Rails).to receive(:root).and_return(rails_root)
+      end
+
+      def stub_node_modules_location(path)
+        allow(ReactOnRails).to receive(:configuration).and_return(
+          instance_double(ReactOnRails::Configuration, node_modules_location: path)
+        )
+      end
+
+      it "resolves root package paths to Rails.root" do
+        [nil, "", ".", rails_root.to_s, "#{rails_root}/"].each do |node_modules_location|
+          doctor = described_class.new(verbose: false, fix: false)
+          stub_node_modules_location(node_modules_location)
+
+          expect(doctor.send(:resolved_package_root)).to eq(rails_root.to_s)
+          expect(doctor.send(:resolved_package_json_path)).to eq(rails_root.join("package.json").to_s)
+          expect(doctor.send(:resolved_package_path, "package.json")).to eq(rails_root.join("package.json").to_s)
+        end
+      end
+
+      it "resolves nested package paths under Rails.root" do
+        stub_node_modules_location("client")
+
+        expect(doctor.send(:resolved_package_root)).to eq(rails_root.join("client").to_s)
+        expect(doctor.send(:resolved_package_json_path)).to eq(rails_root.join("client", "package.json").to_s)
+        expect(doctor.send(:resolved_package_path, "yarn.lock")).to eq(rails_root.join("client", "yarn.lock").to_s)
+      end
+
+      it "passes through absolute package paths" do
+        stub_node_modules_location("/opt/app/client/")
+
+        expect(doctor.send(:resolved_package_root)).to eq("/opt/app/client")
+        expect(doctor.send(:resolved_package_json_path)).to eq("/opt/app/client/package.json")
+        expect(doctor.send(:resolved_package_path, "yarn.lock")).to eq("/opt/app/client/yarn.lock")
+      end
+    end
+
+    describe "#resolved_webpack_config_path" do
+      it "prioritizes shakapacker's exact assets_bundler_config_path" do
+        allow(File).to receive(:file?).and_return(false)
+        allow(File).to receive(:file?).with("config/custom/custom-bundler.config.js").and_return(true)
+        allow(File).to receive(:file?).with("config/custom/webpack.config.js").and_return(true)
+        allow(doctor).to receive(:shakapacker_assets_bundler_config_path)
+          .and_return("config/custom/custom-bundler.config.js")
+        allow(doctor).to receive(:bundler_config_directory)
+          .with("config/custom/custom-bundler.config.js")
+          .and_return("config/custom")
+
+        expect(doctor.send(:resolved_webpack_config_path)).to eq("config/custom/custom-bundler.config.js")
+      end
+
+      it "falls back to shakapacker-derived webpack config candidates when exact shakapacker path is not a file" do
+        allow(File).to receive(:file?).and_return(false)
+        allow(File).to receive(:file?).with("config/custom/webpack.config.ts").and_return(true)
+        allow(doctor).to receive(:bundler_config_directory)
+          .with("config/custom/custom-bundler.config.js")
+          .and_return("config/custom")
+        allow(doctor).to receive(:shakapacker_assets_bundler_config_path)
+          .and_return("config/custom/custom-bundler.config.js")
+
+        expect(doctor.send(:resolved_webpack_config_path)).to eq("config/custom/webpack.config.ts")
+      end
+
+      it "keeps sibling bundler candidates when shakapacker path uses a standard filename" do
+        allow(File).to receive(:file?).and_return(false)
+        allow(File).to receive(:file?).with("config/webpack/rspack.config.js").and_return(true)
+        allow(doctor).to receive(:bundler_config_directory)
+          .with("config/webpack/webpack.config.js")
+          .and_return("config/webpack")
+        allow(doctor).to receive(:shakapacker_assets_bundler_config_path)
+          .and_return("config/webpack/webpack.config.js")
+
+        expect(doctor.send(:resolved_webpack_config_path)).to eq("config/webpack/rspack.config.js")
+      end
+
+      it "resolves rspack config candidates from the shakapacker-derived directory" do
+        allow(File).to receive(:file?).and_return(false)
+        allow(File).to receive(:file?).with("config/rspack/rspack.config.ts").and_return(true)
+        allow(doctor).to receive(:bundler_config_directory)
+          .with("config/rspack/custom-bundler.config.js")
+          .and_return("config/rspack")
+        allow(doctor).to receive(:shakapacker_assets_bundler_config_path)
+          .and_return("config/rspack/custom-bundler.config.js")
+
+        expect(doctor.send(:resolved_webpack_config_path)).to eq("config/rspack/rspack.config.ts")
+      end
+
+      it "falls back to default rspack config paths when shakapacker directory is unavailable" do
+        allow(File).to receive(:file?).and_return(false)
+        allow(File).to receive(:file?).with("config/rspack/rspack.config.js").and_return(true)
+        allow(doctor).to receive(:bundler_config_directory).with(nil).and_return(nil)
+        allow(doctor).to receive(:shakapacker_assets_bundler_config_path).and_return(nil)
+
+        expect(doctor.send(:resolved_webpack_config_path)).to eq("config/rspack/rspack.config.js")
+      end
+    end
+
+    describe "#shakapacker_assets_bundler_config_path" do
+      it "normalizes shakapacker assets_bundler_config_path to a rails-relative path" do
+        rails_root = Pathname.new("/tmp/myapp")
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+        shakapacker_config = Struct.new(:assets_bundler_config_path).new(
+          "#{rails_root}/config/custom/custom-bundler.config.ts"
+        )
+        shakapacker_class = Class.new do
+          class << self
+            attr_accessor :config
+          end
+        end
+        stub_const("Shakapacker", shakapacker_class)
+        Shakapacker.config = shakapacker_config
+
+        expect(doctor.send(:shakapacker_assets_bundler_config_path)).to eq("config/custom/custom-bundler.config.ts")
+      end
+
+      it "keeps absolute assets_bundler_config_path outside Rails.root unchanged" do
+        rails_root = Pathname.new("/tmp/myapp")
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+        shakapacker_config = Struct.new(:assets_bundler_config_path).new("/opt/custom/bundler.config.js")
+        shakapacker_class = Class.new do
+          class << self
+            attr_accessor :config
+          end
+        end
+        stub_const("Shakapacker", shakapacker_class)
+        Shakapacker.config = shakapacker_config
+
+        expect(doctor.send(:shakapacker_assets_bundler_config_path)).to eq("/opt/custom/bundler.config.js")
+      end
+
+      it "does not strip absolute paths when Rails.root is filesystem root" do
+        allow(Rails).to receive(:root).and_return(Pathname.new("/"))
+        allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+        shakapacker_config = Struct.new(:assets_bundler_config_path).new("/opt/custom/bundler.config.js")
+        shakapacker_class = Class.new do
+          class << self
+            attr_accessor :config
+          end
+        end
+        stub_const("Shakapacker", shakapacker_class)
+        Shakapacker.config = shakapacker_config
+
+        expect(doctor.send(:shakapacker_assets_bundler_config_path)).to eq("/opt/custom/bundler.config.js")
+      end
+
+      it "returns nil when normalization strips to an empty relative path" do
+        rails_root = Pathname.new("/tmp/myapp")
+        allow(Rails).to receive(:root).and_return(rails_root)
+        allow(doctor).to receive(:require).with("shakapacker").and_return(true)
+        shakapacker_config = Struct.new(:assets_bundler_config_path).new("#{rails_root}/")
+        shakapacker_class = Class.new do
+          class << self
+            attr_accessor :config
+          end
+        end
+        stub_const("Shakapacker", shakapacker_class)
+        Shakapacker.config = shakapacker_config
+
+        expect(doctor.send(:shakapacker_assets_bundler_config_path)).to be_nil
+      end
+    end
+
+    describe "#bundler_config_directory" do
+      it "extracts a directory from shakapacker's config file path" do
+        expect(doctor.send(:bundler_config_directory, "config/custom/webpack.config.ts"))
+          .to eq("config/custom")
+      end
+
+      it "returns nil for bare filenames without a directory component" do
+        expect(doctor.send(:bundler_config_directory, "webpack.config.js")).to be_nil
+      end
+    end
+  end
+
+  describe "#doctor_app_root" do
+    it "prefers Rails.root when it becomes available after a cwd fallback" do
+      Dir.mktmpdir do |cwd_root|
+        Dir.mktmpdir do |rails_root|
+          current_rails_root = nil
+          allow(Rails).to receive(:root) { current_rails_root }
+
+          Dir.chdir(cwd_root) do
+            cwd_fallback = File.expand_path(Dir.pwd)
+            expect(doctor.send(:doctor_app_root)).to eq(cwd_fallback)
+
+            current_rails_root = Pathname.new(rails_root)
+            expect(doctor.send(:doctor_app_root)).to eq(rails_root)
+          end
+        end
+      end
+    end
+  end
+
+  # ── Pro Setup Checks ──────────────────────────────────────────────
+  # ReactOnRailsPro class may not be loaded in the test environment (Pro is optional),
+  # so we must use unverified doubles for stub_const.
+  # rubocop:disable RSpec/VerifiedDoubles
+
+  describe "Pro setup checks" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      allow(doctor).to receive(:puts)
+      allow(doctor).to receive(:exit)
+    end
+
+    context "when Pro gem is not installed" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "shows the Pro upgrade path without changing the existing check section" do
+        doctor.send(:check_pro_setup)
+        info_messages = checker.messages.select { |message| message[:type] == :info }
+
+        expect(info_messages).to include(
+          hash_including(
+            content: a_string_including(
+              "React on Rails Pro",
+              "https://reactonrails.com/docs/pro/upgrading-to-pro/"
+            )
+          )
+        )
+      end
+    end
+
+    context "when Pro gem is installed with NodeRenderer" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        pro_config = double("ProConfig", server_renderer: "NodeRenderer", rolling_deploy_adapter: nil)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+      end
+
+      it "reports success for NodeRenderer" do
+        doctor.send(:check_pro_setup)
+        success_messages = checker.messages.select { |m| m[:type] == :success }
+        expect(success_messages.any? { |m| m[:content].include?("NodeRenderer") }).to be true
+      end
+    end
+
+    context "when Pro gem is installed with ExecJS" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        pro_config = double("ProConfig", server_renderer: "ExecJS", rolling_deploy_adapter: nil)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+      end
+
+      it "reports ExecJS mode as info" do
+        doctor.send(:check_pro_setup)
+        info_messages = checker.messages.select { |m| m[:type] == :info }
+        expect(info_messages.any? { |m| m[:content].include?("ExecJS") }).to be true
+      end
+    end
+
+    context "when Pro configuration raises an error" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro"))
+        allow(ReactOnRailsPro).to receive(:configuration).and_raise(StandardError, "config load failed")
+      end
+
+      it "catches the error and adds a warning" do
+        doctor.send(:check_pro_setup)
+        warning_messages = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_messages.any? { |m| m[:content].include?("config load failed") }).to be true
+      end
+    end
+  end
+
+  describe "NodeRenderer rollout capacity checks" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:renderer_url) { "http://localhost:3800" }
+    let(:enable_rsc_support) { true }
+    let(:pro_config) do
+      double(
+        "ProConfig",
+        server_renderer: "NodeRenderer",
+        renderer_url:,
+        enable_rsc_support:
+      )
+    end
+
+    def write_node_renderer_script(path, source)
+      canonical_binding =
+        "const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');"
+      source = "#{canonical_binding}\n#{source}" unless source.include?("react-on-rails-pro-node-renderer")
+      File.write(path, source)
+    end
+
+    def wait_for_published_child_pid(path)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+      loop do
+        contents = File.read(path) if File.file?(path)
+        return contents.to_i if contents&.match?(/\A[1-9]\d*\n\z/)
+
+        deadline_reached = Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        raise "syntax-check child pid was not published" if deadline_reached
+
+        sleep 0.01
+      end
+    end
+
+    around do |example|
+      previous_max_vm_pool_size = ENV.fetch("MAX_VM_POOL_SIZE", nil)
+      ENV.delete("MAX_VM_POOL_SIZE")
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) do
+          FileUtils.mkdir_p("renderer")
+          example.run
+        end
+      end
+    ensure
+      if previous_max_vm_pool_size
+        ENV["MAX_VM_POOL_SIZE"] = previous_max_vm_pool_size
+      else
+        ENV.delete("MAX_VM_POOL_SIZE")
+      end
+    end
+
+    before do
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+      stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+    end
+
+    it "reports observed insufficient capacity with the per-worker formula" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 3 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "generations=2",
+            "contexts_per_generation=2",
+            "required_capacity=4 per worker"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "insufficient",
+            "evidence=observed",
+            "configured=3",
+            "required=4",
+            "topology=loopback_endpoint",
+            "scope=configuration_not_live_process"
+          )
+        )
+      )
+    end
+
+    it "passes observed capacity that covers an RSC rollout" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ rendererUrl: 'http://localhost', maxVMPoolSize: 4, " \
+        "currentGenerationManifestPath: '/app/.node-renderer-bundles/.current-generations/" \
+        "rorp-generation-v1-#{'a' * 64}.json' });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :success,
+          content: a_string_including(
+            "sufficient",
+            "evidence=observed",
+            "configured=4",
+            "required=4",
+            "current_generation_declaration=observed"
+          )
+        )
+      )
+    end
+
+    [
+      "/app/.node-renderer-bundles/.current-generations/current.json",
+      ".node-renderer-bundles/.current-generations/rorp-generation-v1-#{'a' * 64}.json",
+      ""
+    ].each do |declaration_path|
+      it "does not observe unsupported current-generation declaration path #{declaration_path.inspect}" do
+        write_node_renderer_script(
+          "renderer/node-renderer.js",
+          "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, " \
+          "currentGenerationManifestPath: #{declaration_path.to_json} });"
+        )
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including("current_generation_declaration=unverified")
+          )
+        )
+        expect(checker.messages).not_to include(
+          hash_including(type: :success, content: a_string_including("Declared-current"))
+        )
+      end
+    end
+
+    it "does not claim a declared-current warm pass when capacity is observed but the declaration is not" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ rendererUrl: 'http://localhost', maxVMPoolSize: 4 });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "capacity is sufficient but declared-current prewarm is unverified",
+            "configured=4",
+            "required=4",
+            "current_generation_declaration=unverified"
+          )
+        )
+      )
+      expect(checker.messages).to include(
+        hash_including(type: :success, content: a_string_including("VM pool rollout capacity is sufficient"))
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("Declared-current"))
+      )
+    end
+
+    it "validates the complete renderer script delimiters once for multiple candidate calls" do
+      content = "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+                "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      allow(doctor).to receive(:node_renderer_delimiter_stack).and_call_original
+
+      doctor.send(:node_renderer_single_reachable_call, content)
+
+      expect(doctor).to have_received(:node_renderer_delimiter_stack).with(content).once
+    end
+
+    it "fails closed before reachability analysis when candidate calls exceed the bounded limit" do
+      content = Array.new(33, "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });").join("\n")
+      expect(doctor).not_to receive(:node_renderer_call_reachability_proven?)
+
+      call = doctor.send(:node_renderer_single_reachable_call, content)
+
+      expect(call).to be_nil
+    end
+
+    it "syntax-checks without executing launcher code or inherited Node hooks" do
+      launcher_marker = File.join(Dir.pwd, "launcher-executed")
+      hook_marker = File.join(Dir.pwd, "node-options-hook-executed")
+      hook_path = File.join(Dir.pwd, "node-options-hook.cjs")
+      File.write(hook_path, "require('fs').writeFileSync(#{hook_marker.to_json}, 'executed');")
+      original_node_options = ENV.fetch("NODE_OPTIONS", nil)
+      ENV["NODE_OPTIONS"] = "--require=#{hook_path}"
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "require('fs').writeFileSync(#{launcher_marker.to_json}, 'executed');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, " \
+        "currentGenerationManifestPath: '/app/.node-renderer-bundles/.current-generations/" \
+        "rorp-generation-v1-#{'a' * 64}.json' });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :success,
+          content: a_string_including("evidence=observed", "configured=4")
+        )
+      )
+      expect(File).not_to exist(launcher_marker)
+      expect(File).not_to exist(hook_marker)
+    ensure
+      if original_node_options
+        ENV["NODE_OPTIONS"] = original_node_options
+      else
+        ENV.delete("NODE_OPTIONS")
+      end
+    end
+
+    it "fails closed when Node cannot prove launcher syntax" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      )
+      allow(Process).to receive(:spawn).and_raise(Errno::ENOENT)
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_javascript_syntax_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "terminates and reaps a stalled Node syntax check" do
+      fake_bin = File.join(Dir.pwd, "fake-bin")
+      fake_node = File.join(fake_bin, "node")
+      FileUtils.mkdir_p(fake_bin)
+      File.write(
+        fake_node,
+        <<~SH
+          #!/bin/sh
+          sleep 1
+        SH
+      )
+      File.chmod(0o755, fake_node)
+      allow(doctor).to receive(:node_renderer_syntax_check_command).and_return([fake_node])
+      spawned_pid = nil
+      allow(Process).to receive(:spawn).and_wrap_original do |original, *arguments|
+        spawned_pid = original.call(*arguments)
+      end
+      detached_waiter = nil
+      allow(Process).to receive(:detach).and_wrap_original do |original, pid|
+        detached_waiter = original.call(pid)
+      end
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TIMEOUT_SECONDS", 0.1)
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0.1)
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      )
+
+      started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      doctor.send(:check_node_renderer_rollout_capacity)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+      expect(elapsed).to be < 0.75
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_javascript_syntax_not_proven"
+          )
+        )
+      )
+      expect(spawned_pid).not_to be_nil
+      expect(detached_waiter).not_to be_nil
+      expect(detached_waiter.join(2)).not_to be_nil
+      expect { Process.kill(0, spawned_pid) }.to raise_error(Errno::ESRCH)
+    end
+
+    it "terminates a stalled Node syntax check process group after its leader exits" do
+      fake_bin = File.join(Dir.pwd, "fake-bin")
+      fake_node = File.join(fake_bin, "node")
+      child_pid_path = File.join(Dir.pwd, "syntax-check-child-pid")
+      FileUtils.mkdir_p(fake_bin)
+      File.write(
+        fake_node,
+        <<~SH
+          #!/bin/sh
+          (trap '' TERM; while :; do sleep 1; done) &
+          echo $! > #{child_pid_path}
+          wait
+        SH
+      )
+      File.chmod(0o755, fake_node)
+      allow(doctor).to receive(:node_renderer_syntax_check_command).and_return([fake_node])
+      spawned_pid = nil
+      allow(Process).to receive(:spawn).and_wrap_original do |original, *arguments|
+        spawned_pid = original.call(*arguments)
+      end
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TIMEOUT_SECONDS", 0.5)
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0.1)
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      child_pid = wait_for_published_child_pid(child_pid_path)
+      expect(spawned_pid).not_to be_nil
+      expect { Process.kill(0, spawned_pid) }.to raise_error(Errno::ESRCH)
+      expect { Process.kill(0, child_pid) }.to raise_error(Errno::ESRCH)
+    ensure
+      begin
+        Process.kill("KILL", -spawned_pid) if spawned_pid
+      rescue Errno::ESRCH
+        nil
+      end
+    end
+
+    it "does not require ActiveSupport status predicates during syntax-check cleanup" do
+      core_status = Class.new(BasicObject) do
+        def nil?
+          false
+        end
+      end.new
+      allow(doctor).to receive(:signal_node_renderer_syntax_check)
+      allow(doctor).to receive(:node_renderer_syntax_check_process_group_alive?).and_return(false)
+      allow(Process).to receive(:wait2).and_return([1234, core_status])
+
+      expect { doctor.send(:terminate_node_renderer_syntax_check, 1234) }.not_to raise_error
+    end
+
+    it "keeps the process-group leader unreaped until group signaling is complete" do
+      events = []
+      waiter = instance_double(Thread, join: nil)
+      allow(doctor).to receive(:signal_node_renderer_syntax_check) { events << :signal }
+      allow(doctor).to receive(:node_renderer_syntax_check_process_group_alive?) do
+        events << :group_probe
+        false
+      end
+      allow(Process).to receive(:detach) do
+        events << :reap
+        waiter
+      end
+
+      doctor.send(:terminate_node_renderer_syntax_check, 1234)
+
+      expect(events.index(:group_probe)).to be < events.index(:reap)
+    end
+
+    it "detaches instead of blocking when bounded syntax-check reaping cannot finish" do
+      allow(doctor).to receive(:signal_node_renderer_syntax_check)
+      allow(doctor).to receive(:node_renderer_syntax_check_process_group_alive?).and_return(false)
+      allow(Process).to receive(:wait).and_raise("blocking wait was attempted")
+      waiter = instance_double(Thread, join: nil)
+      allow(Process).to receive(:detach).and_return(waiter)
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0)
+
+      expect { doctor.send(:terminate_node_renderer_syntax_check, 1234) }.not_to raise_error
+      expect(Process).not_to have_received(:wait)
+      expect(Process).to have_received(:detach).with(1234)
+      expect(waiter).to have_received(:join).with(0)
+    end
+
+    it "does not signal an unsignalable syntax-check process group after an EPERM probe" do
+      allow(doctor).to receive(:signal_node_renderer_syntax_check)
+      allow(Process).to receive(:kill).with(0, -1234).and_raise(Errno::EPERM)
+      allow(Process).to receive(:getpgid).with(1234).and_return(1234)
+      waiter = instance_double(Thread, join: nil)
+      allow(Process).to receive(:detach).and_return(waiter)
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0)
+
+      doctor.send(:terminate_node_renderer_syntax_check, 1234)
+
+      expect(doctor).to have_received(:signal_node_renderer_syntax_check).once.with("TERM", 1234)
+      expect(waiter).to have_received(:join).with(0)
+    end
+
+    it "continues group cleanup after EPERM when a competing waiter already reaped the leader" do
+      allow(doctor).to receive(:signal_node_renderer_syntax_check)
+      allow(Process).to receive(:kill).with(0, -1234).and_raise(Errno::EPERM)
+      allow(Process).to receive(:getpgid).with(1234).and_raise(Errno::ESRCH)
+      allow(Process).to receive(:detach).and_raise(Errno::ECHILD)
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0)
+
+      doctor.send(:terminate_node_renderer_syntax_check, 1234)
+
+      expect(doctor).to have_received(:signal_node_renderer_syntax_check).with("TERM", 1234).ordered
+      expect(doctor).to have_received(:signal_node_renderer_syntax_check).with("KILL", 1234).ordered
+    end
+
+    it "continues process-group cleanup after a competing waiter reaps the group leader" do
+      fake_node = File.join(Dir.pwd, "competing-waiter-node")
+      child_pid_path = File.join(Dir.pwd, "competing-waiter-child-pid")
+      File.write(
+        fake_node,
+        <<~SH
+          #!/bin/sh
+          (trap '' TERM; while :; do sleep 1; done) &
+          echo $! > #{child_pid_path}
+          wait
+        SH
+      )
+      File.chmod(0o755, fake_node)
+      leader_pid = Process.spawn(fake_node, out: File::NULL, err: File::NULL, pgroup: true)
+      child_pid = wait_for_published_child_pid(child_pid_path)
+      reaper = Thread.new { Process.wait(leader_pid) }
+      allow(doctor).to receive(:signal_node_renderer_syntax_check) do |signal, pid|
+        Process.kill(signal, -pid)
+        reaper.join if signal == "TERM"
+      end
+      stub_const("ReactOnRails::Doctor::NODE_RENDERER_SYNTAX_CHECK_TERMINATION_GRACE_SECONDS", 0.1)
+
+      doctor.send(:terminate_node_renderer_syntax_check, leader_pid)
+
+      expect(reaper).not_to be_alive
+      expect { Process.kill(0, child_pid) }.to raise_error(Errno::ESRCH)
+      expect { Process.kill(0, -leader_pid) }.to raise_error(Errno::ESRCH)
+    ensure
+      begin
+        Process.kill("KILL", -leader_pid) if leader_pid && leader_pid > 1 && leader_pid != Process.getpgrp
+      rescue Errno::ESRCH
+        nil
+      end
+      reaper&.join(1)
+    end
+
+    it "fails closed when a bare renderer call has no canonical package binding" do
+      File.write("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_configuration_binding_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    [
+      [
+        "a package binding scoped to an earlier block",
+        "{\nconst { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n}\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding declared after the call",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');"
+      ],
+      [
+        "a CommonJS require function rebound before the package binding",
+        "require = eval(\"(_specifier) => ({ reactOnRailsProNodeRenderer: (_config) => undefined })\");\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require function rebound through direct eval",
+        "eval(\"require = (_specifier) => ({ reactOnRailsProNodeRenderer: (_config) => undefined })\");\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require function rebound through destructuring assignment",
+        "const holder = { loader: require };\n" \
+        "({ loader: require } = holder);\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require function rebound through array assignment",
+        "const holder = [require];\n" \
+        "[require] = holder;\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require assignment separated by a block comment",
+        "const replacement = require;\n" \
+        "require /* gap */ = replacement;\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require function rebound through the wrapper arguments object",
+        "arguments[1] = Object;\n" \
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS require function declaration hoisted from after the renderer call",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "function require(_specifier) { return Object.create(null); }"
+      ],
+      [
+        "a duplicate local name hidden in another CommonJS destructuring specifier",
+        "const { foo: reactOnRailsProNodeRenderer, reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "renderer_configuration_binding_not_proven",
+        true
+      ],
+      [
+        "a syntax-invalid member-expression binding collision",
+        "const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');\n" \
+        "const obj.reactOnRailsProNodeRenderer = shim;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "renderer_javascript_syntax_invalid",
+        true
+      ],
+      [
+        "a syntax-invalid private-identifier binding collision",
+        "const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');\n" \
+        "const #reactOnRailsProNodeRenderer = shim;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "renderer_javascript_syntax_invalid",
+        true
+      ],
+      [
+        "a syntax-invalid hexadecimal identifier escape collision",
+        "const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');\n" \
+        "const \\x72eactOnRailsProNodeRenderer = shim;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "renderer_javascript_syntax_invalid",
+        true
+      ],
+      [
+        "a CommonJS package binding lookalike inside a quoted string",
+        'const help = "; const { reactOnRailsProNodeRenderer } = ' \
+        "require('react-on-rails-pro-node-renderer');\";\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an ESM package binding lookalike inside a quoted string",
+        'const help = "; import { reactOnRailsProNodeRenderer } from ' \
+        "'react-on-rails-pro-node-renderer';\";\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding lookalike inside an unterminated double-quoted string",
+        'const help = "; const { reactOnRailsProNodeRenderer } = ' \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "ambiguous_javascript_configuration",
+        true
+      ],
+      [
+        "an ESM package binding lookalike inside an unterminated double-quoted string",
+        'const help = "; import { reactOnRailsProNodeRenderer } from ' \
+        "'react-on-rails-pro-node-renderer';\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "ambiguous_javascript_configuration",
+        true
+      ],
+      [
+        "a CommonJS package binding lookalike inside an unterminated single-quoted string",
+        "const help = '; const { reactOnRailsProNodeRenderer } = " \
+        'require("react-on-rails-pro-node-renderer");' \
+        "\nreactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "ambiguous_javascript_configuration",
+        true
+      ],
+      [
+        "an ESM package binding lookalike inside an unterminated single-quoted string",
+        "const help = '; import { reactOnRailsProNodeRenderer } from " \
+        '"react-on-rails-pro-node-renderer";' \
+        "\nreactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });",
+        "ambiguous_javascript_configuration",
+        true
+      ]
+    ].each do |description, source, expected_reason, node_syntax_error|
+      expected_reason ||= "renderer_configuration_binding_not_proven"
+
+      it "requires proven binding scope for #{description}" do
+        File.write("renderer/node-renderer.js", source)
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "evidence=unverified",
+              "reason=#{expected_reason}"
+            )
+          )
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+
+      it "emits unverified JSON when provenance resembles #{description}" do
+        File.write("renderer/node-renderer.js", source)
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including(
+            "evidence=unverified",
+            "reason=#{expected_reason}"
+          )
+        )
+        expect(check.fetch("details")).not_to include(hash_including("level" => "success"))
+      end
+
+      next unless node_syntax_error
+
+      it "proves malformed source fails Node parsing for #{description}" do
+        require_node_runtime!
+
+        _stdout, stderr, status = Open3.capture3("node", "--eval", source)
+
+        expect(status).not_to be_success
+        expect(stderr).to include("SyntaxError")
+      end
+    end
+
+    [
+      [
+        "an unrelated double-quoted string value",
+        'reactOnRailsProNodeRenderer({ label: "safe", maxVMPoolSize: 4 });'
+      ],
+      [
+        "an unrelated single-quoted string value",
+        "reactOnRailsProNodeRenderer({ label: 'safe', maxVMPoolSize: 4 });"
+      ],
+      [
+        "a directly quoted capacity key",
+        'reactOnRailsProNodeRenderer({ label: "safe", "maxVMPoolSize": 4 });'
+      ],
+      [
+        "a punctuation boundary and whitespace/newline before invocation",
+        <<~JS
+          const renderer = (
+            reactOnRailsProNodeRenderer
+            (
+              { maxVMPoolSize: 4 }
+            )
+          );
+        JS
+      ],
+      [
+        "new text in strings, comments, and regular expressions",
+        "const label = 'new';\n" \
+        "// new\n" \
+        "const matcher = /new/;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a void context",
+        "void (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a direct call used as an outer constructor argument",
+        "class Factory {}\n" \
+        "new Factory(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a byte-zero call followed by a trailing constructor decoy",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "class Factory {}\nnew Factory();"
+      ],
+      [
+        "a byte-zero parenthesized call followed by a trailing constructor decoy",
+        "(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));\n" \
+        "class Factory {}\nnew Factory();"
+      ],
+      [
+        "a CommonJS package binding",
+        "const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an ESM package binding",
+        "import { reactOnRailsProNodeRenderer } from 'react-on-rails-pro-node-renderer';\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a multi-specifier CommonJS package binding",
+        "const { renderToPipeableStream, reactOnRailsProNodeRenderer, version: packageVersion } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a multi-specifier ESM package binding",
+        "import { renderToPipeableStream, reactOnRailsProNodeRenderer, version as packageVersion } from " \
+        "'react-on-rails-pro-node-renderer';\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a quoted global renderer-property decoy",
+        "const helpText = \"globalThis['reactOnRailsProNodeRenderer'] = shim\";\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a quoted Unicode-escaped global renderer-property decoy",
+        "const helpText = \"glob\\u0061lThis.reactOnRailsProNodeRenderer = shim\";\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a commented Unicode-escaped global renderer-property decoy",
+        "// glob\\u0061lThis.reactOnRailsProNodeRenderer = shim\n" \
+        "/* glob\\u0061l.reactOnRailsProNodeRenderer = shim */\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped comment decoy ending with carriage return",
+        "// glob\\u0061lThis.reactOnRailsProNodeRenderer = shim\r" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped comment decoy ending with a line separator",
+        "// glob\\u0061lThis.reactOnRailsProNodeRenderer = shim\u2028" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped comment decoy ending with a paragraph separator",
+        "// glob\\u0061lThis.reactOnRailsProNodeRenderer = shim\u2029" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ]
+    ].each do |description, source|
+      it "observes a direct inline literal with #{description}" do
+        write_node_renderer_script("renderer/node-renderer.js", source)
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :success,
+            content: a_string_including("evidence=observed", "configured=4", "required=4")
+          )
+        )
+      end
+
+      it "emits observed JSON evidence for a direct inline literal with #{description}" do
+        write_node_renderer_script("renderer/node-renderer.js", source)
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including("current_generation_declaration=unverified")
+        )
+        expect(check.fetch("details")).to include(
+          hash_including(
+            "level" => "success",
+            "content" => a_string_including("evidence=observed", "configured=4", "required=4")
+          ),
+          hash_including(
+            "level" => "warning",
+            "content" => a_string_including("current_generation_declaration=unverified")
+          )
+        )
+      end
+    end
+
+    it "ignores real line and block comments around a direct inline literal" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "// reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });\n" \
+        "reactOnRailsProNodeRenderer({\n" \
+        "/* maxVMPoolSize: 2 */\n" \
+        "maxVMPoolSize: 4 // maxVMPoolSize: 2\n" \
+        "});"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :success,
+          content: a_string_including("evidence=observed", "configured=4", "required=4")
+        )
+      )
+    end
+
+    it "proves Node rejects a constructor invocation of an arrow-function renderer" do
+      require_node_runtime!
+      source = <<~JS
+        const reactOnRailsProNodeRenderer = () => undefined;
+        new reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });
+      JS
+
+      _stdout, stderr, status = Open3.capture3("node", "--eval", source)
+
+      expect(status).not_to be_success
+      expect(stderr).to include("TypeError", "reactOnRailsProNodeRenderer is not a constructor")
+    end
+
+    [
+      [
+        "a constructor of a renderer call",
+        "new (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a comment-separated constructor of a renderer call",
+        "new /* constructor */ ( reactOnRailsProNodeRenderer ( { maxVMPoolSize: 4 } ) );"
+      ]
+    ].each do |description, invocation|
+      it "proves Node rejects #{description}" do
+        require_node_runtime!
+        source = <<~JS
+          const reactOnRailsProNodeRenderer = () => undefined;
+          #{invocation}
+        JS
+
+        _stdout, stderr, status = Open3.capture3("node", "--eval", source)
+
+        expect(status).not_to be_success
+        expect(stderr).to include("TypeError", "is not a constructor")
+      end
+    end
+
+    it "proves JavaScript config spread invokes a leading getter before reading capacity" do
+      require_node_runtime!
+      source = <<~JS
+        let getterCalls = 0;
+        const userConfig = {
+          get runtimeProbe() {
+            getterCalls += 1;
+            Reflect.set(this, "maxVM" + "PoolSize", 2);
+            return true;
+          },
+          maxVMPoolSize: 4
+        };
+        const resolvedConfig = { ...userConfig };
+        process.stdout.write(JSON.stringify({ getterCalls, maxVMPoolSize: resolvedConfig.maxVMPoolSize }));
+      JS
+
+      stdout, stderr, status = Open3.capture3("node", "--eval", source)
+
+      expect(status).to be_success, stderr
+      expect(JSON.parse(stdout)).to eq("getterCalls" => 1, "maxVMPoolSize" => 2)
+    end
+
+    it "keeps non-accessor method syntax eligible for direct inline observation" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({\n" \
+        "get() { return 1; },\n" \
+        "set(value) { return value; },\n" \
+        "async refresh() { return 2; },\n" \
+        "*values() { yield 2; },\n" \
+        "async *entries() { yield 2; },\n" \
+        "maxVMPoolSize: 4\n" \
+        "});"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :success,
+          content: a_string_including("evidence=observed", "configured=4", "required=4")
+        )
+      )
+    end
+
+    it "does not misclassify a fractional JavaScript value as an observed integer" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4.5 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including("evidence=unverified", "reason=dynamic_javascript_configuration")
+        )
+      )
+    end
+
+    it "does not infer the package default from a loopback endpoint and canonical script alone" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "topology=loopback_endpoint",
+            "reason=package_default_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "parses a quoted JavaScript object property instead of falling through to package defaults" do
+      write_node_renderer_script("renderer/node-renderer.js", 'reactOnRailsProNodeRenderer({ "maxVMPoolSize": 2 });')
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "insufficient",
+            "evidence=observed",
+            "configured=2",
+            "required=4"
+          )
+        )
+      )
+    end
+
+    it "fails closed for an assignment form the static scanner does not parse" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "const config = { workersCount: 2 };\nconfig.maxVMPoolSize = 2;\nreactOnRailsProNodeRenderer(config);"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_configuration_binding_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "does not treat an unrelated file-wide literal as renderer configuration" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "const unrelated = { maxVMPoolSize: 8 };\n" \
+        "reactOnRailsProNodeRenderer({ workersCount: 2 });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_configuration_binding_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("configured=8"))
+      )
+    end
+
+    it "emits JSON guidance for the renderer script selected by an active direct Procfile launcher" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write("Procfile.production", "node-renderer: node client/node-renderer.js\n")
+      json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+      allow(json_doctor).to receive(:exit)
+      output = []
+      allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+      json_doctor.run_diagnosis
+
+      check = JSON.parse(output.join("\n")).fetch("checks").first
+      expect(check).to include(
+        "id" => "node_renderer_rollout_capacity",
+        "status" => "warn"
+      )
+      guidance = check.fetch("details").find do |detail|
+        detail["level"] == "info" && detail["content"].include?("Set MAX_VM_POOL_SIZE")
+      end
+      expect(guidance.fetch("content")).to include("client/node-renderer.js")
+      expect(guidance.fetch("content")).not_to include("renderer/node-renderer.js")
+    end
+
+    it "fails closed for a top-level literal on a named object passed to the renderer" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "const config = { nested: { value: 1 }, maxVMPoolSize: 4 };\n" \
+        "reactOnRailsProNodeRenderer(config);"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_configuration_binding_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "fails closed for a locally rebound renderer identifier" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "var reactOnRailsProNodeRenderer = console.log;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(type: :warning, content: a_string_including("evidence=unverified"))
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    [
+      [
+        "a non-package destructuring binding",
+        "const { reactOnRailsProNodeRenderer } = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an array-destructured local declaration",
+        "const [reactOnRailsProNodeRenderer] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a nested array-destructured local declaration",
+        "const [[reactOnRailsProNodeRenderer]] = getNestedRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a defaulted array-destructured local declaration",
+        "const [reactOnRailsProNodeRenderer = getDefaultRenderer()] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a wrong-export CommonJS alias",
+        "const { otherRenderer: reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a wrong-export ESM alias",
+        "import { otherRenderer as reactOnRailsProNodeRenderer } from " \
+        "'react-on-rails-pro-node-renderer';\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding from the default export",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer').default;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding from an invoked export",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer')();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a globalThis renderer assignment",
+        "globalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a globalThis renderer prefix update",
+        "++globalThis.reactOnRailsProNodeRenderer;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a bracketed globalThis renderer assignment",
+        "globalThis['reactOnRailsProNodeRenderer'] = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Node global renderer compound assignment",
+        "global.reactOnRailsProNodeRenderer ||= getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped globalThis renderer assignment",
+        "glob\\u0061lThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a leading-Unicode-escaped globalThis renderer assignment",
+        "\\u0067lobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a braced-Unicode-escaped globalThis renderer assignment",
+        "\\u{67}lobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a fully Unicode-escaped globalThis renderer assignment",
+        "\\u0067\\u006c\\u006f\\u0062\\u0061\\u006cThis." \
+        "reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped Node global renderer assignment",
+        "glob\\u0061l.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an escaped-punctuation invalid identifier",
+        "shim\\u002eglobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an out-of-range Unicode escape",
+        "glob\\u{110000}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a surrogate Unicode escape",
+        "glob\\u{D800}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a non-hex Unicode escape",
+        "glob\\u{zz}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a short Unicode escape",
+        "glob\\u061lThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an empty Unicode escape",
+        "glob\\u{}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an unrelated global-object reference",
+        "globalThis.fetch = globalThis.fetch;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an aliased global-object mutation",
+        "const rendererGlobal = globalThis;\n" \
+        "rendererGlobal[getRendererKey()] = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an object-destructuring assignment target",
+        "({ reactOnRailsProNodeRenderer } = getRendererShim());\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an array-destructuring assignment target",
+        "[reactOnRailsProNodeRenderer] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a later renderer reassignment",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "reactOnRailsProNodeRenderer = console.log;"
+      ],
+      [
+        "a later renderer update",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\nreactOnRailsProNodeRenderer++;"
+      ],
+      [
+        "a post-declaration Object.assign override",
+        "const config = { maxVMPoolSize: 4 };\n" \
+        "Object.assign(config, getRuntimeConfig());\n" \
+        "reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a computed object property",
+        "const key = getRuntimeKey();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, [key]: 2 });"
+      ],
+      [
+        "a direct call passed through an earlier function declaration",
+        "function renew(value) { return value; }\n" \
+        "renew (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a direct call passed through an earlier object method",
+        "const wrapper = { new(value) { return value; } };\n" \
+        "wrapper.new(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "an unreachable braced direct-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "if (false) { reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }); }\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a short-circuited direct-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "false && reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "an unbraced conditional direct-call decoy",
+        "if (false) reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a ternary direct-call decoy",
+        "false ? reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }) : undefined;"
+      ],
+      [
+        "a direct call after a top-level throw",
+        "throw new Error('renderer disabled');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call in an unused array-destructuring default",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const [unused = reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 })] = [true];\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a direct call in an unused arrow-parameter default",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const chooseRenderer = (value = reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 })) => value;\n" \
+        "chooseRenderer(true);\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a direct call after an unmatched opening parenthesis",
+        "(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call after an unmatched opening bracket",
+        "[reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call inside an uninvoked arrow function",
+        "const startRenderer = () => reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call inside a return context",
+        "function startRenderer() {\n" \
+        "return (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));\n" \
+        "}\nstartRenderer();"
+      ],
+      [
+        "a direct call inside an await context",
+        "async function startRenderer() {\n" \
+        "await (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));\n" \
+        "}\nstartRenderer();"
+      ],
+      [
+        "a direct member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "shim.reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an optional-chain member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "shim?.reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a chained member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "getShim().reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a dollar-prefixed identifier decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "$reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a Unicode-prefixed identifier decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "éreactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an optional-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "reactOnRailsProNodeRenderer?.({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a constructor invocation",
+        "new reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor invocation separated by a real block comment",
+        "new/* constructor */reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor invocation separated by a newline",
+        "new\nreactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a parenthesized constructor target",
+        "new (reactOnRailsProNodeRenderer)({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor of a parenthesized renderer call",
+        "new (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a comment-separated constructor of a parenthesized renderer call",
+        "new /* constructor */ ( reactOnRailsProNodeRenderer ( { maxVMPoolSize: 4 } ) );"
+      ],
+      [
+        "a constructor of a renderer call inside nested parentheses",
+        "new (((reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }))));"
+      ],
+      [
+        "a comment-separated constructor of a renderer call inside multiline nested parentheses",
+        "new /* constructor */ (\n" \
+        "( /* nested */ reactOnRailsProNodeRenderer\n" \
+        "( { maxVMPoolSize: 4 } ) )\n" \
+        ");"
+      ],
+      [
+        "an optional constructor invocation",
+        "new reactOnRailsProNodeRenderer?.({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a function declaration name before a dynamic aliased renderer call",
+        "function reactOnRailsProNodeRenderer(config = { maxVMPoolSize: 8 }) {}\n" \
+        "const startRenderer = getRendererStarter();\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a class method name before a dynamic aliased renderer call",
+        "class Shim {\n" \
+        "reactOnRailsProNodeRenderer(config = { maxVMPoolSize: 8 }) {}\n" \
+        "}\nconst startRenderer = getRendererStarter();\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a double-quoted call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        'const helpText = "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })";' \
+        "\nconst runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a single-quoted call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = 'reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })';\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a call decoy inside escaped double quotes",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        'const helpText = "Use \"reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })\"";' \
+        "\nconst runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a call decoy inside escaped single quotes",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = 'Use \\'reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })\\'';\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a template-literal call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = `reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })`;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a nested template-literal call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = `${`reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })`}`;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an otherwise static renderer call in a template-bearing script",
+        "const helpText = `safe`;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a regular-expression call lookalike before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpPattern = /reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })/;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "line and block comment call lookalikes before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "// reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "/* reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 }); */\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a mutable alias",
+        "const config = { maxVMPoolSize: 4 };\n" \
+        "const alias = config;\n" \
+        "Object.assign(alias, getRuntimeConfig());\n" \
+        "reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a spread override source",
+        "reactOnRailsProNodeRenderer({ ...getRuntimeConfig(), maxVMPoolSize: 4 });"
+      ],
+      [
+        "a computed getter",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, get [key]() { return 2; } });"
+      ],
+      [
+        "an ordinary getter whose spread side effect changes capacity",
+        "reactOnRailsProNodeRenderer({ get runtimeProbe() { " \
+        "Reflect.set(this, 'maxVM' + 'PoolSize', 2); return true; }, maxVMPoolSize: 4 });"
+      ],
+      [
+        "an ordinary setter on an unrelated property",
+        "reactOnRailsProNodeRenderer({ set runtimeProbe(value) { consume(value); }, maxVMPoolSize: 4 });"
+      ],
+      [
+        "a getter with a quoted property name",
+        'reactOnRailsProNodeRenderer({ get "runtime probe"() { return true; }, maxVMPoolSize: 4 });'
+      ],
+      [
+        "a setter with a quoted property name",
+        "reactOnRailsProNodeRenderer({ set 'runtime probe'(value) { consume(value); }, maxVMPoolSize: 4 });"
+      ],
+      [
+        "a getter with an escaped quoted property name",
+        'reactOnRailsProNodeRenderer({ get "runtime\u0020probe"() { return true; }, maxVMPoolSize: 4 });'
+      ],
+      [
+        "a quoted getter with comment separators in a file containing template syntax",
+        'reactOnRailsProNodeRenderer({ get/* accessor */"runtime probe"/* params */() { return true; }, ' \
+        "note: `safe`, maxVMPoolSize: 4 });"
+      ],
+      [
+        "a computed setter",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, set [key](value) { consume(value); } });"
+      ],
+      [
+        "an async computed method",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, async [key]() { return 2; } });"
+      ],
+      [
+        "a computed generator method",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, *[key]() { yield 2; } });"
+      ],
+      [
+        "an async computed generator method",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, async *[key]() { yield 2; } });"
+      ],
+      [
+        "an escaped identifier property",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, \u006daxVMPoolSize: 2 });'
+      ],
+      [
+        "a braced escaped identifier property",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, \u{6d}axVMPoolSize: 2 });'
+      ],
+      [
+        "a hex-escaped string property",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, "\x6daxVMPoolSize": 2 });'
+      ],
+      [
+        "a Unicode-escaped string property",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, "\u006daxVMPoolSize": 2 });'
+      ],
+      [
+        "an escaped compositional alias",
+        'const config={maxVMPoolSize:4}; const alias=c\u006fnfig; ' \
+        "Object.assign(alias,getRuntimeConfig()); reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a braced escaped compositional alias",
+        'const config={maxVMPoolSize:4}; const alias=c\u{6f}nfig; ' \
+        "Object.assign(alias,getRuntimeConfig()); reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "block-comment delimiters in double-quoted strings",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: "/*", ' \
+        '[getRuntimeKey()]: 2, decoyClose: "*/" });'
+      ],
+      [
+        "block-comment delimiters in single-quoted strings",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: '/*', " \
+        "[getRuntimeKey()]: 2, decoyClose: '*/' });"
+      ],
+      [
+        "block-comment delimiters in template strings",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: `/*`, " \
+        "[getRuntimeKey()]: 2, decoyClose: `*/` });"
+      ],
+      [
+        "block-comment delimiters in nested template strings",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: `${`/*`}`, " \
+        "[getRuntimeKey()]: 2, decoyClose: `${`*/`}` });"
+      ],
+      [
+        "a block-comment delimiter after an escaped string quote",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: "\"/*", ' \
+        '[getRuntimeKey()]: 2, decoyClose: "*/" });'
+      ]
+    ].each do |description, source|
+      it "fails closed for #{description}" do
+        write_node_renderer_script("renderer/node-renderer.js", source)
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(type: :warning, content: a_string_including("evidence=unverified"))
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+    end
+
+    [
+      [
+        "a post-declaration Object.assign override",
+        "const config = { maxVMPoolSize: 4 };\n" \
+        "Object.assign(config, getRuntimeConfig());\n" \
+        "reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a computed object property",
+        "const key = getRuntimeKey();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, [key]: 2 });"
+      ],
+      [
+        "a direct call passed through an earlier function declaration",
+        "function renew(value) { return value; }\n" \
+        "renew (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a direct call passed through an earlier object method",
+        "const wrapper = { new(value) { return value; } };\n" \
+        "wrapper.new(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "an unreachable braced direct-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "if (false) { reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }); }\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a short-circuited direct-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "false && reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "an unbraced conditional direct-call decoy",
+        "if (false) reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a ternary direct-call decoy",
+        "false ? reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }) : undefined;"
+      ],
+      [
+        "a direct call after a top-level throw",
+        "throw new Error('renderer disabled');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call in an unused array-destructuring default",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const [unused = reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 })] = [true];\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a direct call in an unused arrow-parameter default",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const chooseRenderer = (value = reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 })) => value;\n" \
+        "chooseRenderer(true);\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a direct call after an unmatched opening parenthesis",
+        "(reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call after an unmatched opening bracket",
+        "[reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call inside an uninvoked arrow function",
+        "const startRenderer = () => reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct call inside a return context",
+        "function startRenderer() {\n" \
+        "return (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));\n" \
+        "}\nstartRenderer();"
+      ],
+      [
+        "a direct call inside an await context",
+        "async function startRenderer() {\n" \
+        "await (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));\n" \
+        "}\nstartRenderer();"
+      ],
+      [
+        "a computed getter",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, get [key]() { return 2; } });"
+      ],
+      [
+        "an ordinary getter whose spread side effect changes capacity",
+        "reactOnRailsProNodeRenderer({ get runtimeProbe() { " \
+        "Reflect.set(this, 'maxVM' + 'PoolSize', 2); return true; }, maxVMPoolSize: 4 });"
+      ],
+      [
+        "an ordinary setter on an unrelated property",
+        "reactOnRailsProNodeRenderer({ set runtimeProbe(value) { consume(value); }, maxVMPoolSize: 4 });"
+      ],
+      [
+        "a getter with a quoted property name",
+        'reactOnRailsProNodeRenderer({ get "runtime probe"() { return true; }, maxVMPoolSize: 4 });'
+      ],
+      [
+        "a quoted getter with comment separators in a file containing template syntax",
+        'reactOnRailsProNodeRenderer({ get/* accessor */"runtime probe"/* params */() { return true; }, ' \
+        "note: `safe`, maxVMPoolSize: 4 });"
+      ],
+      [
+        "an escaped identifier property",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, \u006daxVMPoolSize: 2 });'
+      ],
+      [
+        "a named object literal",
+        "const config = { maxVMPoolSize: 4 };\nreactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a locally rebound renderer identifier",
+        "var reactOnRailsProNodeRenderer = console.log;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an array-destructured local declaration",
+        "const [reactOnRailsProNodeRenderer] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a nested array-destructured local declaration",
+        "const [[reactOnRailsProNodeRenderer]] = getNestedRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a defaulted array-destructured local declaration",
+        "const [reactOnRailsProNodeRenderer = getDefaultRenderer()] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a wrong-export CommonJS alias",
+        "const { otherRenderer: reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer');\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a wrong-export ESM alias",
+        "import { otherRenderer as reactOnRailsProNodeRenderer } from " \
+        "'react-on-rails-pro-node-renderer';\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding from the default export",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer').default;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a CommonJS package binding from an invoked export",
+        "const { reactOnRailsProNodeRenderer } = " \
+        "require('react-on-rails-pro-node-renderer')();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a globalThis renderer assignment",
+        "globalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a globalThis renderer prefix update",
+        "++globalThis.reactOnRailsProNodeRenderer;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a bracketed globalThis renderer assignment",
+        "globalThis['reactOnRailsProNodeRenderer'] = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Node global renderer compound assignment",
+        "global.reactOnRailsProNodeRenderer ||= getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped globalThis renderer assignment",
+        "glob\\u0061lThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a leading-Unicode-escaped globalThis renderer assignment",
+        "\\u0067lobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a braced-Unicode-escaped globalThis renderer assignment",
+        "\\u{67}lobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a fully Unicode-escaped globalThis renderer assignment",
+        "\\u0067\\u006c\\u006f\\u0062\\u0061\\u006cThis." \
+        "reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a Unicode-escaped Node global renderer assignment",
+        "glob\\u0061l.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an escaped-punctuation invalid identifier",
+        "shim\\u002eglobalThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an out-of-range Unicode escape",
+        "glob\\u{110000}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a surrogate Unicode escape",
+        "glob\\u{D800}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a non-hex Unicode escape",
+        "glob\\u{zz}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a short Unicode escape",
+        "glob\\u061lThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an empty Unicode escape",
+        "glob\\u{}alThis.reactOnRailsProNodeRenderer = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an unrelated global-object reference",
+        "globalThis.fetch = globalThis.fetch;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an aliased global-object mutation",
+        "const rendererGlobal = globalThis;\n" \
+        "rendererGlobal[getRendererKey()] = getRendererShim();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an object-destructuring assignment target",
+        "({ reactOnRailsProNodeRenderer } = getRendererShim());\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "an array-destructuring assignment target",
+        "[reactOnRailsProNodeRenderer] = getRenderers();\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a direct member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "shim.reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an optional-chain member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "shim?.reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a chained member-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "getShim().reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a dollar-prefixed identifier decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "$reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a Unicode-prefixed identifier decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "éreactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an optional-call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "reactOnRailsProNodeRenderer?.({ maxVMPoolSize: 8 });\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a constructor invocation",
+        "new reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor invocation separated by a real block comment",
+        "new/* constructor */reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor invocation separated by a newline",
+        "new\nreactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a parenthesized constructor target",
+        "new (reactOnRailsProNodeRenderer)({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a constructor of a parenthesized renderer call",
+        "new (reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }));"
+      ],
+      [
+        "a comment-separated constructor of a parenthesized renderer call",
+        "new /* constructor */ ( reactOnRailsProNodeRenderer ( { maxVMPoolSize: 4 } ) );"
+      ],
+      [
+        "a constructor of a renderer call inside nested parentheses",
+        "new (((reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 }))));"
+      ],
+      [
+        "a comment-separated constructor of a renderer call inside multiline nested parentheses",
+        "new /* constructor */ (\n" \
+        "( /* nested */ reactOnRailsProNodeRenderer\n" \
+        "( { maxVMPoolSize: 4 } ) )\n" \
+        ");"
+      ],
+      [
+        "an optional constructor invocation",
+        "new reactOnRailsProNodeRenderer?.({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a function declaration name before a dynamic aliased renderer call",
+        "function reactOnRailsProNodeRenderer(config = { maxVMPoolSize: 8 }) {}\n" \
+        "const startRenderer = getRendererStarter();\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a class method name before a dynamic aliased renderer call",
+        "class Shim {\n" \
+        "reactOnRailsProNodeRenderer(config = { maxVMPoolSize: 8 }) {}\n" \
+        "}\nconst startRenderer = getRendererStarter();\n" \
+        "startRenderer(JSON.parse(process.env.RENDERER_CONFIG));"
+      ],
+      [
+        "a double-quoted call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        'const helpText = "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })";' \
+        "\nconst runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a single-quoted call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = 'reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })';\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a call decoy inside escaped double quotes",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        'const helpText = "Use \"reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })\"";' \
+        "\nconst runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a call decoy inside escaped single quotes",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = 'Use \\'reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })\\'';\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a template-literal call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = `reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })`;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "a nested template-literal call decoy before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpText = `${`reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })`}`;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an otherwise static renderer call in a template-bearing script",
+        "const helpText = `safe`;\n" \
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });"
+      ],
+      [
+        "a regular-expression call lookalike before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "const helpPattern = /reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 })/;\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "line and block comment call lookalikes before a dynamic aliased renderer call",
+        "const startRenderer = reactOnRailsProNodeRenderer;\n" \
+        "// reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });\n" \
+        "/* reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 }); */\n" \
+        "const runtimeConfig = JSON.parse(process.env.RENDERER_CONFIG);\n" \
+        "startRenderer(runtimeConfig);"
+      ],
+      [
+        "an escaped compositional alias",
+        'const config={maxVMPoolSize:4}; const alias=c\u006fnfig; ' \
+        "Object.assign(alias,getRuntimeConfig()); reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "a braced escaped compositional alias",
+        'const config={maxVMPoolSize:4}; const alias=c\u{6f}nfig; ' \
+        "Object.assign(alias,getRuntimeConfig()); reactOnRailsProNodeRenderer(config);"
+      ],
+      [
+        "block-comment delimiters in double-quoted strings",
+        'reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: "/*", ' \
+        '[getRuntimeKey()]: 2, decoyClose: "*/" });'
+      ],
+      [
+        "block-comment delimiters in nested template strings",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4, decoyOpen: `${`/*`}`, " \
+        "[getRuntimeKey()]: 2, decoyClose: `${`*/`}` });"
+      ]
+    ].each do |description, source|
+      it "emits unverified JSON evidence for #{description}" do
+        write_node_renderer_script("renderer/node-renderer.js", source)
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including("evidence=unverified")
+        )
+        expect(check.fetch("details")).not_to include(
+          hash_including("level" => "success", "content" => a_string_including("capacity is sufficient"))
+        )
+      end
+    end
+
+    it "selects the renderer script named by an active direct Procfile launcher" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write("Procfile.production", "node-renderer: node client/node-renderer.js\n")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including("evidence=observed", "configured=2", "required=4")
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("configured=8"))
+      )
+      guidance = checker.messages.find do |message|
+        message[:type] == :info && message[:content].include?("Set MAX_VM_POOL_SIZE")
+      end
+      expect(guidance.fetch(:content)).to include("client/node-renderer.js")
+      expect(guidance.fetch(:content)).not_to include("renderer/node-renderer.js")
+    end
+
+    it "fails closed when an unproven active launcher references another canonical renderer script" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write(
+        "Procfile.production",
+        "renderer: node renderer/node-renderer.js\nclient: env FOO=1 node client/node-renderer.js\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_script_selection_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    [
+      ["an echoed command", "node-renderer: echo node renderer/node-renderer.js"],
+      ["an unreachable shell command", "node-renderer: false && node renderer/node-renderer.js"],
+      ["a double-quoted mention", 'node-renderer: "node renderer/node-renderer.js"'],
+      ["a single-quoted mention", "node-renderer: 'node renderer/node-renderer.js'"],
+      ["an unlabeled command", "MAX_VM_POOL_SIZE=8 node renderer/node-renderer.js"],
+      ["a command with trailing arguments", "node-renderer: node renderer/node-renderer.js --inspect"],
+      ["an absolute script path", "node-renderer: node /renderer/node-renderer.js"],
+      [
+        "renderer-first multiple references",
+        "node-renderer: echo node renderer/node-renderer.js && exec node client/node-renderer.js"
+      ],
+      [
+        "client-first multiple references",
+        "node-renderer: echo node client/node-renderer.js && exec node renderer/node-renderer.js"
+      ]
+    ].each do |description, launcher_line|
+      it "does not prove renderer selection from #{description}" do
+        FileUtils.mkdir_p("client")
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+        write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+        File.write("Procfile.production", "#{launcher_line}\n")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "evidence=unverified",
+              "reason=renderer_script_selection_not_proven"
+            )
+          )
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+
+      it "emits unverified JSON for #{description}" do
+        FileUtils.mkdir_p("client")
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+        write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+        File.write("Procfile.production", "#{launcher_line}\n")
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including(
+            "evidence=unverified",
+            "reason=renderer_script_selection_not_proven"
+          )
+        )
+        expect(check.fetch("details")).not_to include(
+          hash_including("level" => "success", "content" => a_string_including("capacity is sufficient"))
+        )
+      end
+    end
+
+    %w[.bak #suffix -other /other].each do |suffix|
+      it "does not select a canonical renderer script from a #{suffix} token suffix" do
+        FileUtils.mkdir_p("client")
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+        write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+        File.write("Procfile.production", "node-renderer: node renderer/node-renderer.js#{suffix}\n")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "evidence=unverified",
+              "reason=renderer_script_selection_not_proven"
+            )
+          )
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+
+      it "emits unverified JSON for a canonical renderer path with a #{suffix} token suffix" do
+        FileUtils.mkdir_p("client")
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+        write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+        File.write("Procfile.production", "node-renderer: node renderer/node-renderer.js#{suffix}\n")
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including(
+            "evidence=unverified",
+            "reason=renderer_script_selection_not_proven"
+          )
+        )
+        expect(check.fetch("details")).not_to include(
+          hash_including("level" => "success", "content" => a_string_including("capacity is sufficient"))
+        )
+      end
+    end
+
+    it "emits unverified JSON when one launcher line references both canonical renderer scripts" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write(
+        "Procfile.production",
+        "node-renderer: echo node renderer/node-renderer.js && exec node client/node-renderer.js\n"
+      )
+      json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+      allow(json_doctor).to receive(:exit)
+      output = []
+      allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+      json_doctor.run_diagnosis
+
+      check = JSON.parse(output.join("\n")).fetch("checks").first
+      expect(check).to include(
+        "id" => "node_renderer_rollout_capacity",
+        "status" => "warn",
+        "message" => a_string_including(
+          "evidence=unverified",
+          "reason=renderer_script_selection_not_proven"
+        )
+      )
+      expect(check.fetch("details")).not_to include(
+        hash_including("level" => "success", "content" => a_string_including("capacity is sufficient"))
+      )
+    end
+
+    it "fails closed when separate valid process lines select different canonical scripts" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write(
+        "Procfile.production",
+        "renderer-a: node renderer/node-renderer.js\nrenderer-b: node client/node-renderer.js\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_script_selection_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "fails closed when both renderer scripts exist and no active launcher proves selection" do
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write("Procfile.production", "# node-renderer: node client/node-renderer.js\n")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_script_selection_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "does not treat a Rails-process ENV value as observed renderer state for a loopback sidecar" do
+      ENV["MAX_VM_POOL_SIZE"] = "8"
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "topology=loopback_endpoint",
+            "does not prove",
+            "process environment",
+            "deploy lifecycle"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "topology=loopback_endpoint",
+            "reason=renderer_process_environment_not_proven"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("configured=8"))
+      )
+    end
+
+    it "uses a static inline launcher assignment ahead of the Doctor process ENV" do
+      ENV["MAX_VM_POOL_SIZE"] = "4"
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "node-renderer: MAX_VM_POOL_SIZE=2 node renderer/node-renderer.js"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "insufficient",
+            "evidence=observed",
+            "configured=2",
+            "required=4",
+            "source=selected_launcher_static_assignment"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("configured=4"))
+      )
+    end
+
+    it "fails closed for launcher capacity and a declared current generation when renderer syntax is invalid" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ currentGenerationManifestPath: " \
+        "'/app/.node-renderer-bundles/.current-generations/rorp-generation-v1-#{'a' * 64}.json' });\n" \
+        "const broken ="
+      )
+      File.write(
+        "Procfile.production",
+        "node-renderer: MAX_VM_POOL_SIZE=4 node renderer/node-renderer.js\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=renderer_javascript_syntax_invalid"
+          )
+        )
+      )
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "Fix JavaScript syntax in renderer/node-renderer.js",
+            "rerun Doctor"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("Declared-current"))
+      )
+    end
+
+    it "does not treat declaration-looking text in a template literal as observed" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ banner: `, currentGenerationManifestPath: " \
+        "'/app/.node-renderer-bundles/.current-generations/rorp-generation-v1-#{'a' * 64}.json',` });"
+      )
+      File.write(
+        "Procfile.production",
+        "node-renderer: MAX_VM_POOL_SIZE=4 node renderer/node-renderer.js\n"
+      )
+
+      active_content = doctor.send(
+        :node_renderer_active_config_content,
+        File.read("renderer/node-renderer.js")
+      )
+      evidence = doctor.send(
+        :node_renderer_launcher_vm_pool_assignment_evidence,
+        "renderer/node-renderer.js"
+      )
+      evidence[:current_generation_declaration] = doctor.send(
+        :node_renderer_current_generation_declaration_evidence,
+        active_content
+      )
+      doctor.send(:report_node_renderer_capacity_evidence, evidence, 4, :loopback_endpoint)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "capacity is sufficient but declared-current prewarm is unverified",
+            "evidence=observed",
+            "source=selected_launcher_static_assignment",
+            "current_generation_declaration=unverified"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :success, content: a_string_including("Declared-current"))
+      )
+    end
+
+    it "fails closed when separate valid process lines assign conflicting capacities" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "renderer-a: MAX_VM_POOL_SIZE=8 node renderer/node-renderer.js\n" \
+        "renderer-b: MAX_VM_POOL_SIZE=2 node renderer/node-renderer.js\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=dynamic_or_ambiguous_launcher_vm_pool_assignment"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "observes matching assignments across separate valid process lines" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "renderer-a: MAX_VM_POOL_SIZE=2 node renderer/node-renderer.js\n" \
+        "renderer-b: MAX_VM_POOL_SIZE=2 node renderer/node-renderer.js\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "insufficient",
+            "evidence=observed",
+            "configured=2",
+            "source=selected_launcher_static_assignment"
+          )
+        )
+      )
+    end
+
+    it "accepts a directly scoped literal launcher assignment with a Procfile label and varied whitespace" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "node-renderer:\tMAX_VM_POOL_SIZE=2\t\tnode\t\t./renderer/node-renderer.js # direct launcher\n"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "insufficient",
+            "evidence=observed",
+            "configured=2",
+            "source=selected_launcher_static_assignment"
+          )
+        )
+      )
+    end
+
+    [
+      "node-renderer: echo MAX_VM_POOL_SIZE=8 && node renderer/node-renderer.js",
+      "node-renderer: MAX_VM_POOL_SIZE=8 node prep.js && node renderer/node-renderer.js"
+    ].each do |launcher_line|
+      it "does not attribute an earlier shell assignment to the selected renderer invocation" do
+        ENV["MAX_VM_POOL_SIZE"] = "2"
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+        File.write("Procfile.production", "#{launcher_line}\n")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "evidence=unverified",
+              "reason=dynamic_or_ambiguous_launcher_vm_pool_assignment"
+            )
+          )
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+
+      it "emits unverified JSON for an earlier shell assignment outside the selected renderer invocation" do
+        ENV["MAX_VM_POOL_SIZE"] = "2"
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+        File.write("Procfile.production", "#{launcher_line}\n")
+        json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+        allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+        allow(json_doctor).to receive(:exit)
+        output = []
+        allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+        json_doctor.run_diagnosis
+
+        check = JSON.parse(output.join("\n")).fetch("checks").first
+        expect(check).to include(
+          "id" => "node_renderer_rollout_capacity",
+          "status" => "warn",
+          "message" => a_string_including(
+            "evidence=unverified",
+            "reason=dynamic_or_ambiguous_launcher_vm_pool_assignment"
+          )
+        )
+        expect(check.fetch("details")).not_to include(
+          hash_including("level" => "success", "content" => a_string_including("capacity is sufficient"))
+        )
+      end
+    end
+
+    it "fails closed when one launcher line invokes the selected script more than once" do
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "node-renderer: MAX_VM_POOL_SIZE=8 node renderer/node-renderer.js && " \
+        "MAX_VM_POOL_SIZE=2 exec node renderer/node-renderer.js"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=dynamic_or_ambiguous_launcher_vm_pool_assignment"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "fails closed when the selected launcher computes MAX_VM_POOL_SIZE dynamically" do
+      ENV["MAX_VM_POOL_SIZE"] = "4"
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ workersCount: 2 });")
+      File.write(
+        "Procfile.production",
+        "node-renderer: MAX_VM_POOL_SIZE=${MAX_VM_POOL_SIZE:-4} node renderer/node-renderer.js"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=dynamic_or_ambiguous_launcher_vm_pool_assignment"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "warns instead of passing when JavaScript computes the capacity dynamically" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: Number(process.env.MAX_VM_POOL_SIZE) });"
+      )
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :warning,
+          content: a_string_including(
+            "evidence=unverified",
+            "reason=dynamic_javascript_configuration",
+            "does not query the live renderer process"
+          )
+        )
+      )
+    end
+
+    context "with a separate renderer workload" do
+      let(:renderer_url) { "https://renderer.internal.example:3800" }
+
+      it "warns even when the local canonical script has a sufficient literal" do
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :warning,
+            content: a_string_including(
+              "evidence=unverified",
+              "topology=separate",
+              "reason=separate_renderer_workload"
+            )
+          )
+        )
+        expect(checker.messages.map { |message| message[:content] }.join("\n")).not_to include(renderer_url)
+      end
+    end
+
+    context "with a bracketed IPv6 loopback endpoint" do
+      let(:renderer_url) { "http://[::1]:3800" }
+
+      it "normalizes the URI host before classifying topology" do
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :success,
+            content: a_string_including(
+              "evidence=observed",
+              "configured=4",
+              "topology=loopback_endpoint"
+            )
+          )
+        )
+      end
+    end
+
+    context "with RSC disabled" do
+      let(:enable_rsc_support) { false }
+
+      it "requires one server context for each overlapping generation" do
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :info,
+            content: a_string_including("contexts_per_generation=1", "required_capacity=2")
+          ),
+          hash_including(
+            type: :success,
+            content: a_string_including("configured=2", "required=2")
+          )
+        )
+      end
+    end
+
+    it "ignores partial-boot runtime RSC state when the Rails environment did not load" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      FileUtils.mkdir_p("config/initializers")
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        "config.server_renderer = \"NodeRenderer\"\n# config.enable_rsc_support = false\n"
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 4 });")
+      allow(pro_config).to receive(:enable_rsc_support).and_return(false)
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :info, content: a_string_including("contexts_per_generation=1"))
+      )
+    end
+
+    it "keeps oversized initializer RSC evidence conservative after a failed Rails boot" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      FileUtils.mkdir_p("config/initializers")
+      prefix =
+        "config.enable_rsc_support = false\n" \
+        "config.server_renderer = \"NodeRenderer\"\n" \
+        "#"
+      padding = "x" * (described_class::NODE_RENDERER_CONFIG_MAX_BYTES - prefix.bytesize)
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        "#{prefix}#{padding}\nconfig.enable_rsc_support = true\n"
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including("insufficient", "configured=2", "required=4")
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "emits conservative JSON evidence for an oversized initializer after a failed Rails boot" do
+      FileUtils.mkdir_p("config/initializers")
+      prefix =
+        "config.enable_rsc_support = false\n" \
+        "config.server_renderer = \"NodeRenderer\"\n" \
+        "#"
+      padding = "x" * (described_class::NODE_RENDERER_CONFIG_MAX_BYTES - prefix.bytesize)
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        "#{prefix}#{padding}\nconfig.enable_rsc_support = true\n"
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      allow(json_doctor).to receive(:exit)
+      output = []
+      allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+      json_doctor.run_diagnosis
+
+      check = JSON.parse(output.join("\n")).fetch("checks").first
+      expect(check).to include(
+        "id" => "node_renderer_rollout_capacity",
+        "status" => "warn"
+      )
+      expect(check.fetch("details")).to include(
+        hash_including(
+          "level" => "info",
+          "content" => a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          "level" => "warning",
+          "content" => a_string_including("insufficient", "configured=2", "required=4")
+        )
+      )
+    end
+
+    [
+      [
+        "an uncalled instance method",
+        <<~RUBY
+          def configure_rsc(config)
+            config.enable_rsc_support = false
+          end
+        RUBY
+      ],
+      [
+        "an uncalled singleton method",
+        <<~RUBY
+          def self.configure_rsc(config)
+            config.enable_rsc_support = false
+          end
+        RUBY
+      ],
+      [
+        "a block",
+        <<~RUBY
+          configs.each do |config|
+            config.enable_rsc_support = false
+          end
+        RUBY
+      ],
+      [
+        "a lambda",
+        <<~RUBY
+          configure_rsc = ->(config) { config.enable_rsc_support = false }
+        RUBY
+      ],
+      [
+        "a ternary branch",
+        <<~RUBY
+          enabled ? (config.enable_rsc_support = false) : nil
+        RUBY
+      ],
+      [
+        "a short-circuit expression",
+        <<~RUBY
+          enabled && (config.enable_rsc_support = false)
+        RUBY
+      ],
+      [
+        "a defined? query",
+        <<~RUBY
+          defined?(config.enable_rsc_support = false)
+        RUBY
+      ],
+      [
+        "a safe-navigation assignment",
+        <<~RUBY
+          config = nil
+          config&.enable_rsc_support = false
+        RUBY
+      ],
+      [
+        "an unbound top-level receiver",
+        <<~RUBY
+          config = Object.new
+          config.enable_rsc_support = false
+        RUBY
+      ],
+      [
+        "a class body",
+        <<~RUBY
+          class Setup
+            config.enable_rsc_support = false
+          end
+        RUBY
+      ],
+      [
+        "a module body",
+        <<~RUBY
+          module Setup
+            config.enable_rsc_support = false
+          end
+        RUBY
+      ]
+    ].each do |description, dynamic_source|
+      it "keeps RSC evidence in #{description} conservative after a failed Rails boot" do
+        allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+        FileUtils.mkdir_p("config/initializers")
+        File.write(
+          "config/initializers/react_on_rails_pro.rb",
+          "config.server_renderer = \"NodeRenderer\"\n#{dynamic_source}"
+        )
+        write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+
+        doctor.send(:check_node_renderer_rollout_capacity)
+
+        expect(checker.messages).to include(
+          hash_including(
+            type: :info,
+            content: a_string_including(
+              "contexts_per_generation=2",
+              "required_capacity=4",
+              "RSC evidence=unverified_conservative_enabled"
+            )
+          ),
+          hash_including(
+            type: :warning,
+            content: a_string_including("insufficient", "configured=2", "required=4")
+          )
+        )
+        expect(checker.messages).not_to include(hash_including(type: :success))
+      end
+    end
+
+    it "emits conservative JSON evidence for an assignment inside defined? after a failed Rails boot" do
+      FileUtils.mkdir_p("config/initializers")
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        <<~RUBY
+          config.server_renderer = "NodeRenderer"
+          defined?(config.enable_rsc_support = false)
+        RUBY
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      allow(json_doctor).to receive(:exit)
+      output = []
+      allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+      json_doctor.run_diagnosis
+
+      check = JSON.parse(output.join("\n")).fetch("checks").first
+      expect(check).to include(
+        "id" => "node_renderer_rollout_capacity",
+        "status" => "warn"
+      )
+      expect(check.fetch("details")).to include(
+        hash_including(
+          "level" => "info",
+          "content" => a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          "level" => "warning",
+          "content" => a_string_including("insufficient", "configured=2", "required=4")
+        )
+      )
+    end
+
+    it "keeps a leading top-level initializer RSC assignment conservative after a failed Rails boot" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      FileUtils.mkdir_p("config/initializers")
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        <<~RUBY
+          config.enable_rsc_support = false
+          config.server_renderer = "NodeRenderer"
+        RUBY
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      allow(pro_config).to receive(:enable_rsc_support).and_return(true)
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including("insufficient", "configured=2", "required=4")
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "keeps conflicting top-level initializer RSC evidence conservative after a failed Rails boot" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      FileUtils.mkdir_p("config/initializers")
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        <<~RUBY
+          config.enable_rsc_support = false
+          config.server_renderer = "NodeRenderer"
+          config.enable_rsc_support = true
+        RUBY
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :info, content: a_string_including("RSC evidence=inferred_enabled"))
+      )
+    end
+
+    it "keeps conditional conflicting initializer RSC evidence conservative after a failed Rails boot" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(false)
+      FileUtils.mkdir_p("config/initializers")
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        <<~RUBY
+          config.server_renderer = "NodeRenderer"
+          if Rails.env.test?
+            config.enable_rsc_support = false
+          else
+            config.enable_rsc_support = true
+          end
+        RUBY
+      )
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      allow(pro_config).to receive(:enable_rsc_support).and_return(false)
+
+      doctor.send(:check_node_renderer_rollout_capacity)
+
+      expect(checker.messages).to include(
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including("insufficient", "configured=2", "required=4")
+        )
+      )
+      expect(checker.messages).not_to include(hash_including(type: :success))
+    end
+
+    it "resolves rollout inputs from Rails.root when invoked from an application subdirectory" do
+      app_root = Pathname.new(Dir.pwd)
+      allow(Rails).to receive(:root).and_return(app_root)
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_call_original
+      FileUtils.mkdir_p("config/initializers")
+      File.write("config/environment.rb", 'raise "boot blocked for fallback coverage"')
+      File.write(
+        "config/initializers/react_on_rails_pro.rb",
+        <<~RUBY
+          config.server_renderer = "NodeRenderer"
+          config.enable_rsc_support = true
+        RUBY
+      )
+      FileUtils.mkdir_p("client")
+      write_node_renderer_script("renderer/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 8 });")
+      write_node_renderer_script("client/node-renderer.js", "reactOnRailsProNodeRenderer({ maxVMPoolSize: 2 });")
+      File.write("Procfile.production", "node-renderer: node client/node-renderer.js\n")
+      FileUtils.mkdir_p("tmp/doctor")
+
+      Dir.chdir("tmp/doctor") { doctor.send(:check_node_renderer_rollout_capacity) }
+
+      expect(checker.messages).to include(
+        hash_including(type: :warning, content: a_string_including("boot blocked for fallback coverage")),
+        hash_including(
+          type: :info,
+          content: a_string_including(
+            "contexts_per_generation=2",
+            "required_capacity=4",
+            "RSC evidence=unverified_conservative_enabled"
+          )
+        ),
+        hash_including(
+          type: :warning,
+          content: a_string_including("evidence=observed", "configured=2", "required=4")
+        )
+      )
+      expect(checker.messages).not_to include(
+        hash_including(type: :info, content: a_string_including("not applicable"))
+      )
+    end
+
+    it "emits the unverified evidence state in the stable JSON check" do
+      write_node_renderer_script(
+        "renderer/node-renderer.js",
+        "reactOnRailsProNodeRenderer({ maxVMPoolSize: Number(process.env.MAX_VM_POOL_SIZE) });"
+      )
+      json_doctor = described_class.new(format: :json, only: "node_renderer_rollout_capacity")
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+      allow(json_doctor).to receive(:exit)
+      output = []
+      allow(json_doctor).to receive(:puts) { |argument| output << argument.to_s }
+
+      json_doctor.run_diagnosis
+
+      check = JSON.parse(output.join("\n")).fetch("checks").first
+      expect(check).to include(
+        "id" => "node_renderer_rollout_capacity",
+        "status" => "warn",
+        "message" => a_string_including("evidence=unverified")
+      )
+      expect(check.fetch("details")).to include(
+        hash_including("level" => "warning", "content" => a_string_including("does not query the live renderer"))
+      )
+    end
+  end
+
+  describe "ensure_rails_environment_loaded" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when config/environment.rb exists and loads successfully" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/environment.rb", "# noop")
+            example.run
+          end
+        end
+      end
+
+      it "returns true" do
+        expect(doctor.send(:ensure_rails_environment_loaded)).to be true
+      end
+
+      it "only loads once" do
+        doctor.send(:ensure_rails_environment_loaded)
+        # Second call should return true without re-requiring
+        expect(doctor.send(:ensure_rails_environment_loaded)).to be true
+      end
+    end
+
+    context "when config/environment.rb does not exist" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "returns false" do
+        expect(doctor.send(:ensure_rails_environment_loaded)).to be false
+      end
+    end
+
+    context "when loading raises an error" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/environment.rb", "raise 'boot failed'")
+            example.run
+          end
+        end
+      end
+
+      it "returns false and adds a warning" do
+        expect(doctor.send(:ensure_rails_environment_loaded)).to be false
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("Could not load Rails environment") }).to be true
+      end
+    end
+  end
+
+  describe "react_on_rails_runtime_configuration" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    it "memoizes nil when rails environment cannot be loaded" do
+      expect(doctor).to receive(:ensure_rails_environment_loaded).once.and_return(false)
+
+      expect(doctor.send(:react_on_rails_runtime_configuration)).to be_nil
+      expect(doctor.send(:react_on_rails_runtime_configuration)).to be_nil
+    end
+
+    it "rescues and memoizes nil when ReactOnRails.configuration raises" do
+      allow(doctor).to receive(:ensure_rails_environment_loaded).and_return(true)
+      allow(ReactOnRails).to receive(:configuration).and_raise(StandardError, "bad config")
+
+      expect(doctor.send(:react_on_rails_runtime_configuration)).to be_nil
+      expect(doctor.send(:react_on_rails_runtime_configuration)).to be_nil
+
+      warning_messages = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+      warning_count =
+        warning_messages.count { |msg| msg.include?("Could not query React on Rails runtime configuration") }
+      expect(warning_count).to eq(1)
+    end
+  end
+
+  describe "resolved_pro_server_renderer" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    it "memoizes nil when Pro is not active" do
+      expect(ReactOnRails::Utils).to receive(:react_on_rails_pro?).once.and_return(false)
+
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+    end
+
+    it "warns once when Pro is active but runtime and initializer renderer sources are unavailable" do
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      allow(doctor).to receive_messages(
+        ensure_rails_environment_loaded: true,
+        pro_initializer_has_node_renderer?: false
+      )
+      hide_const("ReactOnRailsPro") if defined?(ReactOnRailsPro)
+
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+
+      warning_messages = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+      expect(warning_messages.count { |msg| msg.include?("Could not determine Pro server renderer") }).to eq(1)
+    end
+
+    it "adds an info message when Rails env is unavailable and initializer fallback is absent" do
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      allow(doctor).to receive_messages(
+        ensure_rails_environment_loaded: false,
+        pro_initializer_has_node_renderer?: false
+      )
+
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+
+      info_messages = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+      expect(info_messages.any? { |msg| msg.include?("Rails environment unavailable and no initializer match found") })
+        .to be true
+    end
+
+    it "rescues LoadError when Pro runtime renderer cannot be queried" do
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_raise(LoadError, "missing pro gem")
+
+      expect(doctor.send(:resolved_pro_server_renderer)).to be_nil
+
+      warning_messages = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+      expect(warning_messages.any? { |msg| msg.include?("Could not read Pro runtime renderer configuration") })
+        .to be true
+    end
+  end
+
+  describe "check_pro_initializer_existence" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when Pro initializer exists" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config/initializers")
+            File.write("config/initializers/react_on_rails_pro.rb", "ReactOnRailsPro.configure {}")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_pro_initializer_existence)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("Pro initializer exists") }).to be true
+      end
+    end
+
+    context "when Pro initializer is missing" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_pro_initializer_existence)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("Pro initializer not found") }).to be true
+      end
+    end
+  end
+
+  describe "check_rolling_deploy_adapter" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:config) { double("ProConfig", rolling_deploy_adapter: adapter) } # rubocop:disable RSpec/VerifiedDoubles
+
+    before do
+      # Capture let values into locals so closures inside define_singleton_method
+      # can see them — define_singleton_method evaluates blocks in the module's
+      # own scope where `config` is not a known identifier.
+      config_value = config
+      pro_module = Module.new
+      pro_module.define_singleton_method(:configuration) { config_value }
+      utils_module = Module.new
+      utils_module.define_singleton_method(:resolve_renderer_cache_dir) { "/tmp/nonexistent-cache-dir" }
+      pro_module.const_set(:Utils, utils_module)
+      stub_const("ReactOnRailsPro", pro_module)
+      ENV.delete("PREVIOUS_BUNDLE_HASHES")
+    end
+
+    after { ENV.delete("PREVIOUS_BUNDLE_HASHES") }
+
+    context "when rolling_deploy_adapter is nil and env override is unset" do
+      let(:adapter) { nil }
+
+      it "adds an info line" do
+        doctor.send(:check_rolling_deploy_adapter)
+        info = checker.messages.select { |m| m[:type] == :info }
+        expect(info.any? { |m| m[:content].include?("No rolling_deploy_adapter configured") }).to be(true)
+      end
+    end
+
+    context "when env override is set but adapter is nil" do
+      let(:adapter) { nil }
+
+      before { ENV["PREVIOUS_BUNDLE_HASHES"] = "abc,def" }
+
+      it "warns that both are required" do
+        doctor.send(:check_rolling_deploy_adapter)
+        warnings = checker.messages.select { |m| m[:type] == :warning }
+        expect(warnings.any? do |m|
+                 m[:content].include?("PREVIOUS_BUNDLE_HASHES") && m[:content].include?("abc,def")
+               end).to be(true)
+      end
+    end
+
+    # Regression: an accidentally-large PREVIOUS_BUNDLE_HASHES value (e.g. a
+    # full bundle dumped into the env by mistake) should not flood operator
+    # output. Echo a capped prefix and the total length instead.
+    context "when env override is large enough to flood operator output" do
+      let(:adapter) { nil }
+      let(:long_value) { "a" * 500 }
+
+      before { ENV["PREVIOUS_BUNDLE_HASHES"] = long_value }
+
+      it "truncates the echoed env value and reports the total length" do
+        doctor.send(:check_rolling_deploy_adapter)
+        warning = checker.messages.find { |m| m[:type] == :warning && m[:content].include?("PREVIOUS_BUNDLE_HASHES") }
+        expect(warning).not_to be_nil
+        expect(warning[:content]).to include("… (500 chars total)")
+        expect(warning[:content]).not_to include("a" * 200)
+      end
+    end
+
+    context "when adapter implements all required methods and returns hashes" do
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes = %w[abc def]
+          def self.fetch(_hash); end
+          def self.upload(_hash, **_opts); end
+        end
+      end
+
+      it "reports protocol success and probe success" do
+        doctor.send(:check_rolling_deploy_adapter)
+        successes = checker.messages.select { |m| m[:type] == :success }
+        expect(successes.any? { |m| m[:content].include?("responds to all required methods") }).to be(true)
+        expect(successes.any? { |m| m[:content].include?("2 hash(es)") }).to be(true)
+      end
+    end
+
+    context "when adapter is configured and PREVIOUS_BUNDLE_HASHES is also set" do
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes
+            raise "should not be probed when env var overrides discovery"
+          end
+
+          def self.fetch(_hash); end
+          def self.upload(_hash, **_opts); end
+        end
+      end
+
+      before { ENV["PREVIOUS_BUNDLE_HASHES"] = "abc,def" }
+
+      it "skips the previous_bundle_hashes probe and reports the env-var override" do
+        doctor.send(:check_rolling_deploy_adapter)
+        info = checker.messages.select { |m| m[:type] == :info }
+        warnings = checker.messages.select { |m| m[:type] == :warning }
+        expect(info.any? do |m|
+                 m[:content].include?("PREVIOUS_BUNDLE_HASHES") && m[:content].include?("skipping")
+               end).to be(true)
+        expect(warnings.none? { |m| m[:content].include?("should not be probed") }).to be(true)
+      end
+    end
+
+    context "when renderer cache contains rolling-deploy temporary directories" do
+      let(:cache_dir) { Dir.mktmpdir }
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes = %w[abc]
+          def self.fetch(_hash); end
+          def self.upload(_hash, **_opts); end
+        end
+      end
+
+      before do
+        FileUtils.mkdir_p(File.join(cache_dir, "abc"))
+        FileUtils.mkdir_p(File.join(cache_dir, "abc.staging-1234-deadbeef12"))
+        FileUtils.mkdir_p(File.join(cache_dir, "abc.previous-1234-feedface12"))
+        cache_dir_value = cache_dir
+        ReactOnRailsPro::Utils.define_singleton_method(:resolve_renderer_cache_dir) { cache_dir_value }
+      end
+
+      after { FileUtils.rm_rf(cache_dir) }
+
+      it "excludes temporary directories from the bundle-hash count" do
+        doctor.send(:check_rolling_deploy_adapter)
+        info = checker.messages.select { |m| m[:type] == :info }
+        expect(info.map { |m| m[:content] }).to include(a_string_matching(/\(1 bundle-hash subdir\(s\)\)/))
+      end
+    end
+
+    context "when adapter is missing required methods" do
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes = []
+        end
+      end
+
+      it "warns with the missing methods listed" do
+        doctor.send(:check_rolling_deploy_adapter)
+        warnings = checker.messages.select { |m| m[:type] == :warning }
+        expect(warnings.any? do |m|
+                 m[:content].include?("missing required methods") && m[:content].include?("fetch")
+               end).to be(true)
+        expect(warnings.none? { |m| m[:content].include?("previous_bundle_hashes returned []") }).to be(true)
+      end
+    end
+
+    context "when previous_bundle_hashes returns []" do
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes = []
+          def self.fetch(_hash); end
+          def self.upload(_hash, **_opts); end
+        end
+      end
+
+      it "warns that the upload side likely has not run" do
+        doctor.send(:check_rolling_deploy_adapter)
+        warnings = checker.messages.select { |m| m[:type] == :warning }
+        expect(warnings.any? { |m| m[:content].include?("returned []") }).to be(true)
+      end
+    end
+
+    context "when previous_bundle_hashes times out" do
+      let(:adapter) do
+        Module.new do
+          def self.previous_bundle_hashes
+            sleep 1
+          end
+
+          def self.fetch(_hash); end
+          def self.upload(_hash, **_opts); end
+        end
+      end
+
+      before do
+        stager_module = Module.new
+        stager_module.const_set(:DISCOVERY_TIMEOUT_SECONDS, 0.01)
+        ReactOnRailsPro.const_set(:RollingDeployCacheStager, stager_module)
+      end
+
+      it "uses the stager timeout constant when it is loaded" do
+        doctor.send(:check_rolling_deploy_adapter)
+        warnings = checker.messages.select { |m| m[:type] == :warning }
+        expect(warnings.any? { |m| m[:content].include?("timed out after 0.01s") }).to be(true)
+      end
+    end
+  end
+
+  describe "report_resolved_cache_dir" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+    let(:cache_dir) { Dir.mktmpdir("doctor-cache") }
+
+    before do
+      cache_dir_value = cache_dir
+      pro_module = Module.new
+      utils_module = Module.new
+      utils_module.define_singleton_method(:resolve_renderer_cache_dir) { cache_dir_value }
+      pro_module.const_set(:Utils, utils_module)
+      stub_const("ReactOnRailsPro", pro_module)
+    end
+
+    after { FileUtils.rm_rf(cache_dir) }
+
+    it "excludes leftover staging/backup temp dirs from the bundle-hash count" do
+      FileUtils.mkdir_p(File.join(cache_dir, "abc123"))
+      FileUtils.mkdir_p(File.join(cache_dir, "def456"))
+      FileUtils.mkdir_p(File.join(cache_dir, "abc123.staging-1234-deadbeef"))
+      FileUtils.mkdir_p(File.join(cache_dir, "abc123.previous-1234-feedface"))
+
+      doctor.send(:report_resolved_cache_dir)
+
+      info = checker.messages.find { |m| m[:type] == :info && m[:content].include?(cache_dir) }
+      expect(info[:content]).to include("(2 bundle-hash subdir(s))")
+    end
+
+    it "uses the Pro stager constant when the Pro gem is loaded" do
+      stager_module = Module.new
+      stager_module.const_set(:TEMPORARY_DIRECTORY_PATTERN, /\.tempmarker\z/)
+      ReactOnRailsPro.const_set(:RollingDeployCacheStager, stager_module)
+      FileUtils.mkdir_p(File.join(cache_dir, "abc123"))
+      FileUtils.mkdir_p(File.join(cache_dir, "abc123.tempmarker"))
+
+      doctor.send(:report_resolved_cache_dir)
+
+      info = checker.messages.find { |m| m[:type] == :info && m[:content].include?(cache_dir) }
+      expect(info[:content]).to include("(1 bundle-hash subdir(s))")
+    end
+  end
+
+  describe "check_deprecated_renderer_cache_task" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when a Procfile references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer && bundle exec puma\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "warns with migration guidance" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("pre_stage_bundle_for_node_renderer") }).to be(true)
+        expect(warning_msgs.any? { |m| m[:content].include?("MODE=symlink") }).to be(true)
+      end
+    end
+
+    context "when a Dockerfile variant references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Dockerfile.production"),
+          "RUN bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "suggests the copy-mode task without MODE=symlink" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs).not_to be_empty
+        warning_content = warning_msgs.map { |m| m[:content] }.join("\n")
+        # Match from the bullet header through any indented continuation lines.
+        bullet_section = warning_content[/  • Dockerfile\.production →(?:\n {6,}.*)*/]
+        expect(bullet_section).not_to be_nil
+        expect(bullet_section).to include("ENV RENDERER_SERVER_BUNDLE_CACHE_PATH=/app/.node-renderer-bundles")
+        expect(bullet_section).to include("RUN bundle exec rake react_on_rails_pro:pre_seed_renderer_cache")
+        expect(bullet_section).not_to include(tmpdir)
+        expect(bullet_section).not_to include("MODE=symlink")
+      end
+    end
+
+    context "when a compose file references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "docker-compose.yml"),
+          "services:\n  web:\n    command: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "warns with migration guidance and a copy-mode hint for image builds" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?("docker-compose.yml →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+        expect(suggestion_line).to include("MODE=symlink")
+        expect(suggestion_line).to include("MODE=copy")
+      end
+    end
+
+    context "when a Compose V2 compose.yaml references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "compose.yaml"),
+          "services:\n  web:\n    command: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "detects .yaml variants of Compose files" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?("compose.yaml →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+      end
+    end
+
+    context "when a Kamal deploy config references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, ".kamal"))
+        File.write(
+          File.join(tmpdir, ".kamal", "deploy.yml"),
+          "hooks:\n  post-deploy: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "shows MODE=symlink and MODE=copy on separate lines for deploy vs image-build hooks" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs).not_to be_empty
+        warning_content = warning_msgs.map { |m| m[:content] }.join("\n")
+        # Match from the bullet header through any indented continuation lines.
+        bullet_section = warning_content[%r{  • \.kamal/deploy\.yml →(?:\n {6,}.*)*}]
+        expect(bullet_section).not_to be_nil
+        expect(bullet_section).to include("rake react_on_rails_pro:pre_seed_renderer_cache MODE=symlink")
+        expect(bullet_section).to include("Kamal deploy hooks")
+        expect(bullet_section).to include("Kamal image-build hooks")
+        expect(bullet_section).to include("MODE=copy")
+        # The previous trailing-comment form ("# use copy mode for image builds") was contradictory
+        # for users editing build hooks, so it must not reappear on the same line as the command.
+        expect(bullet_section).not_to match(/MODE=symlink # use copy mode for image builds/)
+      end
+    end
+
+    context "when a Capistrano staging deploy config references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, "config/deploy"))
+        File.write(
+          File.join(tmpdir, "config/deploy/staging.rb"),
+          "before 'deploy:assets:precompile', 'react_on_rails_pro:pre_stage_bundle_for_node_renderer'\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "flags multi-stage Capistrano deploy files for migration" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?("config/deploy/staging.rb →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+        expect(suggestion_line).to include("MODE=symlink")
+      end
+    end
+
+    context "when no deploy scripts reference the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before { allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir)) }
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "adds no warnings" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        expect(checker.messages.select { |m| m[:type] == :warning }).to be_empty
+      end
+    end
+
+    context "when a configured deploy-script path is a directory" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, "bin/deploy"))
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "skips the directory and continues scanning real files" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+
+        expect(warning_msgs.any? { |m| m[:content].include?("Procfile") }).to be(true)
+        expect(warning_msgs.none? do |m|
+                 m[:content].include?("Could not scan bin/deploy for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when a deploy-script file exceeds the size gate" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        # Stub the cap so we do not have to write a real 1 MB file — the gate
+        # logic is what we are exercising, not the specific threshold.
+        stub_const("ReactOnRails::Doctor::RENDERER_CACHE_DEPLOY_SCRIPT_MAX_BYTES", 64)
+        padding = "x" * 128
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n#{padding}"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "silently skips the file and emits no warning" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        expect(checker.messages.select { |m| m[:type] == :warning }).to be_empty
+      end
+    end
+
+    context "when a deploy-script file is exactly the size gate" do
+      let(:tmpdir) { Dir.mktmpdir }
+      let(:script_content) do
+        "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+      end
+
+      before do
+        stub_const("ReactOnRails::Doctor::RENDERER_CACHE_DEPLOY_SCRIPT_MAX_BYTES", script_content.bytesize)
+        File.write(File.join(tmpdir, "Procfile"), script_content)
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "still scans the file" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("pre_stage_bundle_for_node_renderer") }).to be(true)
+      end
+    end
+
+    context "when reading a deploy-script file raises an unexpected error" do
+      let(:tmpdir) { Dir.mktmpdir }
+      let(:procfile_path) { File.join(tmpdir, "Procfile") }
+
+      before do
+        File.write(
+          procfile_path,
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        root_path = Pathname.new(tmpdir)
+        allow(Rails).to receive(:root).and_return(root_path)
+
+        # Simulate a filesystem error (e.g. transient EIO or a permissions race)
+        # on the actual Pathname receiver used by the doctor scan.
+        failing_procfile = instance_double(Pathname)
+        allow(failing_procfile).to receive_messages(file?: true, size: File.size(procfile_path))
+        allow(failing_procfile).to receive(:binread).and_raise(Errno::EIO, "simulated read failure")
+        allow(root_path).to receive(:join).and_call_original
+        allow(root_path).to receive(:join).with("Procfile").and_return(failing_procfile)
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "captures the error as a warning that names the offending file" do
+        expect { doctor.send(:check_deprecated_renderer_cache_task) }.not_to raise_error
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? do |m|
+                 m[:content].include?("Could not scan Procfile for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when probing a deploy-script file size raises an unexpected error" do
+      let(:tmpdir) { Dir.mktmpdir }
+      let(:deploy_path) { File.join(tmpdir, "bin", "deploy") }
+
+      before do
+        FileUtils.mkdir_p(File.dirname(deploy_path))
+        File.write(
+          deploy_path,
+          "bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+
+        root_path = Pathname.new(tmpdir)
+        allow(Rails).to receive(:root).and_return(root_path)
+
+        failing_procfile = instance_double(Pathname)
+        allow(failing_procfile).to receive(:file?).and_return(true)
+        allow(failing_procfile).to receive(:size).and_raise(Errno::EACCES, "simulated size failure")
+        allow(root_path).to receive(:join).and_call_original
+        allow(root_path).to receive(:join).with("Procfile").and_return(failing_procfile)
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "captures the error for that file and continues scanning the rest" do
+        expect { doctor.send(:check_deprecated_renderer_cache_task) }.not_to raise_error
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? do |m|
+                 m[:content].include?("Could not scan Procfile for deprecated renderer-cache task")
+               end).to be(true)
+        expect(warning_msgs.any? { |m| m[:content].include?("bin/deploy") }).to be(true)
+        expect(warning_msgs.none? do |m|
+                 m[:content].include?("Could not complete scan for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when the deprecated task name appears only inside a comment" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "# was: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n" \
+          "web: bundle exec puma\n"
+        )
+        File.write(
+          File.join(tmpdir, "Dockerfile"),
+          "# previously: rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n" \
+          "RUN bundle exec rake react_on_rails_pro:pre_seed_renderer_cache\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "does not warn for files where every match is in a leading-comment line" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs).to be_empty
+      end
+    end
+
+    context "when the deprecated task name appears only in a trailing inline comment" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec puma  # was: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "does not warn when the task only appears after a trailing `#` annotation" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs).to be_empty
+      end
+    end
+
+    context "when a deploy-script file contains non-UTF-8 bytes" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        # Latin-1 byte (\xE9) outside ASCII; Pathname#read would raise
+        # Encoding::InvalidByteSequenceError if the default external encoding
+        # is UTF-8. The doctor scan should still match the ASCII task name.
+        File.binwrite(
+          File.join(tmpdir, "Procfile"),
+          "# d\xE9ploiement legacy\n" \
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "still detects the deprecated task and does not surface a generic scan error" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("pre_stage_bundle_for_node_renderer") }).to be(true)
+        expect(warning_msgs.none? do |m|
+                 m[:content].include?("Could not scan Procfile for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when a CircleCI config references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, ".circleci"))
+        File.write(
+          File.join(tmpdir, ".circleci/config.yml"),
+          "jobs:\n  deploy:\n    steps:\n      " \
+          "- run: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "flags CI manifests in the fixed allowlist" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?(".circleci/config.yml →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+      end
+    end
+
+    context "when a Jenkinsfile references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Jenkinsfile"),
+          "pipeline {\n  stages {\n    stage('deploy') {\n      " \
+          "steps { sh 'bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer' }\n    " \
+          "}\n  }\n}\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "flags Jenkinsfile entries in the fixed allowlist" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?("Jenkinsfile →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+      end
+    end
+
+    context "when a Jenkinsfile only comments out the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Jenkinsfile"),
+          "pipeline {\n  stages {\n    stage('deploy') {\n      " \
+          "// sh 'bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer'\n    " \
+          "}\n  }\n}\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "ignores Groovy-style line comments" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.none? { |m| m[:content].include?("pre_stage_bundle_for_node_renderer") }).to be(true)
+      end
+    end
+
+    context "when a GitHub Actions workflow discovered via glob references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, ".github/workflows"))
+        File.write(
+          File.join(tmpdir, ".github/workflows/deploy.yml"),
+          "jobs:\n  release:\n    steps:\n      " \
+          "- run: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        # A second workflow with no reference confirms the glob only flags hits.
+        File.write(
+          File.join(tmpdir, ".github/workflows/test.yml"),
+          "jobs:\n  test:\n    steps:\n      - run: bundle exec rspec\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "flags workflows expanded from the bounded glob" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        warning_content = warning_msgs.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include(".github/workflows/deploy.yml →")
+        expect(warning_content).not_to include(".github/workflows/test.yml")
+        expect(warning_content).to include("pre_seed_renderer_cache")
+      end
+    end
+
+    context "when a Capistrano stage file outside the fixed allowlist references the deprecated task" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, "config/deploy"))
+        # canary.rb is not in RENDERER_CACHE_DEPLOY_SCRIPT_PATHS, so it can only be
+        # found via the config/deploy/*.rb glob expansion.
+        File.write(
+          File.join(tmpdir, "config/deploy/canary.rb"),
+          "before 'deploy:assets:precompile', 'react_on_rails_pro:pre_stage_bundle_for_node_renderer'\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "flags arbitrary Capistrano stage files via the glob" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        suggestion_line = warning_msgs
+                          .flat_map { |m| m[:content].split("\n") }
+                          .find { |line| line.include?("config/deploy/canary.rb →") }
+        expect(suggestion_line).not_to be_nil
+        expect(suggestion_line).to include("pre_seed_renderer_cache")
+        expect(suggestion_line).to include("MODE=symlink")
+      end
+    end
+
+    context "when a glob-discovered file raises during read" do
+      let(:tmpdir) { Dir.mktmpdir }
+      let(:workflow_relpath) { ".github/workflows/deploy.yml" }
+      let(:workflow_path) { File.join(tmpdir, workflow_relpath) }
+
+      before do
+        FileUtils.mkdir_p(File.dirname(workflow_path))
+        File.write(
+          workflow_path,
+          "jobs:\n  release:\n    steps:\n      " \
+          "- run: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        # Also drop a Procfile hit so we can confirm the scan keeps going after
+        # the per-file failure on the glob-discovered workflow.
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+
+        root_path = Pathname.new(tmpdir)
+        allow(Rails).to receive(:root).and_return(root_path)
+
+        failing_workflow = instance_double(Pathname)
+        allow(failing_workflow).to receive_messages(file?: true, size: File.size(workflow_path))
+        allow(failing_workflow).to receive(:binread).and_raise(Errno::EIO, "simulated read failure")
+        allow(root_path).to receive(:join).and_call_original
+        allow(root_path).to receive(:join).with(workflow_relpath).and_return(failing_workflow)
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "captures the per-file failure and keeps scanning the remaining paths" do
+        expect { doctor.send(:check_deprecated_renderer_cache_task) }.not_to raise_error
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? do |m|
+                 m[:content].include?("Could not scan #{workflow_relpath} for deprecated renderer-cache task")
+               end).to be(true)
+        expect(warning_msgs.any? { |m| m[:content].include?("Procfile") }).to be(true)
+        expect(warning_msgs.none? do |m|
+                 m[:content].include?("Could not complete scan for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when expanding a deploy-script glob raises an unexpected error" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        File.write(
+          File.join(tmpdir, "Procfile"),
+          "web: bundle exec rake react_on_rails_pro:pre_stage_bundle_for_node_renderer\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+
+        # Fail only the workflows glob; the others must still expand normally.
+        allow(Dir).to receive(:glob).and_call_original
+        allow(Dir).to receive(:glob)
+          .with(".github/workflows/*.yml", File::FNM_PATHNAME, base: tmpdir)
+          .and_raise(Errno::EACCES, "simulated glob failure")
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "captures the glob failure and continues scanning fixed paths" do
+        expect { doctor.send(:check_deprecated_renderer_cache_task) }.not_to raise_error
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? do |m|
+                 m[:content].include?("Could not expand renderer-cache deploy-script glob .github/workflows/*.yml")
+               end).to be(true)
+        expect(warning_msgs.any? { |m| m[:content].include?("pre_stage_bundle_for_node_renderer") }).to be(true)
+        expect(warning_msgs.none? do |m|
+                 m[:content].include?("Could not complete scan for deprecated renderer-cache task")
+               end).to be(true)
+      end
+    end
+
+    context "when a Capistrano stage file is reachable via both the fixed list and the glob" do
+      let(:tmpdir) { Dir.mktmpdir }
+
+      before do
+        FileUtils.mkdir_p(File.join(tmpdir, "config/deploy"))
+        File.write(
+          File.join(tmpdir, "config/deploy/staging.rb"),
+          "before 'deploy:assets:precompile', 'react_on_rails_pro:pre_stage_bundle_for_node_renderer'\n"
+        )
+        allow(Rails).to receive(:root).and_return(Pathname.new(tmpdir))
+      end
+
+      after { FileUtils.remove_entry(tmpdir) if File.directory?(tmpdir) }
+
+      it "reports the same file only once" do
+        doctor.send(:check_deprecated_renderer_cache_task)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        bullet_lines = warning_msgs
+                       .flat_map { |m| m[:content].split("\n") }
+                       .grep(%r{config/deploy/staging\.rb →})
+        expect(bullet_lines.length).to eq(1)
+      end
+    end
+  end
+
+  describe "check_base_package_references" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when JS files import from 'react-on-rails' (base package)" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/custom-bundle.js",
+                       "import ReactOnRails from 'react-on-rails';\nReactOnRails.register({});\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning with file paths" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("custom-bundle.js") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("dynamic imports") }).to be true
+      end
+    end
+
+    context "when JS files import from 'react-on-rails/client' (base subpath)" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.js",
+                       "import ReactOnRails from 'react-on-rails/client';\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails") }).to be true
+      end
+    end
+
+    context "when JS files use require('react-on-rails')" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/legacy.js",
+                       "const ReactOnRails = require('react-on-rails');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails") }).to be true
+      end
+    end
+
+    context "when JS files dynamically import the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/lazy.js",
+                       "const ReactOnRails = await import('react-on-rails/client');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("lazy.js") }).to be true
+      end
+    end
+
+    context "when JS files use a side-effect import of the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/side-effect.js",
+                       "import 'react-on-rails';\nimport 'react-on-rails/client';\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("side-effect.js") }).to be true
+      end
+    end
+
+    context "when JS files use a side-effect import of the Pro package" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/side-effect.js",
+                       "import 'react-on-rails-pro';\n")
+            example.run
+          end
+        end
+      end
+
+      it "does not warn" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("side-effect.js") }).to be false
+      end
+    end
+
+    context "when Vue or Svelte components reference the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/Widget.vue",
+                       "<template>\n  <div />\n</template>\n\n" \
+                       "<script setup>\nimport ReactOnRails from 'react-on-rails';\n</script>\n")
+            File.write("app/javascript/packs/Widget.svelte",
+                       "<script lang=\"ts\">\n  import 'react-on-rails/client';\n</script>\n\n<div />\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning for both .vue and .svelte files" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("Widget.vue") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("Widget.svelte") }).to be true
+      end
+    end
+
+    context "when JS tests mock the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "jest.mock('react-on-rails', () => ({ authenticityHeaders: jest.fn() }));\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("Found references to 'react-on-rails'") }).to be true
+      end
+    end
+
+    context "when JS tests mock a base package subpath after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "jest.mock('react-on-rails/client', () => ({ authenticityHeaders: jest.fn() }));\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be true
+      end
+    end
+
+    context "when JS tests use a typed Jest mock for the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "jest.mock<typeof import('react-on-rails')>('react-on-rails', () => ({}));\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be true
+      end
+    end
+
+    context "when JS tests mock the Pro package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "jest.mock('react-on-rails-pro', () => ({ authenticityHeaders: jest.fn() }));\n")
+            example.run
+          end
+        end
+      end
+
+      it "does not warn" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be false
+      end
+    end
+
+    context "when Vitest tests import the actual base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "const mod = await vi.importActual('react-on-rails/client');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be true
+      end
+    end
+
+    context "when Vitest tests import the base package mock without a receiver" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "const mod = await importMock('react-on-rails');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("app.test.ts") }).to be true
+      end
+    end
+
+    context "when non-test code has a bare mock helper that references the base package string" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/factory.ts",
+                       "mock('react-on-rails', factory);\n")
+            example.run
+          end
+        end
+      end
+
+      it "does not warn" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("factory.ts") }).to be false
+      end
+    end
+
+    context "when non-test code has a mock-like receiver that references the base package string" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/factory.ts",
+                       "server.mock('react-on-rails', factory);\n")
+            example.run
+          end
+        end
+      end
+
+      it "does not warn" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("factory.ts") }).to be false
+      end
+    end
+
+    context "when JS tests use additional mock helpers after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            {
+              "create-mock.test.ts" => "jest.createMockFromModule('react-on-rails');\n",
+              "unmock.test.ts" => "jest.unmock('react-on-rails');\n",
+              "deep-unmock.test.ts" => "jest.deepUnmock('react-on-rails');\n",
+              "do-mock.test.ts" => "jest.doMock('react-on-rails/client', () => ({}));\n",
+              "do-unmock.test.ts" => "vi.doUnmock('react-on-rails');\n",
+              "dont-mock.test.ts" => "jest.dontMock('react-on-rails');\n",
+              "set-mock.test.ts" => "jest.setMock('react-on-rails', {});\n",
+              "unstable-mock-module.test.ts" => "jest.unstable_mockModule('react-on-rails', () => ({}));\n",
+              "unstable-unmock-module.test.ts" => "jest.unstable_unmockModule('react-on-rails');\n",
+              "require-actual.test.ts" => "const mod = jest.requireActual('react-on-rails');\n",
+              "require-mock.test.ts" => "const mod = jest.requireMock('react-on-rails/client');\n",
+              "vitest-mock.test.ts" => "vi.mock('react-on-rails', () => ({ authenticityHeaders: vi.fn() }));\n"
+            }.each do |filename, content|
+              File.write("app/javascript/packs/#{filename}", content)
+            end
+            example.run
+          end
+        end
+      end
+
+      it "reports warning for each stale helper reference" do
+        doctor.send(:check_base_package_references)
+        warning_content = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include("create-mock.test.ts")
+        expect(warning_content).to include("unmock.test.ts")
+        expect(warning_content).to include("deep-unmock.test.ts")
+        expect(warning_content).to include("do-mock.test.ts")
+        expect(warning_content).to include("do-unmock.test.ts")
+        expect(warning_content).to include("dont-mock.test.ts")
+        expect(warning_content).to include("set-mock.test.ts")
+        expect(warning_content).to include("unstable-mock-module.test.ts")
+        expect(warning_content).to include("unstable-unmock-module.test.ts")
+        expect(warning_content).to include("require-actual.test.ts")
+        expect(warning_content).to include("require-mock.test.ts")
+        expect(warning_content).to include("vitest-mock.test.ts")
+      end
+    end
+
+    context "when JS tests use a nonstandard vitest namespace object" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/vitest-namespace.test.ts",
+                       "vitest.mock('react-on-rails', () => ({}));\n")
+            example.run
+          end
+        end
+      end
+
+      it "does not report a warning for the nonstandard helper form" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("vitest-namespace.test.ts") }).to be false
+      end
+    end
+
+    context "when TypeScript declaration files augment the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/types/react-on-rails.d.ts",
+                       "declare module 'react-on-rails' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails.d.ts") }).to be true
+      end
+    end
+
+    context "when TypeScript declaration files augment a base package subpath after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/types/react-on-rails-client.d.ts",
+                       "declare module 'react-on-rails/client' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails-client.d.ts") }).to be true
+      end
+    end
+
+    context "when TypeScript declarations export augmentations for the base package after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/types/react-on-rails-export.d.ts",
+                       "export declare module 'react-on-rails' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails-export.d.ts") }).to be true
+      end
+    end
+
+    context "when module files use ESM or CommonJS extensions after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/esm-entry.mjs",
+                       "import ReactOnRails from 'react-on-rails';\n")
+            File.write("app/javascript/packs/cjs-entry.cjs",
+                       "const ReactOnRails = require('react-on-rails/client');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning for each module file" do
+        doctor.send(:check_base_package_references)
+        warning_content = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include("esm-entry.mjs")
+        expect(warning_content).to include("cjs-entry.cjs")
+      end
+    end
+
+    context "when TypeScript module files use .mts or .cts extensions after a Pro migration" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/packs/esm-entry.mts",
+                       "import ReactOnRails from 'react-on-rails';\n")
+            File.write("app/javascript/packs/cjs-entry.cts",
+                       "const ReactOnRails = require('react-on-rails/client');\n")
+            File.write("app/javascript/types/react-on-rails.d.mts",
+                       "declare module 'react-on-rails' {\n  export function register(): void;\n}\n")
+            File.write("app/javascript/types/react-on-rails.d.cts",
+                       "declare module 'react-on-rails/client' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning for each TypeScript module and declaration file" do
+        doctor.send(:check_base_package_references)
+        warning_content = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include("esm-entry.mts")
+        expect(warning_content).to include("cjs-entry.cts")
+        expect(warning_content).to include("react-on-rails.d.mts")
+        expect(warning_content).to include("react-on-rails.d.cts")
+      end
+    end
+
+    context "when .mts or .cts files correctly reference 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/packs/esm-entry.mts",
+                       "import ReactOnRails from 'react-on-rails-pro';\n")
+            File.write("app/javascript/packs/cjs-entry.cts",
+                       "const ReactOnRails = require('react-on-rails-pro/client');\n")
+            File.write("app/javascript/types/react-on-rails-pro.d.mts",
+                       "declare module 'react-on-rails-pro' {\n  export function register(): void;\n}\n")
+            File.write("app/javascript/types/react-on-rails-pro.d.cts",
+                       "declare module 'react-on-rails-pro/client' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success without flagging Pro references" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when one scanned file has invalid UTF-8 content" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.js",
+                       "import ReactOnRails from 'react-on-rails';\n")
+            File.binwrite("app/javascript/packs/binary.js", "\xFF")
+            example.run
+          end
+        end
+      end
+
+      it "skips the unreadable file and keeps scanning the rest" do
+        doctor.send(:check_base_package_references)
+        warning_content = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include("app.js")
+        expect(warning_content).not_to include("Could not scan")
+      end
+    end
+
+    context "when JS files correctly import from 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.js",
+                       "import ReactOnRails from 'react-on-rails-pro';\nReactOnRails.register({});\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when JS files correctly dynamically import from 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/lazy.js",
+                       "const ReactOnRails = await import('react-on-rails-pro/client');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when JS tests correctly mock 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "jest.mock('react-on-rails-pro', () => ({ authenticityHeaders: jest.fn() }));\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when Vitest tests correctly import actual 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            File.write("app/javascript/packs/app.test.ts",
+                       "const mod = await vi.importActual('react-on-rails-pro');\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when TypeScript declarations correctly augment 'react-on-rails-pro'" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/types/react-on-rails-pro.d.ts",
+                       "declare module 'react-on-rails-pro' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when TypeScript declarations correctly augment a Pro package subpath" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/types")
+            File.write("app/javascript/types/react-on-rails-pro-client.d.ts",
+                       "declare module 'react-on-rails-pro/client' {\n  export function register(): void;\n}\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(warning_msgs).to be_empty
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when no JS files exist" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "reports success (no files to scan)" do
+        doctor.send(:check_base_package_references)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("Pro package used correctly") }).to be true
+      end
+    end
+
+    context "when a generator-scanned client root contains stale base package references" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("client/app/packs")
+            File.write("client/app/packs/app.test.ts",
+                       "jest.mock('react-on-rails', () => ({}));\n")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning for the same root the Pro generator rewrites" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("client/app/packs/app.test.ts") }).to be true
+      end
+    end
+
+    context "when Shakapacker source_path is custom (e.g. client/app)" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/shakapacker.yml", "default:\n  source_path: client/app\n")
+            FileUtils.mkdir_p("client/app/packs")
+            File.write("client/app/packs/app.js",
+                       "import ReactOnRails from 'react-on-rails';\n")
+            example.run
+          end
+        end
+      end
+
+      before do
+        allow(doctor).to receive(:require).with("shakapacker").and_raise(LoadError)
+      end
+
+      it "scans the custom source_path and reports warning" do
+        doctor.send(:check_base_package_references)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("react-on-rails") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("client/app/packs/app.js") }).to be true
+      end
+    end
+
+    context "when a file disappears during the base package scan" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("app/javascript/packs")
+            example.run
+          end
+        end
+      end
+
+      it "skips the unreadable file and keeps scanning the rest" do
+        missing_file = "app/javascript/packs/deleted.js"
+        stale_file = "app/javascript/packs/stale.js"
+        File.write(stale_file, "import ReactOnRails from 'react-on-rails';\n")
+
+        allow(Dir).to receive(:glob).and_call_original
+        allow(Dir).to receive(:glob).with("app/javascript/**/*.js").and_return([missing_file, stale_file])
+
+        doctor.send(:check_base_package_references)
+        warning_content = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }.join("\n")
+        expect(warning_content).to include(stale_file)
+        expect(warning_content).not_to include("Could not scan for base package references")
+      end
+    end
+  end
+
+  # ── RSC Setup Checks ─────────────────────────────────────────────
+
+  describe "RSC setup checks" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      allow(doctor).to receive(:puts)
+      allow(doctor).to receive(:exit)
+    end
+
+    context "when Pro gem is not installed" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(false)
+      end
+
+      it "does not add any RSC messages" do
+        initial_count = checker.messages.length
+        doctor.send(:check_rsc_setup)
+        expect(checker.messages.length).to eq(initial_count)
+      end
+
+      it "reports a skip reason for the RSC-only doctor" do
+        rsc_only_doctor = described_class.new(verbose: false, fix: false, only: ["react_server_components"])
+        rsc_only_checker = rsc_only_doctor.instance_variable_get(:@checker)
+        allow(rsc_only_doctor).to receive(:puts)
+        allow(rsc_only_doctor).to receive(:exit)
+
+        rsc_only_doctor.send(:check_rsc_setup)
+
+        info_messages = rsc_only_checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("React Server Components checks skipped"))
+        expect(info_messages).to include(a_string_including("react_on_rails_pro is not installed"))
+      end
+
+      it "reports a skip reason when RSC is part of an explicit mixed selection" do
+        mixed_doctor = described_class.new(verbose: false, fix: false,
+                                           only: %w[environment_prerequisites react_server_components])
+        mixed_checker = mixed_doctor.instance_variable_get(:@checker)
+        allow(mixed_doctor).to receive(:puts)
+        allow(mixed_doctor).to receive(:exit)
+
+        mixed_doctor.send(:check_rsc_setup)
+
+        info_messages = mixed_checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("React Server Components checks skipped"))
+        expect(info_messages).to include(a_string_including("react_on_rails_pro is not installed"))
+      end
+    end
+
+    context "when Pro is installed but RSC is disabled" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        pro_config = double("ProConfig", enable_rsc_support: false)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+      end
+
+      it "does not add any RSC messages" do
+        initial_count = checker.messages.length
+        doctor.send(:check_rsc_setup)
+        expect(checker.messages.length).to eq(initial_count)
+      end
+
+      it "does not reject Rspack v1 when RSC is disabled" do
+        initial_count = checker.messages.length
+
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/shakapacker.yml", "default:\n  assets_bundler: rspack\n")
+            File.write(
+              "package.json",
+              JSON.generate("dependencies" => {}, "devDependencies" => { "@rspack/core" => "^1.6.0" })
+            )
+
+            doctor.send(:check_rsc_setup)
+          end
+        end
+
+        expect(checker.messages.length).to eq(initial_count)
+      end
+    end
+
+    context "when RSC is enabled with valid setup" do
+      let(:pro_config) do
+        double("ProConfig",
+               enable_rsc_support: true,
+               server_renderer: "NodeRenderer",
+               rsc_bundle_js_file: "rsc-bundle.js",
+               rsc_payload_generation_url_path: "rsc_payload/")
+      end
+
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config/webpack")
+            File.write("config/routes.rb", "Rails.application.routes.draw do\n  rsc_payload_route\nend")
+            File.write("config/webpack/rscWebpackConfig.js", "module.exports = {}")
+            File.write("package.json", '{"dependencies":{"react":"~19.2.7","react-on-rails-rsc":"19.2.1"}}')
+            File.write("Procfile.dev", "rsc-bundle: RSC_BUNDLE_ONLY=true bin/shakapacker --watch")
+            example.run
+          end
+        end
+      end
+
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+      end
+
+      it "reports RSC detected with config values" do
+        doctor.send(:check_rsc_setup)
+        info_messages = checker.messages.select { |m| m[:type] == :info }
+        expect(info_messages.any? { |m| m[:content].include?("React Server Components: enabled") }).to be true
+        expect(info_messages.any? { |m| m[:content].include?("rsc-bundle.js") }).to be true
+      end
+
+      it "reports no errors for a complete setup" do
+        doctor.send(:check_rsc_setup)
+        error_messages = checker.messages.select { |m| m[:type] == :error }
+        expect(error_messages).to be_empty
+      end
+    end
+
+    context "when RSC is enabled but renderer is ExecJS" do
+      let(:pro_config) do
+        double("ProConfig",
+               enable_rsc_support: true,
+               server_renderer: "ExecJS",
+               rsc_bundle_js_file: "rsc-bundle.js",
+               rsc_payload_generation_url_path: "rsc_payload/")
+      end
+
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config/webpack")
+            File.write("config/routes.rb", "rsc_payload_route")
+            File.write("config/webpack/rscWebpackConfig.js", "{}")
+            File.write("package.json", '{"dependencies":{"react":"~19.2.7","react-on-rails-rsc":"19.2.1"}}')
+            File.write("Procfile.dev", "rsc-bundle: RSC_BUNDLE_ONLY=true bin/shakapacker --watch")
+            example.run
+          end
+        end
+      end
+
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+      end
+
+      it "reports error about renderer mode" do
+        doctor.send(:check_rsc_setup)
+        error_messages = checker.messages.select { |m| m[:type] == :error }
+        expect(error_messages.any? { |m| m[:content].include?("NodeRenderer") }).to be true
+      end
+    end
+
+    context "when check_rsc_setup raises an unexpected error" do
+      before do
+        allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+        stub_const("ReactOnRailsPro", double("ReactOnRailsPro"))
+        allow(ReactOnRailsPro).to receive(:configuration).and_raise(StandardError, "unexpected failure")
+      end
+
+      it "catches the error and adds a warning" do
+        doctor.send(:check_rsc_setup)
+        warning_messages = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_messages.any? { |m| m[:content].include?("unexpected failure") }).to be true
+      end
+    end
+  end
+
+  # ── RSC Individual Check Methods ─────────────────────────────────
+
+  describe "check_rsc_payload_route" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when routes.rb contains rsc_payload_route" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/routes.rb",
+                       "Rails.application.routes.draw do\n  rsc_payload_route\nend")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_rsc_payload_route)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("RSC payload route") }).to be true
+      end
+    end
+
+    context "when rsc_payload_route is commented out" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/routes.rb",
+                       "Rails.application.routes.draw do\n  # rsc_payload_route\nend")
+            example.run
+          end
+        end
+      end
+
+      it "reports error (does not count commented-out route)" do
+        doctor.send(:check_rsc_payload_route)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("rsc_payload_route") }).to be true
+      end
+    end
+
+    context "when routes.rb exists but lacks rsc_payload_route" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config")
+            File.write("config/routes.rb", "Rails.application.routes.draw do\nend")
+            example.run
+          end
+        end
+      end
+
+      it "reports error with fix instructions" do
+        doctor.send(:check_rsc_payload_route)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("rsc_payload_route") }).to be true
+      end
+    end
+
+    context "when routes.rb does not exist" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_rsc_payload_route)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("routes.rb not found") }).to be true
+      end
+    end
+  end
+
+  describe "check_rsc_bundler_config" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when config/webpack/rscWebpackConfig.js exists" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config/webpack")
+            File.write("config/webpack/rscWebpackConfig.js", "{}")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_rsc_bundler_config)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("RSC bundler config") }).to be true
+      end
+    end
+
+    context "when config/rspack/rscWebpackConfig.js exists" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            FileUtils.mkdir_p("config/rspack")
+            File.write("config/rspack/rscWebpackConfig.js", "{}")
+            example.run
+          end
+        end
+      end
+
+      it "reports success for rspack variant" do
+        doctor.send(:check_rsc_bundler_config)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("RSC bundler config") }).to be true
+      end
+    end
+
+    context "when neither config exists" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "reports error with fix instructions" do
+        doctor.send(:check_rsc_bundler_config)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("RSC bundler config not found") }).to be true
+      end
+    end
+  end
+
+  describe "check_rsc_rspack_version" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    def write_rspack_project(assets_bundler:, rspack_core_version:, dependency_field: "devDependencies")
+      FileUtils.mkdir_p("config")
+      File.write("config/shakapacker.yml", <<~YAML)
+        default:
+          assets_bundler: #{assets_bundler}
+      YAML
+
+      dependencies = { "react" => "19.2.7" }
+      dev_dependencies = {}
+      package_json = { "dependencies" => dependencies, "devDependencies" => dev_dependencies }
+      if rspack_core_version
+        package_json[dependency_field] ||= {}
+        package_json[dependency_field]["@rspack/core"] = rspack_core_version
+      end
+      File.write(
+        "package.json",
+        JSON.generate(package_json)
+      )
+    end
+
+    around do |example|
+      previous_bundler = ENV.fetch("SHAKAPACKER_ASSETS_BUNDLER", nil)
+      ENV.delete("SHAKAPACKER_ASSETS_BUNDLER")
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    ensure
+      if previous_bundler.nil?
+        ENV.delete("SHAKAPACKER_ASSETS_BUNDLER")
+      else
+        ENV["SHAKAPACKER_ASSETS_BUNDLER"] = previous_bundler
+      end
+    end
+
+    before do
+      allow(Rails).to receive(:root).and_return(Pathname.new(Dir.pwd))
+      allow(doctor).to receive(:resolved_package_root).and_return(Dir.pwd)
+      allow(ReactOnRails).to receive(:configuration).and_return(
+        instance_double(ReactOnRails::Configuration, node_modules_location: "")
+      )
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      stub_const("ReactOnRailsPro", Module.new)
+      stub_const("ReactOnRailsPro::Configuration", Class.new { attr_reader :enable_rsc_support })
+      pro_config = instance_double(ReactOnRailsPro::Configuration, enable_rsc_support: true)
+      ReactOnRailsPro.define_singleton_method(:configuration) { pro_config }
+    end
+
+    context "when RSC uses Rspack v1" do
+      before { write_rspack_project(assets_bundler: "rspack", rspack_core_version: "^1.6.0") }
+
+      it "reports an error with Rspack v2 fix instructions" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("Rspack v2 or newer") }).to be true
+        expect(error_msgs.any? { |m| m[:content].include?("@rspack/core@^2") }).to be true
+      end
+    end
+
+    context "when Rspack is selected for the command through SHAKAPACKER_ASSETS_BUNDLER" do
+      before do
+        ENV["SHAKAPACKER_ASSETS_BUNDLER"] = "rspack"
+        write_rspack_project(assets_bundler: "webpack", rspack_core_version: "^1.6.0")
+      end
+
+      it "reports an error with Rspack v2 fix instructions" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("Rspack v2 or newer") }).to be true
+      end
+    end
+
+    context "when RSC uses Rspack but @rspack/core is missing" do
+      before { write_rspack_project(assets_bundler: "rspack", rspack_core_version: nil) }
+
+      it "reports an error with Rspack v2 fix instructions" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("Detected @rspack/core: not found") }).to be true
+        expect(error_msgs.any? { |m| m[:content].include?("@rspack/core@^2") }).to be true
+      end
+    end
+
+    context "when RSC uses Rspack v2" do
+      before { write_rspack_project(assets_bundler: "rspack", rspack_core_version: "^2.0.0") }
+
+      it "reports success" do
+        doctor.send(:check_rsc_rspack_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("Rspack 2.0.0 is compatible with RSC") }).to be true
+      end
+    end
+
+    context "when Rspack is installed under a configured client package root" do
+      before do
+        write_rspack_project(assets_bundler: "rspack", rspack_core_version: "latest")
+        FileUtils.mkdir_p("client/node_modules/@rspack/core")
+        File.write(
+          "client/node_modules/@rspack/core/package.json",
+          JSON.generate("name" => "@rspack/core", "version" => "2.0.8")
+        )
+        allow(ReactOnRails).to receive(:configuration).and_return(
+          instance_double(ReactOnRails::Configuration, node_modules_location: "client")
+        )
+        doctor.send(:resolved_package_root)
+      end
+
+      it "uses the current configured package root instead of stale root resolution" do
+        doctor.send(:check_rsc_rspack_version)
+
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(success_msgs.any? { |m| m[:content].include?("Rspack 2.0.8 is compatible with RSC") }).to be true
+        expect(error_msgs).to be_empty
+      end
+    end
+
+    context "when RSC uses Rspack v2 from optional dependencies" do
+      before do
+        write_rspack_project(
+          assets_bundler: "rspack",
+          rspack_core_version: "^2.0.0",
+          dependency_field: "optionalDependencies"
+        )
+      end
+
+      it "reports success" do
+        doctor.send(:check_rsc_rspack_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("Rspack 2.0.0 is compatible with RSC") }).to be true
+      end
+    end
+
+    context "when the RSC Rspack version is undeterminable" do
+      before { write_rspack_project(assets_bundler: "rspack", rspack_core_version: "latest") }
+
+      it "keeps doctor fail-closed with Rspack v2 fix instructions" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+
+        expect(error_msgs).to include(
+          a_hash_including(
+            content: a_string_including(
+              "RSC with Rspack requires Rspack v2 or newer",
+              "Detected @rspack/core: latest",
+              "@rspack/core@^2"
+            )
+          )
+        )
+      end
+    end
+
+    context "when RSC is disabled" do
+      before do
+        pro_config = instance_double(ReactOnRailsPro::Configuration, enable_rsc_support: false)
+        ReactOnRailsPro.define_singleton_method(:configuration) { pro_config }
+        write_rspack_project(assets_bundler: "rspack", rspack_core_version: "^1.6.0")
+      end
+
+      it "does not report an Rspack error" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs).to be_empty
+      end
+    end
+
+    context "when the app uses webpack" do
+      before { write_rspack_project(assets_bundler: "webpack", rspack_core_version: "^1.6.0") }
+
+      it "does not report an Rspack error" do
+        doctor.send(:check_rsc_rspack_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs).to be_empty
+      end
+    end
+  end
+
+  describe "check_rsc_rspack_lazy_compilation" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    before do
+      allow(doctor).to receive(:shakapacker_assets_bundler_config_path).and_return(nil)
+    end
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) do
+          FileUtils.mkdir_p("config/rspack")
+          File.write("config/rspack/rscWebpackConfig.js", "module.exports = {}")
+          File.write("config/rspack/rspack.config.js", "module.exports = {};")
+          File.write("config/rspack/development.js", "module.exports = {};")
+          FileUtils.mkdir_p("config")
+          File.write("config/shakapacker.yml", "default:\n  assets_bundler: rspack\n")
+          example.run
+        end
+      end
+    end
+
+    it "warns when RSC Rspack dev-server config does not disable lazy compilation" do
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages)
+        .to include(a_string_including("Rspack lazyCompilation can leave the RSC client manifest empty"))
+      expect(warning_messages).to include(a_string_including("config/rspack/development.js"))
+      expect(info_messages).to include(a_string_including("clientWebpackConfig.lazyCompilation = false"))
+      expect(info_messages).to include(a_string_including("rsc-troubleshooting.md#empty-client-manifest"))
+    end
+
+    it "warns when the RSC Rspack development config is missing" do
+      File.delete("config/rspack/development.js")
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC Rspack development config not found"))
+      expect(info_messages)
+        .to include(a_string_including("Cannot verify that Rspack lazyCompilation is disabled"))
+    end
+
+    it "skips the lazy compilation warning when the RSC Rspack config is not present" do
+      File.delete("config/rspack/rscWebpackConfig.js")
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      expect(checker.messages).to be_empty
+    end
+
+    it "reports success when RSC Rspack dev-server config disables lazy compilation" do
+      File.write("config/rspack/development.js", "clientWebpackConfig.lazyCompilation = false;\n")
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(success_messages)
+        .to include(a_string_including("Rspack lazy compilation appears disabled for RSC dev-server"))
+      expect(warning_messages).to be_empty
+    end
+
+    it "uses the configured Shakapacker Rspack config directory" do
+      FileUtils.mkdir_p("config/custom-rspack")
+      File.write("config/custom-rspack/rspack.custom.js", "module.exports = {};")
+      File.write("config/custom-rspack/rscWebpackConfig.js", "module.exports = {};")
+      File.write("config/custom-rspack/development.js", "clientWebpackConfig.lazyCompilation = false;\n")
+      allow(doctor)
+        .to receive(:shakapacker_assets_bundler_config_path)
+        .and_return("config/custom-rspack/rspack.custom.js")
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(success_messages)
+        .to include(a_string_including("Rspack lazy compilation appears disabled for RSC dev-server"))
+      expect(warning_messages).to be_empty
+    end
+
+    it "continues warning when only unrelated lazy compilation settings are disabled" do
+      File.write(
+        "config/rspack/development.js",
+        <<~JAVASCRIPT
+          module.exports = {
+            lazyCompilation: false,
+          };
+
+          serverWebpackConfig.lazyCompilation = false;
+          rscWebpackConfig.lazyCompilation = false;
+        JAVASCRIPT
+      )
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(success_messages).to be_empty
+      expect(warning_messages)
+        .to include(a_string_including("Rspack lazyCompilation can leave the RSC client manifest empty"))
+    end
+
+    it "continues warning when the client lazy compilation assignment is only commented out" do
+      File.write(
+        "config/rspack/development.js",
+        <<~JAVASCRIPT
+          // clientWebpackConfig.lazyCompilation = false;
+          module.exports = {};
+        JAVASCRIPT
+      )
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(success_messages).to be_empty
+      expect(warning_messages)
+        .to include(a_string_including("Rspack lazyCompilation can leave the RSC client manifest empty"))
+    end
+
+    it "describes the detector limitation instead of asserting lazyCompilation is enabled for equivalent configs" do
+      # Issue #4243: equivalent configs (here Object.assign) effectively set
+      # lazyCompilation: false, but the static check only recognizes the literal
+      # generated assignment. The warning must not claim lazyCompilation is still enabled.
+      File.write(
+        "config/rspack/development.js",
+        "Object.assign(clientWebpackConfig, { lazyCompilation: false });\n"
+      )
+
+      doctor.send(:check_rsc_rspack_lazy_compilation)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(warning_messages)
+        .to include(a_string_including("could not confirm lazyCompilation is disabled"))
+      expect(warning_messages).not_to include(a_string_including("does not appear to disable"))
+      expect(info_messages)
+        .to include(a_string_including("disable lazyCompilation another way"))
+      # An equivalent config must not also produce a spurious success alongside the warning.
+      expect(success_messages).to be_empty
+    end
+  end
+
+  describe "check_rsc_react_version" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    def install_react(version)
+      FileUtils.mkdir_p("node_modules/react")
+      File.write("node_modules/react/package.json", "{\"version\":\"#{version}\"}")
+    end
+
+    def stub_package_root(path)
+      allow(doctor).to receive(:resolved_package_root).and_return(path)
+    end
+
+    before do
+      # RSpec runs before hooks inside the chdir around hooks below, so Dir.pwd is the per-example tmpdir.
+      stub_package_root(Dir.pwd)
+    end
+
+    it "keeps Doctor RSC support constants in sync with the node-renderer peer support window" do
+      support_source = File.read(
+        File.expand_path(
+          "../../../../packages/react-on-rails-pro-node-renderer/src/shared/rscPeerSupport.ts",
+          __dir__
+        )
+      )
+      rsc_support = support_source.match(/reactOnRailsRsc:\s*\{(?<body>[^}]+)\}/)&.[](:body)
+      react_ranges = support_source.scan(
+        /
+          rscMinor:\s*(?<rsc_minor>\d+),\s*
+          rscMinPatch:\s*(?<rsc_min_patch>\d+),\s*
+          rscMaxPatch:\s*(?<rsc_max_patch>\d+|null),\s*
+          minor:\s*(?<minor>\d+),\s*
+          minPatch:\s*(?<min_patch>\d+)
+        /x
+      )
+
+      expect(rsc_support).not_to be_nil
+      expect(react_ranges).not_to be_empty
+      expect(described_class::RSC_MINIMUM_PACKAGE_VERSION).to eq(
+        rsc_support.match(/minimumVersion:\s*'(?<version>[^']+)'/)[:version]
+      )
+      prerelease_match = rsc_support.match(/minimumPrereleaseVersion:\s*'(?<version>[^']+)'/)
+      expect(described_class::RSC_MINIMUM_PACKAGE_PRERELEASE_VERSION).to eq(prerelease_match&.[](:version))
+      expect(described_class::RSC_SUPPORTED_PACKAGE_MAJOR).to eq(
+        rsc_support.match(/supportedMajor:\s*(?<major>\d+)/)[:major].to_i
+      )
+      expect(described_class::RSC_SUPPORTED_PACKAGE_MINORS).to eq(react_ranges.map { |range| range[0].to_i }.uniq)
+      expect(described_class::RSC_REACT_SUPPORT_RANGES).to eq(
+        react_ranges.map do |rsc_minor, rsc_min_patch, rsc_max_patch, minor, min_patch|
+          {
+            rsc_minor: rsc_minor.to_i,
+            rsc_min_patch: rsc_min_patch.to_i,
+            rsc_max_patch: rsc_max_patch == "null" ? nil : rsc_max_patch.to_i,
+            minor: minor.to_i,
+            min_patch: min_patch.to_i
+          }
+        end
+      )
+      first_range = described_class::RSC_REACT_SUPPORT_RANGES.fetch(0)
+      expect(described_class::RSC_MINIMUM_REACT_VERSION).to eq(
+        "#{described_class::RSC_SUPPORTED_PACKAGE_MAJOR}.#{first_range.fetch(:minor)}.#{first_range.fetch(:min_patch)}"
+      )
+      expect(described_class::RSC_SUPPORTED_REACT_MAJOR).to eq(described_class::RSC_SUPPORTED_PACKAGE_MAJOR)
+      expect(described_class::RSC_SUPPORTED_REACT_LINE).to eq(
+        described_class::RSC_REACT_SUPPORT_RANGES.map do |range|
+          "#{described_class::RSC_SUPPORTED_REACT_MAJOR}.#{range.fetch(:minor)}.x"
+        end.uniq.join(" or ")
+      )
+    end
+
+    it "derives the RSC React support predicate from the configured floor and line" do
+      minimum_major, minimum_minor, minimum_patch = described_class::RSC_MINIMUM_REACT_VERSION_TUPLE
+      below_floor = "#{minimum_major}.#{minimum_minor}.#{minimum_patch - 1}"
+      unsupported_minor = "#{minimum_major}.#{described_class::RSC_SUPPORTED_REACT_MINORS.max + 1}.0"
+
+      expect(doctor.send(:unsupported_rsc_react_version?, described_class::RSC_MINIMUM_REACT_VERSION)).to be false
+      expect(doctor.send(:unsupported_rsc_react_version?, below_floor)).to be true
+      expect(doctor.send(:unsupported_rsc_react_version?, unsupported_minor)).to be true
+    end
+
+    context "when React 19.2.7+" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            install_react("19.2.7")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("compatible with RSC") }).to be true
+      end
+    end
+
+    context "when React 19.2.0-19.2.6" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            install_react("19.2.6")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning about the Pro 17 floor" do
+        doctor.send(:check_rsc_react_version)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("React on Rails Pro 17 RSC floor") }).to be true
+      end
+    end
+
+    context "when React 18.x" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            install_react("18.2.0")
+            example.run
+          end
+        end
+      end
+
+      it "reports error" do
+        doctor.send(:check_rsc_react_version)
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(error_msgs.any? { |m| m[:content].include?("not compatible with RSC") }).to be true
+      end
+    end
+
+    context "when React 19.1.x" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            install_react("19.1.0")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning about unverified version" do
+        doctor.send(:check_rsc_react_version)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("not been verified") }).to be true
+      end
+    end
+
+    context "when React 20.x (future major)" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            install_react("20.0.0")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning, not error" do
+        doctor.send(:check_rsc_react_version)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+        expect(warning_msgs.any? { |m| m[:content].include?("not been verified") }).to be true
+        expect(error_msgs).to be_empty
+      end
+    end
+
+    context "when installed version differs from declared range" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("package.json", '{"dependencies":{"react":"^19.0.0"}}')
+            install_react("19.2.7")
+            example.run
+          end
+        end
+      end
+
+      it "uses the installed version, not the declared range" do
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("19.2.7") }).to be true
+      end
+    end
+
+    context "when installed package version is not semver-like" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("package.json", '{"dependencies":{"react":"19.2.7"}}')
+            install_react("canary")
+            example.run
+          end
+        end
+      end
+
+      it "falls back to the declared package version" do
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("19.2.7") }).to be true
+      end
+    end
+
+    context "when React is declared in dependencies and devDependencies" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              '{"dependencies":{"react":"18.2.0"},"devDependencies":{"react":"19.2.7"}}'
+            )
+            example.run
+          end
+        end
+      end
+
+      it "preserves devDependencies precedence for declared package fallback" do
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        error_msgs = checker.messages.select { |m| m[:type] == :error }
+
+        expect(success_msgs.any? { |m| m[:content].include?("React 19.2.7") }).to be true
+        expect(error_msgs).to be_empty
+      end
+    end
+
+    context "when react-on-rails-rsc declares a React peer range" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.0.7",
+                  "react-dom" => "19.0.7",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.0.7")
+            install_package("react-dom", "version" => "19.0.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            example.run
+          end
+        end
+      end
+
+      it "errors when installed React does not satisfy the RSC peer range" do
+        allow(doctor).to receive(:capture_rsc_dist_tags)
+
+        doctor.send(:check_rsc_react_version)
+
+        error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+        expect(error_msgs).to include(
+          a_string_including(
+            "react-on-rails-rsc 19.2.1 requires react ^19.2.7",
+            "installed react is 19.0.7"
+          )
+        )
+        expect(warning_msgs).not_to include(a_string_including("behind the npm"))
+        expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+      end
+
+      it "does not report peer compatibility success when peer checks are unexpectedly empty" do
+        rsc_package = {
+          "version" => "19.2.1",
+          "peerDependencies" => { "react" => "^19.0.4" }
+        }
+        allow(doctor).to receive(:rsc_peer_check_results).and_return([])
+
+        result = doctor.send(:check_rsc_package_peer_compatibility, rsc_package, "19.0.7")
+
+        success_msgs = checker.messages.select { |m| m[:type] == :success }.map { |m| m[:content] }
+        expect(result).to be false
+        expect(success_msgs).not_to include(a_string_including("peer dependencies are compatible"))
+      end
+
+      it "errors when the installed RSC package is below the Pro 17 floor" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.0.5"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.0.5",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:capture_rsc_dist_tags)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.0.5 is not supported by React on Rails Pro 17 RSC",
+                "requires react-on-rails-rsc >= 19.2.1"
+              )
+            )
+            expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+          end
+        end
+      end
+
+      it "errors when the installed RSC package is an older prerelease on the Pro 17 floor tuple" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.2.1-beta.0"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1-beta.0",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:capture_rsc_dist_tags)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.1-beta.0 is not supported by React on Rails Pro 17 RSC",
+                "requires react-on-rails-rsc >= 19.2.1"
+              )
+            )
+            expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+          end
+        end
+      end
+
+      it "errors when the installed RSC package is a future prerelease outside the allowed RC tuple" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.2.2-alpha.0"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.2-alpha.0",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:capture_rsc_dist_tags)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.2-alpha.0 is not supported by React on Rails Pro 17 RSC",
+                "requires react-on-rails-rsc >= 19.2.1"
+              )
+            )
+            expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+          end
+        end
+      end
+
+      it "errors when the installed RSC package is a future stable minor outside the supported line" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.4.0"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.4.0",
+              "peerDependencies" => { "react" => "^19.4.0", "react-dom" => "^19.4.0" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:capture_rsc_dist_tags)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.4.0 is not supported by React on Rails Pro 17 RSC",
+                "supported 19.2.x starting at 19.2.1 or 19.3.x package line"
+              )
+            )
+            expect(error_msgs.size).to eq(1)
+            expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+          end
+        end
+      end
+
+      describe "React 19.3 support table" do
+        # Peer ranges match the published packages: 19.3.0 bundles Flight 19.2.8 and
+        # 19.3.1-rc.0 bundles Flight 19.3.0.
+        published_rsc_react_peers = {
+          "19.2.1" => "^19.2.7",
+          "19.3.0" => "^19.2.8",
+          "19.3.1-rc.0" => "^19.3.0",
+          "19.3.1" => "^19.3.0"
+        }
+
+        def rsc_errors_for(rsc_version:, react_version:, react_peer:, react_dom_version: react_version)
+          Dir.mktmpdir do |tmpdir|
+            Dir.chdir(tmpdir) do
+              File.write(
+                "package.json",
+                JSON.generate(
+                  "dependencies" => {
+                    "react" => react_version,
+                    "react-dom" => react_dom_version,
+                    "react-on-rails-rsc" => rsc_version
+                  }
+                )
+              )
+              install_react(react_version)
+              install_package("react-dom", "version" => react_dom_version)
+              install_package(
+                "react-on-rails-rsc",
+                "version" => rsc_version,
+                "peerDependencies" => { "react" => react_peer, "react-dom" => react_peer }
+              )
+              stub_package_root(Dir.pwd)
+              allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+              doctor.send(:check_rsc_react_version)
+
+              checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            end
+          end
+        end
+
+        [
+          %w[19.3.0 19.2.8],
+          %w[19.3.1-rc.0 19.3.0],
+          %w[19.3.1 19.3.0]
+        ].each do |rsc_version, react_version|
+          it "accepts react-on-rails-rsc #{rsc_version} with React #{react_version}" do
+            errors = rsc_errors_for(rsc_version:, react_version:,
+                                    react_peer: published_rsc_react_peers.fetch(rsc_version))
+
+            expect(errors).to be_empty
+          end
+        end
+
+        [
+          ["19.3.0", "19.3.0", "19.2.x with patch >= 19.2.8 (stable releases only)", "19.2.8"],
+          ["19.2.1", "19.3.0", "19.2.x with patch >= 19.2.7 (stable releases only)", "19.2.7"]
+        ].each do |rsc_version, react_version, supported_range, fix_version|
+          it "rejects react-on-rails-rsc #{rsc_version} with React #{react_version} " \
+             "and points the Fix at React #{fix_version}" do
+            errors = rsc_errors_for(rsc_version:, react_version:,
+                                    react_peer: published_rsc_react_peers.fetch(rsc_version))
+
+            expect(errors).to contain_exactly(
+              a_string_including(
+                "react-on-rails-rsc #{rsc_version} is installed with unsupported React #{react_version}",
+                "React on Rails Pro 17 RSC currently supports React/React DOM #{supported_range}.",
+                "Fix: npm install react@~#{fix_version} react-dom@~#{fix_version} --save-exact"
+              )
+            )
+          end
+        end
+
+        it "rejects the 19.3.1-rc.0 soak with React 19.2.8 when the package peers would allow it" do
+          errors = rsc_errors_for(rsc_version: "19.3.1-rc.0", react_version: "19.2.8", react_peer: "^19.2.8")
+
+          expect(errors).to contain_exactly(
+            a_string_including(
+              "react-on-rails-rsc 19.3.1-rc.0 is installed with unsupported React 19.2.8",
+              "React/React DOM 19.3.x with patch >= 19.3.0 (stable releases only).",
+              "Fix: npm install react@~19.3.0 react-dom@~19.3.0 --save-exact"
+            )
+          )
+        end
+
+        it "rejects a prerelease React build even when the package peers would allow it" do
+          canary = "19.3.0-canary-d083ec1d-20260922"
+          errors = rsc_errors_for(rsc_version: "19.3.1-rc.0", react_version: canary, react_peer: ">=19.3.0-0")
+
+          expect(errors).to contain_exactly(
+            a_string_including(
+              "react-on-rails-rsc 19.3.1-rc.0 is installed with unsupported React #{canary}",
+              "19.3.x with patch >= 19.3.0 (stable releases only)"
+            )
+          )
+        end
+
+        it "names the support-table React version when the package's own peer range rejects React" do
+          errors = rsc_errors_for(rsc_version: "19.3.0", react_version: "19.2.7",
+                                  react_peer: published_rsc_react_peers.fetch("19.3.0"))
+
+          expect(errors).to include(
+            a_string_including(
+              "react-on-rails-rsc 19.3.0 requires react ^19.2.8, but installed react is 19.2.7",
+              "npm install react@~19.2.8 react-on-rails-rsc@19.3.0 --save-exact"
+            )
+          )
+          expect(errors.none? { |error| error.include?("react@^19.2.8") }).to be true
+        end
+
+        it "keeps the support table when the installed RSC package declares no React peers" do
+          errors = rsc_errors_for(rsc_version: "19.2.1", react_version: "19.3.0", react_peer: nil)
+
+          expect(errors).to contain_exactly(
+            a_string_including(
+              "react-on-rails-rsc 19.2.1 is installed with unsupported React 19.3.0",
+              "19.2.x with patch >= 19.2.7 (stable releases only)"
+            )
+          )
+        end
+
+        it "accepts a supported pair when the installed RSC package declares no React peers" do
+          errors = rsc_errors_for(rsc_version: "19.3.0", react_version: "19.2.8", react_peer: nil)
+
+          expect(errors).to be_empty
+        end
+
+        it "rejects the superseded 19.3.0-rc.4 prerelease that React on Rails 17.1.0 accepted" do
+          errors = rsc_errors_for(rsc_version: "19.3.0-rc.4", react_version: "19.2.8", react_peer: "^19.2.8")
+
+          expect(errors).to contain_exactly(
+            a_string_including(
+              "react-on-rails-rsc 19.3.0-rc.4 is not supported by React on Rails Pro 17 RSC",
+              ">= 19.2.1\n(or 19.3.1-rc.0 during the RC soak)",
+              "with React/React DOM 19.2.8+.",
+              "Fix: npm install react@~19.2.8 react-dom@~19.2.8 react-on-rails-rsc@19.3.0 --save-exact"
+            )
+          )
+        end
+      end
+
+      it "recommends React 19.3.0 when the 19.3.1-rc.0 soak is paired with React 19.2" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.3.1-rc.0"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.3.1-rc.0",
+              "peerDependencies" => { "react" => "^19.0.0", "react-dom" => "^19.0.0" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.3.1-rc.0 is installed with unsupported React 19.2.7",
+                "React/React DOM 19.3.x with patch >= 19.3.0",
+                "Fix: npm install react@~19.3.0 react-dom@~19.3.0 --save-exact"
+              )
+            )
+            expect(error_msgs.none? { |msg| msg.include?("react@~19.2.7") }).to be true
+          end
+        end
+      end
+
+      it "reports an error when the declared RSC package cannot be resolved from node_modules" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.0.7",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.0.7")
+            stub_package_root(Dir.pwd)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc is declared in package.json but could not be resolved from node_modules",
+                "npm install"
+              )
+            )
+            expect(error_msgs.none? { |msg| msg.include?("requires react") }).to be true
+          end
+        end
+      end
+
+      it "does not treat optionalDependencies as a declared RSC package" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.0.7",
+                  "react-dom" => "19.0.7"
+                },
+                "optionalDependencies" => {
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.0.7")
+            install_package("react-dom", "version" => "19.0.7")
+            stub_package_root(Dir.pwd)
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs.none? { |msg| msg.include?("react-on-rails-rsc is declared") }).to be true
+          end
+        end
+      end
+
+      it "errors when broad RSC peer ranges allow React below the supported floor" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.0.7",
+                  "react-dom" => "19.0.7",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.0.7")
+            install_package("react-dom", "version" => "19.0.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.0.0", "react-dom" => "^19.0.0" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            warning_msgs = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.1 is installed with unsupported React 19.0.7",
+                "React/React DOM 19.2.x with patch >= 19.2.7",
+                "Fix: npm install react@~19.2.7 react-dom@~19.2.7 --save-exact"
+              )
+            )
+            expect(warning_msgs).not_to include(a_string_including("RSC support currently targets React 19.2.x"))
+          end
+        end
+      end
+
+      it "errors when broad RSC peer ranges allow a future unsupported React minor" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.3.0",
+                  "react-dom" => "19.3.0",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.3.0")
+            install_package("react-dom", "version" => "19.3.0")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            warning_msgs = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.1 is installed with unsupported React 19.3.0",
+                "React/React DOM 19.2.x with patch >= 19.2.7"
+              )
+            )
+            expect(warning_msgs).not_to include(a_string_including("RSC support currently targets React 19.2.x"))
+          end
+        end
+      end
+
+      it "errors when broad RSC peer ranges allow a future unsupported React DOM minor" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.3.0",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.3.0")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.1 is installed with unsupported React DOM 19.3.0",
+                "React/React DOM 19.2.x with patch >= 19.2.7"
+              )
+            )
+          end
+        end
+      end
+
+      it "errors when React DOM does not match the supported React version" do
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.8",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.8")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            stub_package_root(Dir.pwd)
+            allow(doctor).to receive(:rsc_dist_tags).and_return({})
+
+            doctor.send(:check_rsc_react_version)
+
+            error_msgs = checker.messages.select { |m| m[:type] == :error }.map { |m| m[:content] }
+            expect(error_msgs).to include(
+              a_string_including(
+                "react-on-rails-rsc 19.2.1 is installed with React 19.2.7 but React DOM 19.2.8",
+                "react and react-dom to resolve to the same version"
+              )
+            )
+          end
+        end
+      end
+    end
+
+    context "when react-on-rails-rsc is behind the prerelease dist-tag" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write(
+              "package.json",
+              JSON.generate(
+                "dependencies" => {
+                  "react" => "19.2.7",
+                  "react-dom" => "19.2.7",
+                  "react-on-rails-rsc" => "19.2.1"
+                }
+              )
+            )
+            install_react("19.2.7")
+            install_package("react-dom", "version" => "19.2.7")
+            install_package(
+              "react-on-rails-rsc",
+              "version" => "19.2.1",
+              "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+            )
+            example.run
+          end
+        end
+      end
+
+      it "warns that the installed package is behind the next dist-tag" do
+        allow(doctor).to receive(:capture_rsc_dist_tags)
+          .with(Dir.pwd)
+          .and_return(
+            [
+              JSON.generate("latest" => "19.2.1", "next" => "19.2.2-rc.1"),
+              instance_double(Process::Status, success?: true)
+            ]
+          )
+
+        doctor.send(:check_rsc_react_version)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }.map { |m| m[:content] }
+        expect(warning_msgs).to include(
+          a_string_including(
+            "react-on-rails-rsc 19.2.1 is behind the npm next dist-tag 19.2.2-rc.1",
+            "React Server Components track React minor versions"
+          )
+        )
+      end
+
+      it "reports an info message once when the dist-tag lookup is unavailable" do
+        allow(doctor).to receive(:capture_rsc_dist_tags)
+          .with(Dir.pwd)
+          .and_return(["", instance_double(Process::Status, success?: false)])
+
+        doctor.send(:check_rsc_react_version)
+        doctor.send(:check_rsc_react_version)
+
+        info_msgs = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        expect(
+          info_msgs.count { |msg| msg.include?("Could not fetch react-on-rails-rsc dist-tags") }
+        ).to eq(1)
+        expect(doctor).to have_received(:capture_rsc_dist_tags).with(Dir.pwd).once
+      end
+
+      it "skips the dist-tag lookup when the npm dist-tag check environment flag is set" do
+        old_skip = ENV.fetch(described_class::SKIP_NPM_DIST_TAG_CHECK_ENV, nil)
+        ENV[described_class::SKIP_NPM_DIST_TAG_CHECK_ENV] = "1"
+        allow(doctor).to receive(:capture_rsc_dist_tags)
+
+        doctor.send(:check_rsc_react_version)
+
+        info_msgs = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        expect(info_msgs).to include(
+          a_string_including("Skipping react-on-rails-rsc npm dist-tag check")
+        )
+        expect(doctor).not_to have_received(:capture_rsc_dist_tags)
+      ensure
+        if old_skip.nil?
+          ENV.delete(described_class::SKIP_NPM_DIST_TAG_CHECK_ENV)
+        else
+          ENV[described_class::SKIP_NPM_DIST_TAG_CHECK_ENV] = old_skip
+        end
+      end
+
+      it "kills a stalled dist-tag subprocess and reports an info message" do
+        stub_const("ReactOnRails::Doctor::NPM_VIEW_FETCH_TIMEOUT_SECONDS", 0.1)
+        stub_const("ReactOnRails::Doctor::NPM_VIEW_TERMINATION_GRACE_SECONDS", 0.1)
+        allow(doctor).to receive(:rsc_dist_tag_command).and_return([Gem.ruby, "-e", "sleep 20"])
+
+        started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        doctor.send(:check_rsc_react_version)
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+        info_msgs = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        expect(info_msgs).to include(a_string_including("Could not fetch react-on-rails-rsc dist-tags"))
+        expect(elapsed).to be < 2
+      end
+
+      it "cleans up the dist-tag subprocess when setup raises after spawn" do
+        allow(doctor).to receive(:rsc_dist_tag_command).and_return([Gem.ruby, "-e", "sleep 20"])
+        allow(doctor).to receive(:read_pipe_async).and_raise(IOError, "pipe setup failed")
+
+        expect(doctor).to receive(:terminate_rsc_dist_tag_process).and_call_original
+        expect { doctor.send(:capture_rsc_dist_tags, Dir.pwd) }.to raise_error(IOError, "pipe setup failed")
+      end
+
+      it "reports an info message when npm returns JSON that is not an object" do
+        allow(doctor).to receive(:capture_rsc_dist_tags)
+          .with(Dir.pwd)
+          .and_return(["null", instance_double(Process::Status, success?: true)])
+
+        doctor.send(:check_rsc_react_version)
+
+        info_msgs = checker.messages.select { |m| m[:type] == :info }.map { |m| m[:content] }
+        expect(info_msgs).to include(a_string_including("Could not fetch react-on-rails-rsc dist-tags"))
+      end
+    end
+
+    describe "RSC npm range parsing" do
+      it "supports npm hyphen ranges" do
+        expect(doctor.send(:npm_range_satisfied?, "19.1.0", "19.0.0 - 19.2.0"))
+          .to be true
+        expect(doctor.send(:npm_range_satisfied?, "19.3.0", "19.0.0 - 19.2.0"))
+          .to be false
+      end
+
+      it "uses npm tilde upper bounds for single-component versions" do
+        expect(doctor.send(:npm_range_satisfied?, "1.9.0", "~1")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "2.0.0", "~1")).to be false
+      end
+
+      it "supports npm partial x-range upper bounds" do
+        expect(doctor.send(:npm_range_satisfied?, "19.2.7", "19.x")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "20.0.0", "19.x")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.7", "19.2")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "19.3.0", "19.2")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.7", "19.2.x")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "19.3.0", "19.2.x")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.3.0", "^19.2")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "20.0.0", "^19.2")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "0.0.5", "^0.0.x")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "0.1.0", "^0.0.x")).to be false
+      end
+
+      it "excludes prereleases unless the range names the same prerelease tuple" do
+        expect(doctor.send(:npm_range_satisfied?, "1.0.0", "*")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "1.0.0-rc.1", "*")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "1.0.0-rc.1", "x")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "1.0.0-rc.1", "~*")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", "^19.0.4")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", ">=19.0.4")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", "19.x")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", "19.0.4 - 20.0.0")).to be false
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", ">=19.2.1-rc.0 <20.0.0")).to be true
+        expect(doctor.send(:npm_range_satisfied?, "19.2.1-rc.4", "19.2.1-rc.0 - 20.0.0")).to be true
+      end
+    end
+
+    describe "installed package resolution" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "does not pass invalid package names to node resolution" do
+        allow(Open3).to receive(:capture3)
+
+        result = doctor.send(
+          :installed_package_json,
+          Dir.pwd,
+          "react'); require('child_process').execSync('echo unsafe'); require('react"
+        )
+
+        expect(result).to be_nil
+        expect(Open3).not_to have_received(:capture3)
+      end
+
+      it "rejects uppercase package names before node resolution" do
+        allow(Open3).to receive(:capture3)
+
+        result = doctor.send(:installed_package_json, Dir.pwd, "React")
+
+        expect(result).to be_nil
+        expect(Open3).not_to have_received(:capture3)
+      end
+
+      it "reports when node resolution fails before using the flat node_modules fallback" do
+        FileUtils.mkdir_p("node_modules/react")
+        File.write("node_modules/react/package.json", '{"version":"19.0.4"}')
+        allow(Open3).to receive(:capture3)
+          .and_return(
+            ["", "Cannot find module 'react/package.json'", instance_double(Process::Status, success?: false)]
+          )
+
+        result = doctor.send(:installed_package_json, Dir.pwd, "react")
+
+        expect(result.fetch("version")).to eq("19.0.4")
+        info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+        expect(info_messages).to include(a_string_including("Node module resolution failed for react"))
+      end
+    end
+
+    context "when React is installed in a configured nested JS workspace" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "uses the configured package root for node module resolution" do
+        package_root = File.join(Dir.pwd, "client")
+        FileUtils.mkdir_p("client")
+        File.write("client/package.json", '{"dependencies":{"react":"^19.2.0"}}')
+        FileUtils.mkdir_p("client/node_modules/react")
+        File.write("client/node_modules/react/package.json", '{"version":"19.2.7"}')
+        stub_package_root(package_root)
+        allow(Open3).to receive(:capture3)
+          .with(
+            "node",
+            "-e",
+            ReactOnRails::RscRspackSupport::NODE_PACKAGE_RESOLUTION_SCRIPT,
+            "react",
+            File.join(package_root, "node_modules"),
+            chdir: package_root
+          )
+          .and_return(
+            [
+              "#{File.join(package_root, 'node_modules/react/package.json')}\n",
+              "",
+              instance_double(Process::Status, success?: true)
+            ]
+          )
+
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("19.2.7") }).to be true
+      end
+
+      it "falls back to the declared React version in the nested package.json when node is unavailable" do
+        FileUtils.mkdir_p("client")
+        File.write("client/package.json", '{"dependencies":{"react":"19.2.7"}}')
+        stub_package_root(File.join(Dir.pwd, "client"))
+        allow(Open3).to receive(:capture3).and_return(
+          ["", "", instance_double(Process::Status, success?: false)]
+        )
+
+        doctor.send(:check_rsc_react_version)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("19.2.7") }).to be true
+      end
+
+      it "warns when the configured package root does not exist" do
+        stub_package_root(File.join(Dir.pwd, "client"))
+
+        doctor.send(:check_rsc_react_version)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("node_modules_location") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("does not exist") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("config/initializers/react_on_rails.rb") }).to be true
+        expect(warning_msgs.count { |m| m[:content].include?("node_modules_location") }).to eq(1)
+        expect(warning_msgs.any? { |m| m[:content].include?("all diagnostics that read from it are skipped") })
+          .to be true
+      end
+
+      it "warns when the configured package root exists without package.json" do
+        package_root = File.join(Dir.pwd, "client")
+        package_json_path = File.join(package_root, "package.json")
+        FileUtils.mkdir_p(package_root)
+        stub_package_root(package_root)
+        allow(Open3).to receive(:capture3).and_return(
+          ["", "", instance_double(Process::Status, success?: false)]
+        )
+
+        doctor.send(:check_rsc_react_version)
+
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("#{package_json_path} not found") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("declared React version") }).to be true
+        expect(warning_msgs.any? { |m| m[:content].include?("config/initializers/react_on_rails.rb") }).to be true
+      end
+    end
+
+    context "when React is not installed" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("package.json", '{"dependencies":{}}')
+            example.run
+          end
+        end
+      end
+
+      it "reports info and skips" do
+        doctor.send(:check_rsc_react_version)
+        info_msgs = checker.messages.select { |m| m[:type] == :info }
+        expect(info_msgs.any? { |m| m[:content].include?("Could not detect React version") }).to be true
+      end
+    end
+  end
+
+  describe "JSON output for RSC compatibility" do
+    let(:json_doctor) { described_class.new(format: :json) }
+    let(:checker) { json_doctor.instance_variable_get(:@checker) }
+    let(:pro_config) do
+      double(
+        "ProConfig",
+        enable_rsc_support: true,
+        server_renderer: "NodeRenderer",
+        rsc_bundle_js_file: "rsc-bundle.js",
+        rsc_payload_generation_url_path: "rsc_payload/"
+      )
+    end
+
+    around do |example|
+      previous_bundler = ENV.fetch("SHAKAPACKER_ASSETS_BUNDLER", nil)
+      ENV.delete("SHAKAPACKER_ASSETS_BUNDLER")
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) do
+          FileUtils.mkdir_p("config/webpack")
+          FileUtils.mkdir_p("config")
+          File.write("config/shakapacker.yml", "default:\n  assets_bundler: webpack\n")
+          File.write("config/routes.rb", "Rails.application.routes.draw do\n  rsc_payload_route\nend")
+          File.write("config/webpack/rscWebpackConfig.js", "{}")
+          File.write("Procfile.dev", "rsc-bundle: RSC_BUNDLE_ONLY=true bin/shakapacker --watch")
+          File.write(
+            "package.json",
+            JSON.generate(
+              "dependencies" => {
+                "react" => "19.0.7",
+                "react-dom" => "19.0.7",
+                "react-on-rails-rsc" => "19.2.1"
+              }
+            )
+          )
+          install_package("react", "version" => "19.0.7")
+          install_package("react-dom", "version" => "19.0.7")
+          install_package(
+            "react-on-rails-rsc",
+            "version" => "19.2.1",
+            "peerDependencies" => { "react" => "^19.2.7", "react-dom" => "^19.2.7" }
+          )
+          example.run
+        end
+      end
+    ensure
+      if previous_bundler.nil?
+        ENV.delete("SHAKAPACKER_ASSETS_BUNDLER")
+      else
+        ENV["SHAKAPACKER_ASSETS_BUNDLER"] = previous_bundler
+      end
+    end
+
+    before do
+      described_class::CHECK_SECTIONS.each do |section|
+        allow(json_doctor).to receive(section[:method])
+      end
+      allow(json_doctor).to receive(:check_rsc_setup).and_call_original
+      allow(json_doctor).to receive(:ensure_rails_environment_loaded)
+      allow(json_doctor).to receive(:resolved_package_root).and_return(Dir.pwd)
+      allow(ReactOnRails::Utils).to receive(:react_on_rails_pro?).and_return(true)
+      stub_const("ReactOnRailsPro", double("ReactOnRailsPro", configuration: pro_config))
+    end
+
+    it "includes RSC peer compatibility failures in the react_server_components check" do
+      output = []
+      allow(json_doctor).to receive(:exit)
+      allow(json_doctor).to receive(:puts) { |arg| output << arg.to_s }
+
+      json_doctor.run_diagnosis
+
+      report = JSON.parse(output.join("\n"))
+      rsc_check = report["checks"].find { |check| check["id"] == "react_server_components" }
+      expect(rsc_check["status"]).to eq("fail")
+      expect(rsc_check["message"]).to include("react-on-rails-rsc 19.2.1 requires react ^19.2.7")
+      expect(report["status"]).to eq("fail")
+    end
+  end
+
+  describe "check_rsc_procfile_watcher" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    context "when Procfile.dev contains RSC_BUNDLE_ONLY" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("Procfile.dev", "rsc-bundle: RSC_BUNDLE_ONLY=true bin/shakapacker --watch")
+            example.run
+          end
+        end
+      end
+
+      it "reports success" do
+        doctor.send(:check_rsc_procfile_watcher)
+        success_msgs = checker.messages.select { |m| m[:type] == :success }
+        expect(success_msgs.any? { |m| m[:content].include?("RSC bundle watcher") }).to be true
+      end
+    end
+
+    context "when RSC_BUNDLE_ONLY is commented out in Procfile.dev" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("Procfile.dev",
+                       "web: bin/rails server\n# rsc-bundle: RSC_BUNDLE_ONLY=true bin/shakapacker --watch")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning (does not count commented-out entry)" do
+        doctor.send(:check_rsc_procfile_watcher)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("RSC bundle watcher not found") }).to be true
+      end
+    end
+
+    context "when Procfile.dev exists but lacks RSC entry" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) do
+            File.write("Procfile.dev", "web: bin/rails server\nwebpack: bin/shakapacker-dev-server")
+            example.run
+          end
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_rsc_procfile_watcher)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("RSC bundle watcher not found") }).to be true
+      end
+    end
+
+    context "when Procfile.dev does not exist" do
+      around do |example|
+        Dir.mktmpdir do |tmpdir|
+          Dir.chdir(tmpdir) { example.run }
+        end
+      end
+
+      it "reports warning" do
+        doctor.send(:check_rsc_procfile_watcher)
+        warning_msgs = checker.messages.select { |m| m[:type] == :warning }
+        expect(warning_msgs.any? { |m| m[:content].include?("Procfile.dev not found") }).to be true
+      end
+    end
+  end
+
+  describe "check_rsc_client_manifest" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    before do
+      stub_const("ReactOnRailsPro", Module.new)
+      ReactOnRailsPro.const_set(:Utils, Module.new)
+      ReactOnRailsPro::Utils.define_singleton_method(:react_client_manifest_file_path) { nil }
+      allow(ReactOnRailsPro::Utils).to receive(:react_client_manifest_file_path)
+        .and_return(File.expand_path("public/packs/react-client-manifest.json"))
+    end
+
+    it "reports an info message when the installed Pro API is too old for manifest path resolution" do
+      stub_const("ReactOnRailsPro::Utils", Module.new)
+
+      doctor.send(:check_rsc_client_manifest)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(info_messages).to include(a_string_including("upgrade react-on-rails-pro to enable it"))
+      expect(warning_messages).not_to include(a_string_including("RSC client manifest path could not be resolved"))
+    end
+
+    it "warns when the installed Pro API resolves a nil manifest path" do
+      allow(ReactOnRailsPro::Utils).to receive(:react_client_manifest_file_path).and_return(nil)
+
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client manifest path could not be resolved"))
+    end
+
+    it "warns when the RSC client manifest resolves to a dev-server URL" do
+      allow(ReactOnRailsPro::Utils).to receive(:react_client_manifest_file_path)
+        .and_return("http://localhost:3035/packs/react-client-manifest.json")
+
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("dev-server URL"))
+      expect(info_messages).to include(a_string_including("bin/dev static"))
+    end
+
+    it "warns when the RSC client manifest file is missing" do
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client manifest not found"))
+      expect(info_messages).to include(a_string_including("bin/dev static"))
+    end
+
+    it "warns with rebuild guidance when the RSC client manifest is invalid JSON" do
+      FileUtils.mkdir_p("public/packs")
+      File.write("public/packs/react-client-manifest.json", "{not-json")
+
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client manifest is not valid JSON"))
+      expect(info_messages).to include(a_string_including("bin/dev static"))
+      expect(info_messages).to include(a_string_including("public/packs"))
+    end
+
+    it "warns when the RSC client manifest is missing client reference metadata" do
+      FileUtils.mkdir_p("public/packs")
+      File.write(
+        "public/packs/react-client-manifest.json",
+        JSON.generate("moduleLoading" => { "prefix" => "", "crossOrigin" => nil })
+      )
+
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("RSC client manifest is missing filePathToModuleMetadata")
+      )
+    end
+
+    it "warns when the RSC client manifest has no client reference metadata" do
+      FileUtils.mkdir_p("public/packs")
+      File.write(
+        "public/packs/react-client-manifest.json",
+        JSON.generate("moduleLoading" => { "prefix" => "", "crossOrigin" => nil }, "filePathToModuleMetadata" => {})
+      )
+
+      doctor.send(:check_rsc_client_manifest)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("RSC client manifest has no client reference metadata")
+      )
+      expect(info_messages).to include(a_string_including("bin/dev static"))
+      expect(info_messages).to include(a_string_including("public/packs"))
+      expect(info_messages).to include(a_string_including("ssr-generated"))
+      expect(info_messages).to include(a_string_including(".node-renderer-bundles"))
+    end
+
+    it "reports success when the RSC client manifest has client reference metadata" do
+      FileUtils.mkdir_p("public/packs")
+      File.write(
+        "public/packs/react-client-manifest.json",
+        JSON.generate(
+          "filePathToModuleMetadata" => {
+            "/app/client/Button.jsx" => { "id" => "Button", "chunks" => [], "name" => "default" }
+          }
+        )
+      )
+
+      doctor.send(:check_rsc_client_manifest)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("RSC client manifest includes 1 client reference"))
+      expect(checker.messages.none? { |msg| msg[:type] == :warning }).to be true
+    end
+  end
+
+  describe "check_rsc_artifacts" do
+    let(:doctor) { described_class.new(verbose: false, fix: false) }
+    let(:checker) { doctor.instance_variable_get(:@checker) }
+
+    around do |example|
+      Dir.mktmpdir do |tmpdir|
+        Dir.chdir(tmpdir) { example.run }
+      end
+    end
+
+    before do
+      allow(Rails).to receive(:root).and_return(Pathname.new(Dir.pwd))
+      stub_const("ReactOnRailsPro", Module.new)
+      ReactOnRailsPro.const_set(:Utils, Module.new)
+      ReactOnRailsPro::Utils.define_singleton_method(:rsc_bundle_js_file_path) { nil }
+      ReactOnRailsPro::Utils.define_singleton_method(:react_server_client_manifest_file_path) { nil }
+      allow(ReactOnRailsPro::Utils).to receive_messages(
+        rsc_bundle_js_file_path: File.expand_path("ssr-generated/rsc-bundle.js"),
+        react_server_client_manifest_file_path: File.expand_path("ssr-generated/react-server-client-manifest.json")
+      )
+      allow(ReactOnRails::PackerUtils).to receive(:packer_source_entry_path).and_return("app/javascript/packs")
+    end
+
+    def write_rsc_discovery_support_files(bundler: "webpack")
+      config_dir = "config/#{bundler}"
+      FileUtils.mkdir_p(config_dir)
+      FileUtils.mkdir_p("bin")
+      File.write("#{config_dir}/rscWebpackConfig.js", "RSC_REFERENCE_DISCOVERY_BUILD RSCReferenceDiscoveryPlugin")
+      File.write(
+        "bin/shakapacker-precompile-hook",
+        "generate_rsc_manifest_client_references_if_needed RSC_REFERENCE_DISCOVERY_BUILD"
+      )
+    end
+
+    it "uses the client-reference discovery fallback when the registration entry is absent" do
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC bundle not found"))
+      expect(warning_messages).to include(a_string_including("RSC server client manifest not found"))
+      expect(warning_messages).not_to include(a_string_including("RSC client references manifest not found"))
+      expect(info_messages).to include(a_string_including("broad client-reference discovery fallback"))
+    end
+
+    it "warns when a configured RSC registration entry path is invalid" do
+      previous_entry_path = ENV.fetch(described_class::RSC_REGISTRATION_ENTRY_PATH_ENV, nil)
+      ENV[described_class::RSC_REGISTRATION_ENTRY_PATH_ENV] = "missing-registration-entry.js"
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("#{described_class::RSC_REGISTRATION_ENTRY_PATH_ENV}=\"missing-registration-entry.js\"")
+      )
+      expect(warning_messages).to include(a_string_including("falling back to default discovery"))
+    ensure
+      if previous_entry_path.nil?
+        ENV.delete(described_class::RSC_REGISTRATION_ENTRY_PATH_ENV)
+      else
+        ENV[described_class::RSC_REGISTRATION_ENTRY_PATH_ENV] = previous_entry_path
+      end
+    end
+
+    it "skips direct artifact checks when Pro path utilities are unavailable" do
+      hide_const("ReactOnRailsPro::Utils")
+
+      doctor.send(:check_rsc_artifacts)
+
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(info_messages).to include(a_string_including("RSC artifact checks skipped"))
+    end
+
+    it "warns when the RSC client references manifest is missing and generated configs support discovery" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+      write_rsc_discovery_support_files
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+    end
+
+    it "resolves relative RSC discovery paths from Rails.root when invoked from a subdirectory" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+      write_rsc_discovery_support_files
+      FileUtils.mkdir_p("tmp/subdir")
+
+      Dir.chdir("tmp/subdir") { doctor.send(:check_rsc_artifacts) }
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+    end
+
+    it "does not treat a blank Shakapacker source entry path as ./generated" do
+      allow(ReactOnRails::PackerUtils).to receive(:packer_source_entry_path).and_return("")
+      FileUtils.mkdir_p("generated")
+      File.write("generated/server-component-registration-entry.js", "// wrong default when source_entry_path is blank")
+      write_rsc_discovery_support_files
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).not_to include(a_string_including("RSC client references manifest not found"))
+      expect(info_messages).to include(a_string_including("broad client-reference discovery fallback"))
+    end
+
+    it "warns when the Rspack RSC config supports manifest discovery and the manifest is missing" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+      write_rsc_discovery_support_files(bundler: "rspack")
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+    end
+
+    it "warns when RSC discovery support files exist but cannot be read" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+      write_rsc_discovery_support_files
+      config_path = File.expand_path("config/webpack/rscWebpackConfig.js", Dir.pwd)
+      allow(File).to receive(:read).and_call_original
+      allow(File).to receive(:read).with(config_path).and_raise(Errno::EACCES, "Permission denied")
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("Could not read config/webpack/rscWebpackConfig.js during RSC discovery check")
+      )
+    end
+
+    it "warns with generator guidance when missing manifest discovery support requires broad fallback" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("does not support manifest discovery yet"))
+      expect(warning_messages).to include(a_string_including("broad client-reference discovery fallback"))
+      expect(info_messages).to include(a_string_including("rails g react_on_rails:rsc"))
+    end
+
+    it "warns when a configured RSC client references manifest is missing" do
+      previous_manifest_path = ENV.fetch(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV, nil)
+      ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = "missing-rsc-client-references.json"
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+      expect(info_messages).not_to include(a_string_including("broad client-reference discovery fallback"))
+    ensure
+      if previous_manifest_path.nil?
+        ENV.delete(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV)
+      else
+        ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = previous_manifest_path
+      end
+    end
+
+    it "names the configured RSC client references manifest env var when the path is missing" do
+      previous_manifest_path = ENV.fetch(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV, nil)
+      ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = "true"
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("#{described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV}=\"true\"")
+      )
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+    ensure
+      if previous_manifest_path.nil?
+        ENV.delete(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV)
+      else
+        ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = previous_manifest_path
+      end
+    end
+
+    it "reports success when the RSC bundle, server manifest, and client references manifest exist" do
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("ssr-generated/rsc-bundle.js", "// RSC bundle")
+      File.write("ssr-generated/react-server-client-manifest.json", JSON.generate("module" => {}))
+      File.write("ssr-generated/rsc-client-references.json", JSON.generate("refs" => []))
+
+      doctor.send(:check_rsc_artifacts)
+
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(success_messages).to include(a_string_including("RSC bundle exists"))
+      expect(success_messages).to include(a_string_including("RSC server client manifest exists"))
+      expect(success_messages).to include(a_string_including("RSC client references manifest includes 0 refs"))
+      expect(checker.messages.none? { |msg| msg[:type] == :warning }).to be true
+    end
+
+    it "warns when the RSC client references manifest is older than the registration entry" do
+      FileUtils.mkdir_p("app/javascript/generated")
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("app/javascript/generated/server-component-registration-entry.js", "// registration entry")
+      File.write("ssr-generated/rsc-client-references.json", JSON.generate("refs" => []))
+      File.utime(Time.now - 120, Time.now - 120, "ssr-generated/rsc-client-references.json")
+      File.utime(Time.now, Time.now, "app/javascript/generated/server-component-registration-entry.js")
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      success_messages = checker.messages.select { |msg| msg[:type] == :success }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("older than the server component registration entry"))
+      expect(success_messages).not_to include(a_string_including("RSC client references manifest includes"))
+      expect(info_messages).to include(a_string_including("bin/shakapacker-precompile-hook"))
+    end
+
+    it "warns when JSON RSC artifacts cannot be parsed or have the wrong shape" do
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("ssr-generated/rsc-bundle.js", "// RSC bundle")
+      File.write("ssr-generated/react-server-client-manifest.json", "{not-json")
+      File.write("ssr-generated/rsc-client-references.json", JSON.generate("refs" => {}))
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("RSC server client manifest is not valid JSON"))
+      expect(warning_messages).to include(
+        a_string_including("RSC client references manifest must contain a refs array")
+      )
+    end
+
+    it "continues client-reference diagnostics when the server manifest cannot be read" do
+      previous_manifest_path = ENV.fetch(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV, nil)
+      ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = "missing-rsc-client-references.json"
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("ssr-generated/rsc-bundle.js", "// RSC bundle")
+      File.write("ssr-generated/react-server-client-manifest.json", JSON.generate("module" => {}))
+      server_manifest_path = File.expand_path("ssr-generated/react-server-client-manifest.json")
+      allow(File).to receive(:read).and_call_original
+      allow(File).to receive(:read).with(server_manifest_path).and_raise(Errno::EACCES, "Permission denied")
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Could not read RSC server client manifest"))
+      expect(warning_messages).to include(a_string_including("RSC client references manifest not found"))
+    ensure
+      if previous_manifest_path.nil?
+        ENV.delete(described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV)
+      else
+        ENV[described_class::RSC_CLIENT_REFERENCES_MANIFEST_ENV] = previous_manifest_path
+      end
+    end
+
+    it "does not add rebuild guidance when a JSON artifact exists but cannot be read" do
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("ssr-generated/react-server-client-manifest.json", JSON.generate("module" => {}))
+      server_manifest_path = File.expand_path("ssr-generated/react-server-client-manifest.json")
+      allow(File).to receive(:read).and_call_original
+      allow(File).to receive(:read).with(server_manifest_path).and_raise(Errno::EACCES, "Permission denied")
+
+      doctor.send(:report_rsc_json_artifact, "RSC server client manifest", server_manifest_path)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      info_messages = checker.messages.select { |msg| msg[:type] == :info }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(a_string_including("Could not read RSC server client manifest"))
+      expect(info_messages).not_to include(a_string_including("Re-run bin/shakapacker-precompile-hook"))
+    end
+
+    it "warns clearly when the RSC client references manifest is a JSON array" do
+      FileUtils.mkdir_p("ssr-generated")
+      File.write("ssr-generated/rsc-bundle.js", "// RSC bundle")
+      File.write("ssr-generated/react-server-client-manifest.json", JSON.generate("module" => {}))
+      File.write("ssr-generated/rsc-client-references.json", JSON.generate([]))
+
+      doctor.send(:check_rsc_artifacts)
+
+      warning_messages = checker.messages.select { |msg| msg[:type] == :warning }.map { |msg| msg[:content] }
+      expect(warning_messages).to include(
+        a_string_including("RSC client references manifest must contain a refs array")
+      )
+      expect(warning_messages).not_to include(a_string_including("no implicit conversion of String into Integer"))
+    end
+  end
+  # rubocop:enable RSpec/VerifiedDoubles
+end

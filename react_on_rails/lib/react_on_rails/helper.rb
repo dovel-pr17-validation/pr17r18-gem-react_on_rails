@@ -1,0 +1,1079 @@
+# frozen_string_literal: true
+
+# rubocop:disable Metrics/ModuleLength
+# rubocop:disable Metrics/MethodLength
+# NOTE:
+# For any heredoc JS:
+# 1. The white spacing in this file matters!
+# 2. Keep all #{some_var} fully to the left so that all indentation is done evenly in that var
+require "react_on_rails/prerender_error"
+require "react_on_rails/json_parse_error"
+require "react_on_rails/smart_error"
+require "addressable/uri"
+require "react_on_rails/utils"
+require "react_on_rails/json_output"
+require "active_support/concern"
+require "react_on_rails/pro_helper"
+require "react_on_rails/font_helper"
+
+module ReactOnRails
+  module Helper
+    include ReactOnRails::Utils::Required
+    include ReactOnRails::ProHelper
+    include ReactOnRails::FontHelper
+
+    COMPONENT_HTML_KEY = "componentHtml"
+    IMMEDIATE_HYDRATION_WARNING_MUTEX = Mutex.new
+
+    class << self
+      def warn_removed_immediate_hydration_option(helper_name)
+        should_warn = IMMEDIATE_HYDRATION_WARNING_MUTEX.synchronize do
+          @removed_immediate_hydration_warnings ||= {}
+          next false if @removed_immediate_hydration_warnings[helper_name]
+
+          @removed_immediate_hydration_warnings[helper_name] = true
+        end
+
+        return unless should_warn
+
+        Rails.logger.warn(
+          "[React on Rails] `immediate_hydration:` is no longer supported on #{helper_name}. Remove this option."
+        )
+      end
+
+      # :nodoc:
+      def reset_removed_immediate_hydration_warnings!
+        IMMEDIATE_HYDRATION_WARNING_MUTEX.synchronize do
+          @removed_immediate_hydration_warnings = {}
+        end
+      end
+
+      # Validates the **rest kwargs accepted by both redux_store implementations
+      # (controller concern and view helper). Raises ArgumentError for unknown
+      # keywords and warns once if the removed :immediate_hydration option is passed.
+      def validate_redux_store_options!(rest)
+        unknown_keys = rest.keys - [:immediate_hydration]
+        if unknown_keys.any?
+          plural = unknown_keys.one? ? "" : "s"
+          unknown_options = unknown_keys.map { |key| ":#{key}" }.join(", ")
+          raise ArgumentError, "unknown keyword#{plural}: #{unknown_options}"
+        end
+
+        warn_removed_immediate_hydration_option("redux_store") if rest.key?(:immediate_hydration)
+      end
+    end
+
+    # react_component_name: can be a React function or class component or a "Render-Function".
+    # "Render-Functions" differ from a React function in that they take two parameters, the
+    #   props and the railsContext, like this:
+    #
+    #   let MyReactComponentApp = (props, railsContext) => <MyReactComponent {...props}/>;
+    #
+    #   Alternately, you can define the Render-Function with an additional property
+    #   `.renderFunction = true`:
+    #
+    #   let MyReactComponentApp = (props) => <MyReactComponent {...props}/>;
+    #   MyReactComponent.renderFunction = true;
+    #
+    #   Exposing the react_component_name is necessary to both a plain ReactComponent as well as
+    #     a generator:
+    #   See README.md for how to "register" your React components.
+    #   See spec/dummy/client/app/packs/server-bundle.ts and
+    #     spec/dummy/client/app/packs/client-bundle.ts for examples of this.
+    #
+    # options:
+    #   props: Ruby Hash or JSON string which contains the properties to pass to the react object. Do
+    #      not pass any props if you are separately initializing the store by the `redux_store` helper.
+    #   prerender: <true/false> set to false when debugging!
+    #   id: You can optionally set the id, or else a unique one is automatically generated.
+    #   html_options: You can set other html attributes that will go on this component
+    #   trace: <true/false> set to true to print additional debugging information in the browser
+    #          default is true for development, off otherwise
+    #   replay_console: <true/false> Default is true. False will disable echoing server rendering
+    #                   logs to browser. While this can make troubleshooting server rendering difficult,
+    #                   so long as you have the default configuration of logging_on_server set to
+    #                   true, you'll still see the errors on the server.
+    #   raise_on_prerender_error: <true/false> Default to false. True will raise exception on server
+    #      if the JS code throws
+    # Any other options are passed to the content tag, including the id.
+    # random_dom_id can be set to override the default from the config/initializers. That's only
+    # used if you have multiple instance of the same component on the Rails view.
+    def react_component(component_name, options = {})
+      if options.key?(:immediate_hydration)
+        ReactOnRails::Helper.warn_removed_immediate_hydration_option("react_component")
+        options.delete(:immediate_hydration)
+      end
+
+      internal_result = internal_react_component(component_name, options)
+      server_rendered_html = internal_result[:result]["html"]
+      console_script = internal_result[:result]["consoleReplayScript"]
+      render_options = internal_result[:render_options]
+
+      case server_rendered_html
+      when String
+        html = build_react_component_result_for_server_rendered_string(
+          server_rendered_html:,
+          component_specification_tag: internal_result[:tag],
+          console_script:,
+          render_options:
+        )
+        html.html_safe
+      when Hash
+        msg = <<~MSG
+          Use react_component_hash (not react_component) to return a Hash to your ruby view code. See
+          https://github.com/shakacode/react_on_rails/blob/main/react_on_rails/spec/dummy/client/app/startup/ReactHelmetApp.server.tsx
+          for an example of the necessary javascript configuration.
+        MSG
+        raise ReactOnRails::Error, msg
+      else
+        class_name = server_rendered_html.class.name
+        msg = <<~MSG
+          ReactOnRails: server_rendered_html is expected to be a String or Hash for #{component_name}.
+          Type is #{class_name}
+          Value:
+          #{server_rendered_html}
+
+          If you're trying to use a Render-Function to return a Hash to your ruby view code, then use
+          react_component_hash instead of react_component and see
+          https://github.com/shakacode/react_on_rails/blob/main/react_on_rails/spec/dummy/client/app/startup/ReactHelmetApp.server.tsx
+          for an example of the JavaScript code.
+        MSG
+        raise ReactOnRails::Error, msg
+      end
+    end
+
+    # react_component_hash is used to return multiple HTML strings for server rendering, such as for
+    # adding meta-tags to a page.
+    # It is exactly like react_component except for the following:
+    # 1. prerender: true is automatically added, as this method doesn't make sense for client only
+    #    rendering.
+    # 2. Your JavaScript Render-Function for server rendering must return an Object rather than a React component.
+    # 3. Your view code must expect an object and not a string.
+    #
+    # Here is an example of the view code:
+    #    <% react_helmet_app = react_component_hash("ReactHelmetApp", prerender: true,
+    #                                               props: { helloWorldData: { name: "Mr. Server Side Rendering"}},
+    #                                               id: "react-helmet-0", trace: true) %>
+    #    <% content_for :title do %>
+    #      <%= react_helmet_app['title'] %>
+    #    <% end %>
+    #    <%= react_helmet_app["componentHtml"] %>
+    #
+    def react_component_hash(component_name, options = {})
+      if options.key?(:immediate_hydration)
+        ReactOnRails::Helper.warn_removed_immediate_hydration_option("react_component_hash")
+        options.delete(:immediate_hydration)
+      end
+
+      options[:prerender] = true
+
+      internal_result = internal_react_component(component_name, options)
+      server_rendered_html = internal_result[:result]["html"]
+      console_script = internal_result[:result]["consoleReplayScript"]
+      render_options = internal_result[:render_options]
+
+      if server_rendered_html.is_a?(String) && internal_result[:result]["hasErrors"]
+        server_rendered_html = { COMPONENT_HTML_KEY => internal_result[:result]["html"] }
+      end
+
+      if server_rendered_html.is_a?(Hash)
+        build_react_component_result_for_server_rendered_hash(
+          server_rendered_html:,
+          component_specification_tag: internal_result[:tag],
+          console_script:,
+          render_options:
+        )
+
+      else
+        msg = <<~MSG
+          Render-Function used by react_component_hash for #{component_name} is expected to return
+          an Object. See https://github.com/shakacode/react_on_rails/blob/main/react_on_rails/spec/dummy/client/app/startup/ReactHelmetApp.server.tsx
+          for an example of the JavaScript code.
+          Note, your Render-Function must either take 2 params or have the property
+          `.renderFunction = true` added to it to distinguish it from a React Function Component.
+        MSG
+        raise ReactOnRails::Error, msg
+      end
+    end
+
+    # Separate initialization of store from react_component allows multiple react_component calls to
+    # use the same Redux store.
+    #
+    # NOTE: This technique not recommended as it prevents dynamic code splitting for performance.
+    # Instead, you should use the standard react_component view helper.
+    #
+    # store_name: name of the store, corresponding to your call to ReactOnRails.registerStores in your
+    #             JavaScript code. When using auto-bundling, this should match the filename of your
+    #             store file (e.g., "commentsStore" for commentsStore.js).
+    # props: Ruby Hash or JSON string which contains the properties to pass to the redux store.
+    # Options
+    #    defer: false -- pass as true if you wish to render this below your component.
+    #    auto_load_bundle: nil -- If true, automatically loads the generated pack for this store.
+    #                      Defaults to ReactOnRails.configuration.auto_load_bundle if not specified.
+    #                      Requires config.stores_subdirectory to be set (e.g., "ror_stores").
+    #                      Store files should be placed in directories matching this name, e.g.:
+    #                        app/javascript/bundles/ror_stores/commentsStore.js
+    #                      The store file must export default a store generator function.
+    def redux_store(store_name, props: {}, defer: false, auto_load_bundle: nil, **rest)
+      ReactOnRails::Helper.validate_redux_store_options!(rest)
+
+      # Auto-load store pack if configured
+      should_auto_load = auto_load_bundle.nil? ? ReactOnRails.configuration.auto_load_bundle : auto_load_bundle
+      load_pack_for_generated_store(store_name, explicit_auto_load: auto_load_bundle == true) if should_auto_load
+
+      redux_store_data = { store_name:,
+                           props: }
+      if defer
+        registered_stores_defer_render << redux_store_data
+        "YOU SHOULD NOT SEE THIS ON YOUR VIEW -- Uses as a code block, like <% redux_store %> " \
+          "and not <%= redux store %>"
+      else
+        registered_stores << redux_store_data
+        result = render_redux_store_data(redux_store_data)
+        prepend_render_rails_context(result).html_safe
+      end
+    end
+
+    # Place this view helper (no parameters) at the end of your shared layout. This tell
+    # ReactOnRails where to client render the redux store hydration data. Since we're going
+    # to be setting up the stores in the controllers, we need to know where on the view to put the
+    # client side rendering of this hydration data, which is a hidden div with a matching class
+    # that contains a data props.
+    def redux_store_hydration_data
+      return if registered_stores_defer_render.blank?
+
+      registered_stores_defer_render.reduce(+"") do |accum, redux_store_data|
+        accum << render_redux_store_data(redux_store_data)
+      end.html_safe
+    end
+
+    def react_on_rails_preload_links(*component_names)
+      ReactOnRails::PackerUtils.raise_nested_entries_disabled unless ReactOnRails::PackerUtils.nested_entries?
+
+      pack_names = component_names.flatten.compact.map do |component_name|
+        generated_component_pack_name(component_name)
+      end
+
+      sources = pack_names.flat_map { |pack_name| preload_sources_for_generated_pack(pack_name) }
+      links = unique_preload_sources_by_href(sources).map { |source| preload_link_for_source(source) }
+      safe_join(links, "\n")
+    end
+
+    def sanitized_props_string(props)
+      ReactOnRails::JsonOutput.escape(props.is_a?(String) ? props : props.to_json)
+    end
+
+    # Helper method to take javascript expression and returns the output from evaluating it.
+    # If you have more than one line that needs to be executed, wrap it in an IIFE.
+    # JS exceptions are caught and console messages are handled properly.
+    # Options include:{ prerender:, trace:, raise_on_prerender_error:, throw_js_errors: }
+    def server_render_js(js_expression, options = {})
+      render_options = ReactOnRails::ReactComponent::RenderOptions
+                       .new(react_component_name: "generic-js", options:)
+
+      js_code = <<~JS
+        (function() {
+          var htmlResult = '';
+          var hasErrors = false;
+          var renderingError = null;
+          var renderingErrorObject = null;
+
+          try {
+            htmlResult =
+              (function() {
+                return #{js_expression};
+              })();
+          } catch(e) {
+            renderingError = e;
+            if (#{render_options.throw_js_errors}) {
+              throw e;
+            }
+            htmlResult = ReactOnRails.handleError({e: e, name: null,
+              jsCode: '#{escape_javascript(js_expression)}', serverSide: true});
+            hasErrors = true;
+            var errorMessage = String(renderingError);
+            var errorStack = null;
+            // Guard against non-Error throws (e.g., throw null / throw "string").
+            // Boxed primitives (for example new Boolean(false)) are objects too.
+            if (renderingError && typeof renderingError === 'object') {
+              if ('message' in renderingError) {
+                errorMessage = String(renderingError.message);
+              }
+              // Use != (not !==) to guard both null and undefined stack values.
+              if ('stack' in renderingError && renderingError.stack != null) {
+                errorStack = String(renderingError.stack);
+              }
+            }
+            renderingErrorObject = {
+              message: errorMessage,
+              stack: errorStack,
+            };
+          }
+
+          var consoleReplayScript = ReactOnRails.getConsoleReplayScript();
+          return ReactOnRails.prepareRenderResult(htmlResult, consoleReplayScript, hasErrors, renderingErrorObject);
+        })()
+      JS
+
+      result = ReactOnRails::ServerRenderingPool
+               .server_render_js_with_console_logging(js_code, render_options)
+
+      html = result["html"]
+      console_script = result["consoleReplayScript"]
+      console_script_tag = wrap_console_script_with_nonce(console_script) if render_options.replay_console
+      raw("#{html}#{console_script_tag}")
+    rescue ExecJS::ProgramError => err
+      raise ReactOnRails::PrerenderError.new(component_name: "N/A (server_render_js called)",
+                                             err:,
+                                             js_code:)
+    end
+
+    def json_safe_and_pretty(hash_or_string)
+      return "{}" if hash_or_string.nil?
+
+      unless hash_or_string.is_a?(String) || hash_or_string.is_a?(Hash)
+        raise ReactOnRails::Error, "#{__method__} only accepts String or Hash as argument " \
+                                   "(#{hash_or_string.class} given)."
+      end
+
+      json_value = hash_or_string.is_a?(String) ? hash_or_string : hash_or_string.to_json
+
+      ReactOnRails::JsonOutput.escape(json_value)
+    end
+
+    # This is the definitive list of the default values used for the rails_context, which is the
+    # second parameter passed to both component and store Render-Functions.
+    # This method can be called from views and from the controller, as `helpers.rails_context`
+    #
+    # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity
+    def rails_context(server_side: true)
+      # ALERT: Keep in sync with packages/react-on-rails/src/types/index.ts for the properties of RailsContext
+      @rails_context ||= begin
+        result = {
+          componentRegistryTimeout: ReactOnRails.configuration.component_registry_timeout,
+          railsEnv: Rails.env,
+          inMailer: in_mailer?,
+          # Locale settings
+          i18nLocale: I18n.locale,
+          i18nDefaultLocale: I18n.default_locale,
+          rorVersion: ReactOnRails::VERSION,
+          # TODO: v13 just use the version if existing
+          # Pro gem availability signal (not license-valid state).
+          rorPro: ReactOnRails::Utils.react_on_rails_pro?
+        }
+
+        if ReactOnRails::Utils.react_on_rails_pro?
+          result[:rorProVersion] = ReactOnRails::Utils.react_on_rails_pro_version
+
+          if ReactOnRails::Utils.rsc_support_enabled?
+            rsc_payload_url = ReactOnRailsPro.configuration.rsc_payload_generation_url_path
+            result[:rscPayloadGenerationUrlPath] = rsc_payload_url
+          end
+        end
+
+        add_csp_nonce_to_context(result)
+
+        if defined?(request) && request.present?
+          # Check for encoding of the request's original_url and try to force-encoding the
+          # URLs as UTF-8. This situation can occur in browsers that do not encode the
+          # entire URL as UTF-8 already, mostly on the Windows platform (IE11 and lower).
+          original_url_normalized = request.original_url
+          if original_url_normalized.encoding == Encoding::BINARY
+            original_url_normalized = original_url_normalized.force_encoding(Encoding::ISO_8859_1)
+                                                             .encode(Encoding::UTF_8)
+          end
+
+          # Using Addressable instead of standard URI to better deal with
+          # non-ASCII characters (see https://github.com/shakacode/react_on_rails/pull/405)
+          uri = Addressable::URI.parse(original_url_normalized)
+          # uri = Addressable::URI.parse("http://foo.com:3000/posts?id=30&limit=5#time=1305298413")
+
+          result.merge!(
+            # URL settings
+            href: uri.to_s,
+            location: "#{uri.path}#{"?#{uri.query}" if uri.query.present?}",
+            scheme: uri.scheme, # http
+            host: uri.host, # foo.com
+            port: uri.port,
+            pathname: uri.path, # /posts
+            search: uri.query, # id=30&limit=5
+            httpAcceptLanguage: request.env["HTTP_ACCEPT_LANGUAGE"]
+          )
+        end
+        if ReactOnRails.configuration.rendering_extension
+          custom_context = ReactOnRails.configuration.rendering_extension.custom_context(self)
+          result.merge!(custom_context) if custom_context
+        end
+        result
+      end
+
+      context = @rails_context.merge(serverSide: server_side)
+      add_rsc_stream_observability_to_context(context)
+      context
+    end
+
+    # Set by ReactOnRailsPro::Stream#initialize_rsc_stream_observability_state.
+    # Keep this ivar name in sync with the Pro stream concern.
+    def add_rsc_stream_observability_to_context(context)
+      return unless defined?(@react_on_rails_rsc_stream_observability) &&
+                    @react_on_rails_rsc_stream_observability
+
+      context[:rscStreamObservability] = true
+    end
+
+    # Set by ReactOnRailsPro::Stream#initialize_rsc_stream_observability_state.
+    # Keep this ivar name in sync with the Pro stream concern.
+    def add_rsc_stream_observability_to_render_options(render_options)
+      return unless render_options.streaming?
+      return unless defined?(@react_on_rails_rsc_stream_observability) &&
+                    @react_on_rails_rsc_stream_observability
+
+      render_options.set_option(:rsc_stream_observability, true)
+    end
+
+    def add_csp_nonce_to_context(result)
+      nonce = csp_nonce
+      result[:cspNonce] = nonce if nonce.present?
+    end
+
+    def load_pack_for_generated_component(_react_component_name, render_options)
+      return unless render_options.auto_load_bundle
+
+      ReactOnRails::PackerUtils.raise_nested_entries_disabled unless ReactOnRails::PackerUtils.nested_entries?
+      generated_component_name = render_options.react_component_name
+      if Rails.env.development?
+        is_component_pack_present = File.exist?(generated_components_pack_path(generated_component_name))
+        raise_missing_autoloaded_bundle(generated_component_name) unless is_component_pack_present
+      end
+
+      options = { defer: ReactOnRails.configuration.generated_component_packs_loading_strategy == :defer }
+      # Old versions of Shakapacker don't support async script tags.
+      # ReactOnRails.configure already validates if async loading is supported by the installed Shakapacker version.
+      # Therefore, we only need to pass the async option if the loading strategy is explicitly set to :async
+      options[:async] = true if ReactOnRails.configuration.generated_component_packs_loading_strategy == :async
+      append_javascript_pack_tag("generated/#{generated_component_name}", **options)
+      append_stylesheet_pack_tag("generated/#{generated_component_name}")
+    end
+
+    def load_pack_for_generated_store(store_name, explicit_auto_load: false)
+      unless ReactOnRails.configuration.stores_subdirectory.present?
+        if explicit_auto_load
+          raise ReactOnRails::SmartError.new(
+            error_type: :configuration_error,
+            details: "auto_load_bundle is enabled for store " \
+                     "'#{store_name}', but " \
+                     "stores_subdirectory is not configured. " \
+                     "Set config.stores_subdirectory (e.g., " \
+                     "'ror_stores') in your ReactOnRails " \
+                     "configuration so that store packs can " \
+                     "be generated and loaded."
+          )
+        end
+        return
+      end
+
+      ReactOnRails::PackerUtils.raise_nested_entries_disabled unless ReactOnRails::PackerUtils.nested_entries?
+      if Rails.env.development?
+        is_store_pack_present = File.exist?(generated_stores_pack_path(store_name))
+        raise_missing_autoloaded_store_bundle(store_name) unless is_store_pack_present
+      end
+
+      options = { defer: ReactOnRails.configuration.generated_component_packs_loading_strategy == :defer }
+      options[:async] = true if ReactOnRails.configuration.generated_component_packs_loading_strategy == :async
+      append_javascript_pack_tag("generated/#{store_name}", **options)
+    end
+
+    # rubocop:enable Metrics/AbcSize, Metrics/CyclomaticComplexity
+
+    def registered_stores
+      @registered_stores ||= []
+    end
+
+    def registered_stores_defer_render
+      @registered_stores_defer_render ||= []
+    end
+
+    def registered_stores_including_deferred
+      registered_stores + registered_stores_defer_render
+    end
+
+    def create_render_options(react_component_name, options)
+      options = options.dup
+      # If no store dependencies are passed, default to all registered stores up till now
+      unless options.key?(:store_dependencies)
+        store_dependencies = registered_stores_including_deferred.map { |store| store[:store_name] }
+        options = options.merge(store_dependencies: store_dependencies.presence)
+      end
+      render_options = ReactOnRails::ReactComponent::RenderOptions.new(react_component_name:,
+                                                                       options:)
+      add_rsc_stream_observability_to_render_options(render_options)
+      render_options
+    end
+
+    def generated_components_pack_path(component_name)
+      "#{ReactOnRails::PackerUtils.packer_source_entry_path}/generated/#{component_name}.js"
+    end
+
+    def generated_stores_pack_path(store_name)
+      "#{ReactOnRails::PackerUtils.packer_source_entry_path}/generated/#{store_name}.js"
+    end
+
+    def generated_component_pack_name(component_name)
+      component_name = component_name.to_s
+      component_name = component_name.delete_prefix("generated/")
+
+      unless component_name.match?(/\A[A-Za-z0-9_]+\z/)
+        raise ArgumentError,
+              "react_on_rails_preload_links component names must use PascalCase, camelCase, or snake_case " \
+              "without hyphens: #{component_name.inspect}"
+      end
+
+      "generated/#{component_name.camelize}"
+    end
+
+    def preload_sources_for_generated_pack(pack_name)
+      preload_sources_for_javascript_pack(pack_name) + preload_sources_for_stylesheet_pack(pack_name)
+    end
+
+    def preload_sources_for_javascript_pack(pack_name)
+      preload_sources_for_pack(pack_name, type: :javascript, required: true).map do |source|
+        { source:, source_type: :javascript }
+      end
+    end
+
+    def preload_sources_for_stylesheet_pack(pack_name)
+      preload_sources_for_pack(pack_name, type: :stylesheet, required: false).map do |source|
+        { source:, source_type: :stylesheet }
+      end
+    end
+
+    def preload_sources_for_pack(pack_name, type:, required:)
+      manifest = current_shakapacker_instance.manifest
+      sources = if required
+                  manifest.lookup_pack_with_chunks!(pack_name, type:)
+                else
+                  manifest.lookup_pack_with_chunks(pack_name, type:)
+                end
+      Array(sources).compact
+    end
+
+    def current_shakapacker_instance
+      ::Shakapacker.instance
+    end
+
+    def unique_preload_sources_by_href(sources)
+      seen_hrefs = {}
+      sources.filter_map do |source|
+        href = preload_source_path(source.fetch(:source))
+        next if seen_hrefs.key?(href)
+
+        seen_hrefs[href] = true
+        source.merge(href:)
+      end
+    end
+
+    def preload_link_for_source(source)
+      case source.fetch(:source_type)
+      when :javascript
+        preload_link_for_javascript_source(source.fetch(:source), href: source.fetch(:href))
+      when :stylesheet
+        preload_link_for_stylesheet_source(source.fetch(:source), href: source.fetch(:href))
+      else
+        raise ArgumentError, "Unexpected preload source type: #{source.fetch(:source_type).inspect}"
+      end
+    end
+
+    def preload_link_for_javascript_source(source, href:)
+      attributes = preload_link_attributes(source, href:)
+      if modulepreload_source?(source)
+        attributes[:crossorigin] = preload_crossorigin if attributes[:crossorigin].nil?
+        tag.link(**attributes.merge(rel: "modulepreload"))
+      else
+        tag.link(**attributes.merge(rel: "preload", as: "script"))
+      end
+    end
+
+    def preload_link_for_stylesheet_source(source, href:)
+      tag.link(**preload_link_attributes(source, href:).merge(rel: "preload", as: "style"))
+    end
+
+    def preload_link_attributes(source, href:)
+      attributes = { href: }
+      integrity = preload_source_integrity(source)
+      return attributes unless integrity.present?
+
+      cross_origin = shakapacker_integrity_config[:cross_origin]
+      attributes.merge(integrity:, crossorigin: cross_origin.nil? ? preload_crossorigin : cross_origin)
+    end
+
+    def preload_source_path(source)
+      path_to_asset(preload_manifest_source(source), skip_pipeline: true)
+    end
+
+    def preload_manifest_source(source)
+      return source if source.is_a?(String)
+      return preload_manifest_value(source, "src") if preload_manifest_key?(source, "src")
+
+      raise ArgumentError, "Unexpected Shakapacker manifest source without src: #{source.inspect}"
+    end
+
+    def preload_source_integrity(source)
+      return unless shakapacker_integrity_config[:enabled]
+
+      preload_manifest_value(source, "integrity")
+    end
+
+    def preload_crossorigin
+      cross_origin = shakapacker_integrity_config[:cross_origin]
+      cross_origin.nil? ? "anonymous" : cross_origin
+    end
+
+    def shakapacker_integrity_config
+      config = current_shakapacker_instance.config
+      return {} unless config.respond_to?(:integrity)
+
+      config.integrity || {}
+    end
+
+    def modulepreload_source?(source)
+      # Priority order: explicit module metadata, rel/type metadata, then the .mjs extension heuristic.
+      module_value = preload_manifest_value(source, "module")
+      return true if module_value == true
+      return false if module_value == false
+
+      return true if preload_manifest_value(source, "rel").to_s == "modulepreload"
+      return true if preload_manifest_value(source, "type").to_s == "module"
+
+      source_path = preload_manifest_source(source).to_s.split(/[?#]/, 2).first
+      File.extname(source_path) == ".mjs"
+    end
+
+    def preload_manifest_value(source, key)
+      return if source.is_a?(String) || !source.respond_to?(:[])
+
+      return source[key] if preload_manifest_key?(source, key)
+      return source[key.to_sym] if preload_manifest_key?(source, key.to_sym)
+
+      nil
+    end
+
+    def preload_manifest_key?(source, key)
+      source.respond_to?(:key?) && source.key?(key)
+    end
+
+    def build_react_component_result_for_server_rendered_string(
+      server_rendered_html: required("server_rendered_html"),
+      component_specification_tag: required("component_specification_tag"),
+      console_script: required("console_script"),
+      render_options: required("render_options")
+    )
+      content_tag_options = render_options.html_options
+      if content_tag_options.key?(:tag)
+        content_tag_options_html_tag = content_tag_options[:tag]
+        content_tag_options.delete(:tag)
+      else
+        content_tag_options_html_tag = "div"
+      end
+      content_tag_options[:id] = render_options.dom_id
+
+      rendered_output = content_tag(content_tag_options_html_tag.to_sym,
+                                    server_rendered_html.html_safe,
+                                    content_tag_options)
+
+      result_console_script = render_options.replay_console ? wrap_console_script_with_nonce(console_script) : ""
+      result = compose_react_component_html_with_spec_and_console(
+        component_specification_tag, rendered_output, result_console_script
+      )
+
+      prepend_render_rails_context(result)
+    end
+
+    def build_react_component_result_for_server_rendered_hash(
+      server_rendered_html: required("server_rendered_html"),
+      component_specification_tag: required("component_specification_tag"),
+      console_script: required("console_script"),
+      render_options: required("render_options")
+    )
+      content_tag_options = render_options.html_options
+      content_tag_options[:id] = render_options.dom_id
+
+      unless server_rendered_html[COMPONENT_HTML_KEY]
+        raise ReactOnRails::Error, "server_rendered_html hash expected to contain \"#{COMPONENT_HTML_KEY}\" key."
+      end
+
+      rendered_output = content_tag(:div,
+                                    server_rendered_html[COMPONENT_HTML_KEY].html_safe,
+                                    content_tag_options)
+
+      result_console_script = render_options.replay_console ? wrap_console_script_with_nonce(console_script) : ""
+      result = compose_react_component_html_with_spec_and_console(
+        component_specification_tag, rendered_output, result_console_script
+      )
+
+      # Other HTML strings need to be marked as html_safe too:
+      server_rendered_hash_except_component = server_rendered_html.except(COMPONENT_HTML_KEY)
+      server_rendered_hash_except_component.each do |key, html_string|
+        server_rendered_hash_except_component[key] = html_string.html_safe
+      end
+
+      result_with_rails_context = prepend_render_rails_context(result)
+      { COMPONENT_HTML_KEY => result_with_rails_context }.merge(
+        server_rendered_hash_except_component
+      )
+    end
+
+    # Returns the CSP script nonce for the current request, or nil if CSP is not enabled.
+    # Rails 5.2-6.0 use content_security_policy_nonce with no arguments.
+    # Rails 6.1+ accept an optional directive argument.
+    def csp_nonce
+      return unless respond_to?(:content_security_policy_nonce)
+
+      begin
+        content_security_policy_nonce(:script)
+      rescue ArgumentError
+        # Fallback for Rails versions that don't accept arguments
+        content_security_policy_nonce
+      end
+    end
+
+    # Wraps console replay JavaScript code in a script tag with CSP nonce if available.
+    # The console_script_code is already escaped by escapeScript() (applied inside
+    # consoleReplay() in the JavaScript layer), so using html_safe here is secure.
+    def wrap_console_script_with_nonce(console_script_code)
+      return "" if console_script_code.blank?
+
+      nonce = csp_nonce
+
+      # Build the script tag with nonce if available
+      script_options = { id: "consoleReplayLog" }
+      script_options[:nonce] = nonce if nonce.present?
+
+      # Safe to use html_safe because content is pre-escaped via escapeScript()
+      content_tag(:script, console_script_code.html_safe, script_options)
+    end
+
+    def compose_react_component_html_with_spec_and_console(component_specification_tag, rendered_output,
+                                                           console_script)
+      # IMPORTANT: Ensure that we mark string as html_safe to avoid escaping.
+      added_html = "#{component_specification_tag}\n#{console_script}".strip
+      added_html = added_html.present? ? "\n#{added_html}" : ""
+
+      "#{rendered_output}#{added_html}".html_safe
+    end
+
+    def rails_context_if_not_already_rendered
+      return "" if @rendered_rails_context
+
+      data = rails_context(server_side: false)
+
+      @rendered_rails_context = true
+
+      attribution_comment = react_on_rails_attribution_comment
+      script_tag = content_tag(:script,
+                               json_safe_and_pretty(data).html_safe,
+                               type: "application/json",
+                               id: "js-react-on-rails-context")
+
+      "#{attribution_comment}\n#{script_tag}".html_safe
+    end
+
+    # Generates the HTML attribution comment
+    # Pro version calls ReactOnRailsPro::Utils for license-specific details
+    def react_on_rails_attribution_comment
+      if ReactOnRails::Utils.react_on_rails_pro?
+        ReactOnRailsPro::Utils.pro_attribution_comment
+      else
+        "<!-- Powered by React on Rails (c) ShakaCode | Open Source -->"
+      end
+    end
+
+    # prepend the rails_context if not yet applied
+    def prepend_render_rails_context(render_value)
+      rails_context_content = rails_context_if_not_already_rendered
+      rails_context_content = rails_context_content.present? ? "#{rails_context_content}\n" : ""
+      "#{rails_context_content}#{render_value}".html_safe
+    end
+
+    def internal_react_component(react_component_name, options = {})
+      # Create the JavaScript and HTML to allow either client or server rendering of the
+      # react_component.
+      #
+      # Create the JavaScript setup of the global to initialize the client rendering
+      # (re-hydrate the data). This enables react rendered on the client to see that the
+      # server has already rendered the HTML.
+
+      render_options = create_render_options(react_component_name, options)
+
+      load_pack_for_generated_component(react_component_name, render_options)
+      # Create the HTML rendering part
+      result = server_rendered_react_component(render_options)
+
+      # clientProps are only expected on successful SSR hashes. Current error hashes do not
+      # include that key, so non-SSR/error paths skip this merge entirely.
+      merge_server_rendered_client_props!(render_options, result) if result.is_a?(Hash)
+
+      # Setup the page_loaded_js, which is the same regardless of prerendering or not!
+      # The reason is that React is smart about not doing extra work if the server rendering did its job.
+      component_specification_tag = generate_component_script(render_options)
+
+      {
+        render_options:,
+        tag: component_specification_tag,
+        result:
+      }
+    end
+
+    def merge_server_rendered_client_props!(render_options, result)
+      client_props = result["clientProps"]
+      return if client_props.nil?
+
+      unless client_props.is_a?(Hash)
+        raise ReactOnRails::Error, "Expected result[\"clientProps\"] to be a Hash, got #{client_props.class.name}."
+      end
+
+      return if client_props.empty?
+
+      raw_existing_props = render_options.props
+      existing_props = if raw_existing_props.nil?
+                         {}
+                       elsif raw_existing_props.is_a?(String)
+                         begin
+                           JSON.parse(raw_existing_props)
+                         rescue JSON::ParserError
+                           raise ReactOnRails::Error,
+                                 "Cannot merge result[\"clientProps\"] into props: failed to parse props JSON " \
+                                 "string. Ensure props is a Ruby Hash or a JSON string representing an object."
+                         end
+                       else
+                         raw_existing_props
+                       end
+
+      unless existing_props.is_a?(Hash)
+        class_name = existing_props.class.name
+        raise ReactOnRails::Error,
+              "Cannot merge result[\"clientProps\"] into non-Hash props. " \
+              "Pass props as a Hash, not #{class_name}."
+      end
+
+      render_options.set_option(:props, merge_client_props(existing_props, client_props))
+    end
+
+    def merge_client_props(existing_props, client_props)
+      merged_props = existing_props.dup
+      client_props.each do |key, value|
+        raise_if_duplicate_client_prop_key_types!(merged_props, key)
+        merged_props[client_prop_target_key(merged_props, key)] = value
+      end
+      merged_props
+    end
+
+    def raise_if_duplicate_client_prop_key_types!(props, key)
+      string_key = key.to_s
+      symbol_key = string_key.to_sym
+      return unless props.key?(string_key) && props.key?(symbol_key)
+
+      raise ReactOnRails::Error,
+            "Cannot merge result[\"clientProps\"] when props contains both string and symbol versions of " \
+            "#{string_key.inspect}. Normalize props keys before calling react_component."
+    end
+
+    def client_prop_target_key(props, key)
+      string_key = key.to_s
+      symbol_key = string_key.to_sym
+      # Preserve an existing symbol key when clientProps arrives from JSON with string keys,
+      # otherwise we would create duplicate entries that serialize to the same JSON key.
+      props.key?(symbol_key) && !props.key?(string_key) ? symbol_key : string_key
+    end
+
+    def render_redux_store_data(redux_store_data)
+      store_hydration_data = generate_store_script(redux_store_data)
+
+      prepend_render_rails_context(store_hydration_data)
+    end
+
+    def props_string(props)
+      props.is_a?(String) ? props : props.to_json
+    end
+
+    def raise_prerender_error(json_result, react_component_name, props, js_code)
+      raise ReactOnRails::PrerenderError.new(
+        component_name: react_component_name,
+        props: sanitized_props_string(props),
+        err: rendering_error_from_result(json_result),
+        js_code:,
+        console_messages: json_result["consoleReplayScript"]
+      )
+    end
+
+    def raise_renderer_prerender_error(err, react_component_name, props, js_code)
+      prerender_error = ReactOnRails::PrerenderError.new(component_name: react_component_name,
+                                                         # Sanitize as this might be browser logged
+                                                         props: sanitized_props_string(props),
+                                                         err:,
+                                                         js_code:)
+      renderer_parse_error = err.is_a?(ReactOnRails::JsonParseError) ||
+                             (defined?(ReactOnRails::LengthPrefixedParser::ParseError) &&
+                               err.is_a?(ReactOnRails::LengthPrefixedParser::ParseError))
+      raise prerender_error, cause: nil if renderer_parse_error
+
+      raise prerender_error
+    end
+
+    def rendering_error_from_result(json_result)
+      rendering_error = json_result["renderingError"]
+      return unless rendering_error.is_a?(Hash)
+
+      stack = rendering_error["stack"]
+      # Mirror the JS `buildRSCStreamDiagnosticError` fallback: a renderingError that carries only
+      # a stack (no message) should still surface a diagnostic rather than be silently dropped.
+      message = rendering_error["message"].presence ||
+                (stack.present? ? "RSC stream metadata reported a rendering error" : nil)
+      return if message.nil?
+
+      error = StandardError.new(message)
+      frames = normalize_js_stack_lines(stack)
+      error.set_backtrace(frames) unless frames.empty?
+      error
+    end
+
+    # V8 stack strings begin with a `"TypeError: ..."` header line — and chained-exception stacks
+    # add further non-frame headers mid-stack (e.g. `Caused by: ...`) — none of which match Ruby's
+    # `file:line:in 'method'` backtrace format. Keep only the `at <frame>` lines so backtrace
+    # cleaners and APM tools that ship the array raw don't choke on unparseable strings.
+    # Frames are also `.strip`-ed to drop V8's leading indentation, which Ruby backtraces never carry.
+    #
+    # When the stack has no `at <frame>` lines (e.g. a header-only or non-V8 string) this returns
+    # `[]`, leaving the backtrace nil rather than seeding it with unparseable header lines.
+    def normalize_js_stack_lines(stack)
+      # Only V8 string stacks are parseable here. A non-String stack (e.g. an array of frames
+      # from a non-V8 serializer) would otherwise be `to_s`-ed into Ruby array syntax and yield
+      # no usable frames — guard explicitly so the no-backtrace path is intentional, not garbage.
+      return [] unless stack.is_a?(String)
+
+      stack.lines.map { |line| line.chomp.strip }.select { |line| line.start_with?("at ") }
+    end
+
+    def should_raise_streaming_prerender_error?(chunk_json_result, render_options)
+      chunk_json_result["hasErrors"] &&
+        (if chunk_json_result["isShellReady"]
+           render_options.raise_non_shell_server_rendering_errors
+         else
+           render_options.raise_on_prerender_error
+         end)
+    end
+
+    # Returns object with values that are NOT html_safe!
+    def server_rendered_react_component(render_options)
+      return { "html" => "", "consoleReplayScript" => "" } unless render_options.prerender
+
+      react_component_name = render_options.react_component_name
+      props = render_options.props
+
+      # On server `location` option is added (`location = request.fullpath`)
+      # React Router needs this to match the current route
+
+      # Make sure that we use up-to-date bundle file used for server rendering, which is defined
+      # by config file value for config.server_bundle_js_file
+      ReactOnRails::ServerRenderingPool.reset_pool_if_server_bundle_was_modified
+
+      # Since this code is not inserted on a web page, we don't need to escape props
+      #
+      # However, as JSON (returned from `props_string(props)`) isn't JavaScript,
+      # but we want treat it as such, we need to compensate for the difference.
+      #
+      # \u2028 and \u2029 are valid characters in strings in JSON, but are treated
+      # as newline separators in JavaScript. As no newlines are allowed in
+      # strings in JavaScript, this causes an exception.
+      #
+      # We fix this by replacing these unicode characters with their escaped versions.
+      # This should be safe, as the only place they can appear is in strings anyway.
+      #
+      # Read more here: http://timelessrepo.com/json-isnt-a-javascript-subset
+
+      js_code = ReactOnRails::ServerRenderingJsCode.server_rendering_component_js_code(
+        props_string: props_string(props).gsub("\u2028", '\u2028').gsub("\u2029", '\u2029'),
+        rails_context: rails_context(server_side: true).to_json,
+        redux_stores: initialize_redux_stores(render_options),
+        react_component_name:,
+        render_options:
+      )
+
+      begin
+        result = ReactOnRails::ServerRenderingPool.server_render_js_with_console_logging(js_code, render_options)
+      rescue StandardError => err
+        # This error came from the renderer
+        raise_renderer_prerender_error(err, react_component_name, props, js_code)
+      end
+
+      if render_options.streaming?
+        result.transform do |chunk_json_result|
+          if should_raise_streaming_prerender_error?(chunk_json_result, render_options)
+            raise_prerender_error(chunk_json_result, react_component_name, props, js_code)
+          end
+          # It doesn't make any transformation, it listens and raises error if a chunk has errors
+          chunk_json_result
+        end
+
+        result.rescue do |err|
+          # This error came from the renderer
+          raise_renderer_prerender_error(err, react_component_name, props, js_code)
+        end
+      elsif result["hasErrors"] && render_options.raise_on_prerender_error
+        raise_prerender_error(result, react_component_name, props, js_code)
+      end
+
+      result
+    end
+
+    def initialize_redux_stores(render_options)
+      result = +<<-JS
+      ReactOnRails.clearHydratedStores();
+      JS
+
+      store_dependencies = render_options.store_dependencies
+      return result unless store_dependencies.present?
+
+      declarations = +"var reduxProps, store, storeGenerator;\n"
+      store_objects = registered_stores_including_deferred.select do |store|
+        store_dependencies.include?(store[:store_name])
+      end
+
+      result << store_objects.each_with_object(declarations) do |redux_store_data, memo|
+        store_name = redux_store_data[:store_name]
+        props = props_string(redux_store_data[:props])
+        memo << <<~JS
+          reduxProps = #{props};
+          storeGenerator = ReactOnRails.getStoreGenerator(#{store_name.to_json});
+          store = storeGenerator(reduxProps, railsContext);
+          ReactOnRails.setStore(#{store_name.to_json}, store);
+        JS
+      end
+      result
+    end
+
+    def in_mailer?
+      return false unless defined?(controller)
+      return false unless defined?(ActionMailer::Base)
+
+      controller.is_a?(ActionMailer::Base)
+    end
+
+    def raise_missing_autoloaded_bundle(react_component_name)
+      raise ReactOnRails::SmartError.new(
+        error_type: :missing_auto_loaded_bundle,
+        component_name: react_component_name,
+        expected_path: generated_components_pack_path(react_component_name)
+      )
+    end
+
+    def raise_missing_autoloaded_store_bundle(store_name)
+      raise ReactOnRails::SmartError.new(
+        error_type: :missing_auto_loaded_store_bundle,
+        component_name: store_name,
+        expected_path: generated_stores_pack_path(store_name)
+      )
+    end
+  end
+end
+# rubocop:enable Metrics/ModuleLength
+# rubocop:enable Metrics/MethodLength

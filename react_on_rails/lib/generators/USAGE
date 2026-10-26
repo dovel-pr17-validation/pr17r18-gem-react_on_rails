@@ -1,0 +1,23 @@
+Description:
+
+The react_on_rails:install generator integrates a React frontend, including SSR, with Rails.
+
+* Tailwind CSS v4 (Optional)
+
+    Passing the --tailwind generator option installs Tailwind CSS v4, configures
+    the PostCSS plugin for Webpack or Rspack, and styles the generated
+    server-rendered Hello World example.
+
+*******************************************************************************
+
+After running the generator, you will want to:
+
+    bundle && npm install     # or yarn install, or pnpm install
+
+Then you may run
+
+    ./bin/dev
+
+More Details:
+
+    `https://reactonrails.com/docs/api-reference/generator-details/`

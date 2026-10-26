@@ -1,0 +1,606 @@
+# Upgrading React on Rails Pro
+
+> [!NOTE]
+> **Summary for AI agents:** Every React on Rails Pro version bump is a **coupled
+> Ruby + JavaScript upgrade**. When you change the gem version in `Gemfile`, you
+> must also update the matching npm packages **and** regenerate **both** lockfiles
+> (`Gemfile.lock` and `yarn.lock` / `package-lock.json` / `pnpm-lock.yaml`).
+> See [Coupled Pro upgrade checklist](#coupled-pro-upgrade-checklist) below before
+> editing manifests by hand.
+
+## Coupled Pro Upgrade Checklist
+
+Treat any React on Rails Pro version change as a **coupled Ruby + JavaScript upgrade**.
+Updating only the Ruby gem or only the npm package will produce a PR that looks
+superficially correct but fails CI under frozen-lockfile install, or runs the gem
+and JavaScript packages at mismatched versions.
+
+This checklist applies to every Pro version bump — stable releases (`16.5.0` →
+`16.6.0`) as well as release candidates (`16.7.0.rc.0`).
+
+### Packages that must move together
+
+**Ruby side (regenerate `Gemfile.lock`):**
+
+- `Gemfile`: `react_on_rails_pro`
+- `Gemfile.lock`: `react_on_rails_pro`, `react_on_rails`, and transitive Ruby
+  dependencies such as `jwt` (used for offline license validation)
+
+**JavaScript side (regenerate the JS lockfile):**
+
+- `package.json`: `react-on-rails-pro`
+- `package.json`: `react-on-rails-pro-node-renderer` (only if you use the
+  standalone Node renderer)
+- `package.json`: `react-on-rails-rsc` (required for React Server Components apps;
+  check release notes for the correct version to pair)
+- `yarn.lock`, `package-lock.json`, or `pnpm-lock.yaml`: matching npm resolutions
+  and transitive npm dependencies
+
+Commit **both** the Ruby lockfile and the JavaScript lockfile in the same change.
+A PR that bumps `Gemfile.lock` but skips the JS lockfile (or vice versa) will pass
+a `yarn install` that resolves loosely and fail the same install with
+`--frozen-lockfile` in CI.
+
+### Prerelease versions: Ruby vs npm format
+
+The two ecosystems use different separators for prerelease tags. The Ruby gem and
+the npm package refer to the same release, but the version strings look different:
+
+| Release type      | Ruby gem version | npm package version |
+| ----------------- | ---------------- | ------------------- |
+| Stable            | `16.7.0`         | `16.7.0`            |
+| Release candidate | `16.7.0.rc.0`    | `16.7.0-rc.0`       |
+| Beta              | `16.7.0.beta.1`  | `16.7.0-beta.1`     |
+
+If you copy the gem version string directly into `package.json` (or the npm version
+string directly into `Gemfile`), the install will fail because no package exists
+under that spelling. Substitute `.` for `-` (or `-` for `.`) when crossing the
+language boundary.
+
+### Compare exact prerelease tags
+
+When you upgrade between prereleases, review the changes between the exact tags. Use Ruby/tag dot notation for both
+placeholders in
+`https://github.com/shakacode/react_on_rails/compare/v<CURRENT_VERSION>...v<TARGET_VERSION>`.
+The release notes summarize the release line, but the tag comparison shows the RC-to-RC changes that apply to your
+current pin.
+
+### Custom overrides of Pro helpers
+
+Methods in `ReactOnRailsProHelper` are internal implementation details, not stable extension points. An application
+that uses `prepend` or otherwise overrides a Pro helper method must re-check the method signature for every upgrade.
+
+Prefer documented configuration and helper APIs. If an internal override is unavoidable, compare the exact release
+tags, update the override signature, and run the application's streamed SSR and RSC tests before deployment.
+
+### Strict version pinning
+
+Use exact version constraints on both sides — never `^`, `~`, or `*`. Semver
+wildcards in `package.json` cause boot failures starting in v16.2.x.
+
+Replace `VERSION` below with the latest version from
+[the CHANGELOG](https://github.com/shakacode/react_on_rails/blob/main/CHANGELOG.md).
+
+```ruby
+# Gemfile — pin with =
+gem "react_on_rails_pro", "= VERSION"
+```
+
+```bash
+# package.json — pin with --save-exact / --exact
+yarn add react-on-rails-pro@VERSION --exact
+npm install react-on-rails-pro@VERSION --save-exact
+pnpm add react-on-rails-pro@VERSION --save-exact
+```
+
+### Suggested verification
+
+After updating gem and npm versions, run install and a representative build:
+
+```bash
+bundle install
+
+# Pick your package manager. Run the loose install first to regenerate the lockfile,
+# then re-run with --frozen-lockfile to prove the lockfile matches package.json.
+yarn install --non-interactive
+yarn install --frozen-lockfile --non-interactive --prefer-offline
+# or
+pnpm install
+pnpm install --frozen-lockfile
+# or
+npm install
+npm ci
+
+bundle exec rails react_on_rails:generate_packs
+# Shakapacker projects:
+NODE_ENV=development bundle exec bin/shakapacker
+# Rspack projects: use your project's Rspack build script instead (e.g. `yarn build`)
+```
+
+The `--frozen-lockfile` (or `npm ci`) install is the same install CI runs. If your
+local loose install succeeds but the frozen install fails, your JS lockfile was
+not regenerated — re-run the loose install and commit the updated lockfile.
+
+After upgrading to 16.5.0 or later, also verify gem/npm version alignment:
+
+```bash
+bundle exec rake react_on_rails:sync_versions
+```
+
+The task is dry-run by default and reports any drift between the gem and npm
+package versions. Pass `WRITE=true` to apply the fix automatically.
+
+### Extra verification for RSC apps
+
+If your app uses React Server Components, also confirm that the asset build emits
+both RSC manifests:
+
+- `react-client-manifest.json`
+- `react-server-client-manifest.json`
+
+Both files should appear in your bundler's output directory. For Shakapacker apps,
+the location is set by `public_output_path` in `config/shakapacker.yml`, typically
+`public/webpack/development/` or `public/webpack/production/`. For Rspack apps,
+check the `output.path` in your Rspack configuration. If either manifest
+is missing, see [Manifest Files Not Generated](./react-server-components/upgrading-existing-pro-app.md#manifest-files-not-generated).
+
+Then run your RSC and server-rendering specs to confirm SSR + RSC still work
+end-to-end.
+
+### Why this matters for automated upgrades
+
+Dependency bots and coding agents commonly produce a PR that updates `Gemfile`,
+`Gemfile.lock`, and `package.json` but skips the JS lockfile. That PR reads
+correctly and may pass a loose local install, but CI will fail at the
+frozen-lockfile install step, and a merged-but-stale lockfile can ship a
+mismatched npm package alongside the new gem.
+
+Following this checklist keeps the Ruby and JavaScript halves of React on Rails
+Pro on the same version.
+
+## Upgrading from GitHub Packages to Public Distribution
+
+### Who This Guide is For
+
+This guide is for existing React on Rails Pro customers who are:
+
+- Previously using GitHub Packages authentication (private distribution)
+- On any version before 16.4.0
+- Upgrading to version 16.4.0 or higher
+
+If you're a new customer, see [Installation](./installation.md) instead.
+
+### What's Changing
+
+React on Rails Pro packages are now **publicly distributed** via npmjs.com and RubyGems.org:
+
+- ✅ No more GitHub Personal Access Tokens (PATs)
+- ✅ No more `.npmrc` configuration
+- ✅ Simplified installation with standard `gem install` and `npm install`
+- ✅ License validation now happens at **runtime** using JWT tokens
+
+Package names have changed:
+
+| Package       | Old (Scoped)                                        | New (Unscoped)                     |
+| ------------- | --------------------------------------------------- | ---------------------------------- |
+| Client        | `react-on-rails`                                    | `react-on-rails-pro`               |
+| Node Renderer | `@shakacode-tools/react-on-rails-pro-node-renderer` | `react-on-rails-pro-node-renderer` |
+
+**Important:** Pro users should now import from `react-on-rails-pro` instead of `react-on-rails`. The Pro package includes all core features plus Pro-exclusive functionality.
+
+## Version Alignment: Pro 3.x/4.x → 16.x
+
+React on Rails Pro version numbers were aligned with the core React on Rails gem during the 16.x series. **Pro 16.x is the direct successor to Pro 3.x/4.x** — it is the same gem, with the same features, under a new version number.
+
+| Version        | Distribution              | Notes                                       |
+| -------------- | ------------------------- | ------------------------------------------- |
+| Pro 3.3.x      | GitHub Packages (private) | Last 3.x release                            |
+| Pro 4.0.0-rc.x | GitHub Packages (private) | Release candidates (pre-monorepo)           |
+| Pro 16.1.x     | GitHub Packages (private) | Version-aligned with core gem               |
+| Pro 16.2.0+    | RubyGems.org / npmjs.com  | First publicly distributed, version-aligned |
+
+If you are upgrading from Pro 3.x, 4.0.0-rc.x, or any GitHub Packages version (including 16.1.x), follow the full [Migration Steps](#migration-steps) below.
+
+## Breaking Changes and Deprecation Policy
+
+To reduce upgrade risk, React on Rails Pro follows this policy:
+
+1. **Deprecate first when practical** (docs/changelog + clear replacement).
+2. **Warn at runtime when practical** if a deprecated setup is detected.
+3. **Remove in a later release** with a short migration note in this guide.
+4. **Exception:** security/legal fixes may be removed immediately, but must include an explicit upgrade note.
+
+## Node Renderer Cache Layout
+
+Starting with the release that adds `react_on_rails_pro:pre_seed_renderer_cache`, both the new task and the
+deprecated `pre_stage_bundle_for_node_renderer` shim stage the renderer cache as `<cache>/<bundleHash>/<bundleHash>.js`.
+
+Older `pre_stage_bundle_for_node_renderer` versions wrote a flat `<cache>/<renderer_bundle_file_name>` file. That
+layout did not match the Node Renderer's runtime lookup, so most apps should not depend on it. Update any custom
+scripts that read the old flat file directly.
+
+### Your Current Setup (GitHub Packages)
+
+If you're upgrading, you currently have:
+
+**1. Gemfile with GitHub Packages source:**
+
+```ruby
+source "https://rubygems.pkg.github.com/shakacode-tools" do
+  gem "react_on_rails_pro", "16.1.1"
+end
+```
+
+**2. `.npmrc` file with GitHub authentication:**
+
+```ini
+always-auth=true
+//npm.pkg.github.com/:_authToken=YOUR_TOKEN
+@shakacode-tools:registry=https://npm.pkg.github.com
+```
+
+**3. Scoped package name in package.json:**
+
+```json
+{
+  "private": true,
+  "dependencies": {
+    "@shakacode-tools/react-on-rails-pro-node-renderer": "16.1.1"
+  }
+}
+```
+
+**4. Scoped require statements:**
+
+```javascript
+const { reactOnRailsProNodeRenderer } = require('@shakacode-tools/react-on-rails-pro-node-renderer');
+```
+
+### Migration Steps
+
+> **Version note:** Replace `VERSION` below with the latest version from [the CHANGELOG](https://github.com/shakacode/react_on_rails/blob/main/CHANGELOG.md). After updating to 16.5.0+, run `bundle exec rake react_on_rails:sync_versions` to verify gem and npm versions are aligned.
+
+#### Step 1: Update Gemfile
+
+**Remove** the GitHub Packages source and use standard gem installation:
+
+```diff
+- source "https://rubygems.pkg.github.com/shakacode-tools" do
+-   gem "react_on_rails_pro", "16.1.1"
+- end
++ gem "react_on_rails_pro", "VERSION"
+```
+
+Then run:
+
+```bash
+bundle install
+```
+
+#### Step 2: Remove .npmrc Configuration
+
+If you have a `.npmrc` file with GitHub Packages authentication, **delete it** or remove the GitHub-specific lines:
+
+```bash
+# Remove the entire file if it only contained GitHub Packages config
+rm .npmrc
+
+# Or edit it to remove these lines:
+# always-auth=true
+# //npm.pkg.github.com/:_authToken=YOUR_TOKEN
+# @shakacode-tools:registry=https://npm.pkg.github.com
+```
+
+#### Step 3: Update package.json
+
+**Add the client package** and update the node renderer package name:
+
+```diff
+{
+  "dependencies": {
++   "react-on-rails-pro": "VERSION",
+-   "@shakacode-tools/react-on-rails-pro-node-renderer": "16.1.1"
++   "react-on-rails-pro-node-renderer": "VERSION"
+  }
+}
+```
+
+Then reinstall:
+
+```bash
+npm install
+# or
+yarn install
+```
+
+#### Step 4: Update Import Statements
+
+**Client code:** Change all imports from `react-on-rails` to `react-on-rails-pro`:
+
+```diff
+- import ReactOnRails from 'react-on-rails';
++ import ReactOnRails from 'react-on-rails-pro';
+```
+
+**Pro-exclusive features** (React Server Components, async loading):
+
+```diff
+- import RSCRoute from 'react-on-rails/RSCRoute';
++ import RSCRoute from 'react-on-rails-pro/RSCRoute';
+
+- import registerServerComponent from 'react-on-rails/registerServerComponent/client';
++ import registerServerComponent from 'react-on-rails-pro/registerServerComponent/client';
+
+- import wrapServerComponentRenderer from 'react-on-rails/wrapServerComponentRenderer/client';
++ import wrapServerComponentRenderer from 'react-on-rails-pro/wrapServerComponentRenderer/client';
+```
+
+**Node renderer configuration file:**
+
+```diff
+- const { reactOnRailsProNodeRenderer } = require('@shakacode-tools/react-on-rails-pro-node-renderer');
++ const { reactOnRailsProNodeRenderer } = require('react-on-rails-pro-node-renderer');
+```
+
+**Node renderer integrations (Sentry, Honeybadger):**
+
+```diff
+- require('@shakacode-tools/react-on-rails-pro-node-renderer/integrations/sentry').init();
++ require('react-on-rails-pro-node-renderer/integrations/sentry').init();
+
+- require('@shakacode-tools/react-on-rails-pro-node-renderer/integrations/honeybadger').init();
++ require('react-on-rails-pro-node-renderer/integrations/honeybadger').init();
+```
+
+#### Step 5: Configure the License Key (Optional)
+
+The license key is optional in every environment. It identifies your
+organization, marks rendered pages `Licensed`, and changes the license status
+in logs. Without a key, Pro keeps running and rendered pages read `UNLICENSED`.
+
+Production without a key is fine for the free uses and for organizations below
+the free line. Larger organizations subscribe at
+[pro.reactonrails.com](https://pro.reactonrails.com/) and receive a key with
+their subscription. In production, a missing or invalid key produces a warning
+that reminds larger organizations to subscribe.
+
+Configure the token through Rails credentials or another application-owned secret provider:
+
+```ruby
+ReactOnRailsPro.configure do |config|
+  config.license_token = Rails.application.credentials.dig(:react_on_rails_pro, :license_token)
+end
+```
+
+Alternatively, set the environment variable:
+
+```bash
+export REACT_ON_RAILS_PRO_LICENSE="your-license-token-here"
+```
+
+> **Migration note (legacy key-file setup):**
+> `config/react_on_rails_pro_license.key` is no longer read by React on Rails Pro.
+> If you previously used that file, move the token into `config.license_token` or
+> `REACT_ON_RAILS_PRO_LICENSE`.
+
+Explicit nonblank configuration takes precedence over the environment variable; blank configuration falls back to it.
+Never commit your license token to version control. Configure a standalone Node renderer separately through its
+`licenseToken` option or environment because it cannot read Rails credentials.
+
+**Where to get your license key:** Subscribe at [pro.reactonrails.com](https://pro.reactonrails.com/).
+
+For complete licensing details, see [LICENSE_SETUP.md](https://github.com/shakacode/react_on_rails/blob/main/react_on_rails_pro/LICENSE_SETUP.md).
+
+### Understanding the Pro npm packages
+
+React on Rails Pro has two npm packages with different purposes:
+
+| Package                            | Purpose                                                                     | When to install                                        |
+| ---------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `react-on-rails-pro`               | Client-side Pro features (immediate hydration, RSC, component registration) | **Always** — all Pro users need this                   |
+| `react-on-rails-pro-node-renderer` | Server-side Node.js rendering pool                                          | **Only** if using the standalone Node Renderer for SSR |
+
+If you only use ExecJS for SSR (the default), you do not need `react-on-rails-pro-node-renderer`.
+
+### Additional Upgrade Notes
+
+#### Upgrading to a version with the async-http node renderer client
+
+React on Rails Pro now uses `async-http` instead of HTTPX for Rails-to-node-renderer requests.
+This affects render, streaming render, and asset upload requests.
+
+Before upgrading:
+
+- Run Ruby 3.3 or newer. The `async-http` dependency requires Ruby 3.3+.
+- Audit Rails console detection that calls `Rails.const_defined?(:Console)`. The `console` gem arrives through Pro's
+  `async` dependency, which was already present in Pro 16.x, and defines top-level `::Console`. Pro 17 loads `async` on
+  the ordinary render path, while Pro 16 loaded it only for streaming or async rendering, so the default lookup inherits
+  through `Object` and silently returns `true` outside a Rails console. Use `Rails.const_defined?(:Console, false)` to
+  set `inherit: false`.
+- Remove direct application assumptions about HTTPX-specific response or error classes in Pro renderer request paths.
+- Treat `config.ssr_timeout` as a per-read socket timeout. With the async-http client, this is applied as the
+  read timeout on each renderer socket. It no longer wraps the entire request as a single task-level timeout.
+- Treat `config.renderer_http_pool_timeout` as the TCP connect timeout. After the socket connects, individual reads
+  are bounded by `ssr_timeout`.
+- Treat `config.renderer_http_pool_size` as the per-client async-http connection-pool limit, not as the old
+  process-wide persistent pool size. With a long-lived `Fiber.scheduler` (for example Falcon or Puma configured with an
+  async scheduler), the client is reused across renderer requests within that scheduler and the setting bounds
+  concurrent async-http connections for streamed renders sharing one client. HTTP/2 may multiplex multiple request
+  streams over those pooled connections. Under standard Puma streaming, `Sync {}` creates a per-request scheduler and
+  cleans up the client when that streaming response ends, so reuse does not persist across consecutive Rails requests.
+  Setting it to `nil` keeps the default connection limit; it does not make the async-http client unlimited.
+- Expect renderer connection drops to surface immediately as `ReactOnRailsPro::Error`/connection failures. HTTPX
+  previously performed one implicit transport retry for some connection drops; the async-http adapter uses
+  `retries: 0` and leaves retry policy to the existing bundle-upload retry loop and caller behavior.
+- If your Rails application uses OpenTelemetry, run `OpenTelemetry::SDK.configure` before the first renderer request
+  so both the tracer provider and W3C propagator are registered. HTTPX instrumentation no longer observes the
+  async-http transport. React on Rails Pro now creates the replacement CLIENT span itself and injects W3C trace
+  context for regular, streaming, incremental, raw-render, and asset-upload requests. Configure the Node Renderer
+  with `fastify: true` so its server spans extract that context. No OpenTelemetry dependency is added by the Pro gem;
+  when the SDK is absent or no provider is registered, renderer requests remain uninstrumented.
+- Run the node renderer client from the normal Rails request path. **Note for Falcon/async-rails users:** the earlier
+  advisory to keep Falcon deployments on the HTTPX renderer client is superseded; HTTPX has been removed and async-http
+  now handles Falcon natively. Async Rails servers (Falcon, Puma with an async scheduler) are supported: the async-http
+  client uses scheduler-scoped connection reuse automatically when a `Fiber.scheduler` already exists before the adapter
+  enters `Sync {}`. Middleware and background code should call the renderer from a scheduler with a deliberate request or
+  service lifecycle; a custom scheduler-only context can keep renderer clients alive longer than intended.
+- `config.renderer_http_keep_alive_timeout` is deprecated and ignored, but remains accepted during upgrade because
+  async-http manages connection lifecycle through its scheduler-scoped clients and ephemeral request clients. Explicitly
+  setting it to a non-`nil` value in your `configure` block emits a deprecation warning; leaving it unset or setting it
+  to `nil` is accepted silently. If you previously set it to `30` (the old default), remove the line from your
+  `configure` block entirely.
+
+#### Upgrading to 16.4.0 or later
+
+##### JWT gem requirement
+
+`react_on_rails_pro` uses `jwt` for offline license validation. The first release containing
+[PR 4864](https://github.com/shakacode/react_on_rails/pull/4864), and later releases, require `jwt >= 2.8, < 4`;
+earlier React on Rails Pro releases retain the dependency range declared by their gemspec. Apps still pinned to a
+compatible jwt 2.x release can bundle without upgrading. Apps that can resolve `jwt 3.2.0` or newer in the 3.x line
+will continue to do so; jwt 4.x is not supported. If your Gemfile pins `jwt` below 2.8 (e.g., `2.2.x` for compatibility
+with OAuth gems), you will need to upgrade it. Check for conflicts with:
+
+```bash
+bundle update jwt
+```
+
+> **Why the floor is 2.8.** jwt 2.8.0 began declaring `base64` as a runtime dependency. That declaration
+> keeps offline license validation reliable on Ruby 3.4+, where `base64` is a bundled gem.
+
+##### Node renderer config: `bundlePath` → `serverBundleCachePath`
+
+The node renderer configuration key `bundlePath` has been renamed to `serverBundleCachePath`. Update your node renderer configuration file:
+
+```diff
+  const config = {
+-   bundlePath: path.resolve(__dirname, '../.node-renderer-bundles'),
++   serverBundleCachePath: path.resolve(__dirname, '../.node-renderer-bundles'),
+  };
+```
+
+##### Changed defaults (from Pro 3.x)
+
+If you are upgrading from Pro 3.x and relied on default values without explicitly setting them, be aware of these changes:
+
+| Setting                         | Old Default (3.x) | New Default (16.x) |
+| ------------------------------- | ----------------- | ------------------ |
+| `ssr_timeout`                   | 20 seconds        | 5 seconds          |
+| `renderer_request_retry_limit`  | 1                 | 5                  |
+| `renderer_use_fallback_exec_js` | `false`           | `true`             |
+
+If your app depends on the previous defaults, set them explicitly in `config/initializers/react_on_rails_pro.rb`.
+
+##### Async props on the RSC payload endpoint
+
+The RSC payload endpoint now supports async props through two mechanisms:
+
+1. **Config registry** (recommended): Register providers in your initializer:
+
+   ```ruby
+   ReactOnRailsPro.configure do |config|
+     config.register_async_props("ComponentName", "ProviderClassName")
+   end
+   ```
+
+   The provider class must implement `.call(emit, props, controller)`. Pass the
+   class name as a string (not the class itself) so the reference survives Rails
+   class reloading in development.
+
+2. **Controller hook**: Override `rsc_payload_async_props_block_override` in your controller
+   for components that need controller context (e.g. `current_user`).
+
+If you were using the template-shadowing workaround described in
+[#5075](https://github.com/shakacode/react_on_rails/issues/5075), you can now
+replace it with either approach. The template-shadow approach continues to work but
+is no longer necessary.
+
+##### RSC payload template overrides
+
+React on Rails Pro now renders the built-in RSC payload template with `formats: [:text]` so Rails view annotations cannot inject HTML comments into NDJSON responses.
+
+If your app overrides `custom_rsc_payload_template`, make sure that override resolves to a text or format-neutral template path, such as `app/views/.../rsc_payload.text.erb`. Overrides that only exist as `.html.erb` templates will raise `ActionView::MissingTemplate` when the RSC payload endpoint renders.
+
+##### Gemfile: `react_on_rails` is redundant with `react_on_rails_pro`
+
+`react_on_rails_pro` declares `react_on_rails` as a dependency, so you do not need a separate `gem "react_on_rails"` line in your Gemfile when using Pro. Remove it to avoid confusion about which line controls the version:
+
+```diff
+- gem "react_on_rails", "VERSION"
+  gem "react_on_rails_pro", "VERSION"
+```
+
+### Verify Migration
+
+#### 1. Verify Gem Installation
+
+```bash
+bundle list | grep react_on_rails_pro
+# Should show: react_on_rails_pro (16.4.0) or higher
+```
+
+#### 2. Verify NPM Package Installation
+
+```bash
+# Verify client package
+npm list react-on-rails-pro
+# Should show: react-on-rails-pro@16.4.0 or higher
+
+# Verify node renderer (if using)
+npm list react-on-rails-pro-node-renderer
+# Should show: react-on-rails-pro-node-renderer@16.4.0 or higher
+```
+
+#### 3. Verify License Status
+
+Start your Rails server and verify behavior:
+
+```text
+React on Rails Pro license validated successfully
+```
+
+If no license key is set, the app still runs. Non-production environments log informational status. Production logs a
+warning that reminds larger organizations to subscribe. Subscribing organizations can confirm that their configured
+key reports a valid status.
+
+#### 4. Test Your Application
+
+- Start your Rails server
+- Start the node renderer (if using): `npm run node-renderer`
+- Verify that server-side rendering works correctly
+
+### Troubleshooting
+
+#### "Could not find gem 'react_on_rails_pro'"
+
+- Ensure you removed the GitHub Packages source from your Gemfile
+- Run `bundle install` again
+- Check that you have the correct version specified
+
+#### "Cannot find module 'react-on-rails-pro'" or "Cannot find module 'react-on-rails-pro-node-renderer'"
+
+- Verify you added `react-on-rails-pro` to your package.json dependencies
+- Verify you updated all import/require statements to use the correct package names
+- Delete `node_modules` and reinstall: `rm -rf node_modules && npm install`
+
+#### "Cannot mix react-on-rails (core) with react-on-rails-pro"
+
+This error occurs when you import from both `react-on-rails` and `react-on-rails-pro`. Pro users should **only** import from `react-on-rails-pro`:
+
+```diff
+- import ReactOnRails from 'react-on-rails';
++ import ReactOnRails from 'react-on-rails-pro';
+```
+
+The Pro package re-exports everything from core, so you don't need both.
+
+#### "License validation failed" for a configured key
+
+- If your organization subscribes, ensure `config.license_token` or `REACT_ON_RAILS_PRO_LICENSE` provides its key.
+- If using the standalone Node renderer, ensure its `licenseToken` option or environment provides the same key.
+- Verify the token string is correct (no extra spaces or quotes).
+- Visit [pro.reactonrails.com](https://pro.reactonrails.com/) if you need a new key.
+
+### Need Help?
+
+If you encounter issues during migration, contact [justin@shakacode.com](mailto:justin@shakacode.com) for support.

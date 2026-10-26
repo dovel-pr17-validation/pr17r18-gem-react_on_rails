@@ -1,0 +1,4 @@
+# frozen_string_literal: true
+
+# Shared development dependencies for react_on_rails and react_on_rails_pro.
+# Root-owned tooling such as RuboCop belongs in the top-level Gemfile.

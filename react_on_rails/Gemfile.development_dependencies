@@ -1,0 +1,65 @@
+# frozen_string_literal: true
+
+Dir.chdir(__dir__) { eval_gemfile "../Gemfile.shared_dev_dependencies" }
+
+gem "shakapacker", "10.3.2"
+gem "bootsnap", require: false
+gem "rails", ">= 7.2.3.2", "< 7.3"
+
+gem "sqlite3", "~> 2.0"
+gem "sass-rails", "~> 6.0"
+gem "uglifier"
+gem "jquery-rails"
+gem "puma", "~> 6.0"
+
+# Turbolinks makes following links in your web application faster. Read more: https://github.com/rails/turbolinks
+# Declared unconditionally so the gemset always matches Gemfile.lock. DISABLE_TURBOLINKS
+# toggles Turbolinks at the application layer (the require_asset in
+# spec/dummy/app/assets/javascripts/application_non_webpack.js.erb), not gem inclusion.
+# A conditional declaration broke `bundle install --frozen` in CI (see AGENTS.md).
+gem "turbolinks"
+
+# Build JSON APIs with ease. Read more: https://github.com/rails/jbuilder
+gem "jbuilder"
+# bundle exec rake doc:rails generates the API under doc/api.
+gem "sdoc", group: :doc
+
+gem "sprockets", "~> 4.0"
+
+gem "amazing_print"
+
+gem "turbo-rails"
+
+group :development, :test do
+  gem "package_json"
+  gem "listen"
+  gem "debug"
+  gem "pry"
+  gem "pry-byebug", require: false
+  gem "pry-doc"
+  gem "pry-rails"
+  gem "pry-rescue"
+  gem "rbs", require: false
+  gem "steep", require: false
+  gem "spring", "~> 4.0"
+  gem "lefthook", require: false
+  # Added for Ruby 3.5+ compatibility to silence warnings
+  gem "benchmark", require: false
+  gem "logger", require: false
+  gem "ostruct", require: false
+end
+
+group :test do
+  gem "capybara", "~> 3.40"
+  gem "capybara-screenshot"
+  gem "simplecov", "~> 0.16.1", require: false
+  gem "cypress-on-rails", "~> 1.19"
+  gem "equivalent-xml"
+  gem "generator_spec"
+  gem "launchy"
+  gem "rspec_junit_formatter"
+  gem "rspec-rails"
+  gem "rspec-retry"
+  gem "selenium-webdriver", "4.9.0"
+  gem "webdrivers", "5.3.0"
+end

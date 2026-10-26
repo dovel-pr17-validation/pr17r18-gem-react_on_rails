@@ -1,0 +1,23 @@
+printWidth: 110
+tabWidth: 2
+useTabs: false
+semi: true
+singleQuote: true
+trailingComma: all
+bracketSpacing: true
+bracketSameLine: false
+
+overrides:
+  - files: '*.@(css|scss)'
+    options:
+      singleQuote: false
+      printWidth: 120
+  - files: '*.@(json)'
+    options:
+      printWidth: 100
+  - files: '.*rc'
+    excludeFiles:
+      # Direnv file, not YAML
+      - '.envrc'
+    options:
+      parser: yaml

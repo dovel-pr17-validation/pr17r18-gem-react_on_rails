@@ -1,0 +1,65 @@
+# frozen_string_literal: true
+
+Rails.application.routes.draw do
+  # The priority is based upon order of creation: first created -> highest priority.
+  # See how all your routes lay out with "rake routes".
+
+  # You can have the root of your site routed with "root"
+  root "pages#index"
+
+  get "client_side_hello_world" => "pages#client_side_hello_world"
+  get "client_side_rescript_hello_world" => "pages#client_side_rescript_hello_world"
+  get "client_side_hello_world_shared_store" => "pages#client_side_hello_world_shared_store"
+  get "client_side_hello_world_shared_store_controller" => "pages#client_side_hello_world_shared_store_controller"
+  get "client_side_hello_world_shared_store_defer" => "pages#client_side_hello_world_shared_store_defer"
+  get "server_side_hello_world_shared_store" => "pages#server_side_hello_world_shared_store"
+  get "server_side_hello_world_shared_store_controller" => "pages#server_side_hello_world_shared_store_controller"
+  get "server_side_hello_world_shared_store_defer" => "pages#server_side_hello_world_shared_store_defer"
+  get "server_side_hello_world" => "pages#server_side_hello_world"
+  get "server_side_hello_world_hooks" => "pages#server_side_hello_world_hooks"
+  get "server_side_hello_world_props" => "pages#server_side_hello_world_props"
+  get "client_side_log_throw" => "pages#client_side_log_throw"
+  get "server_side_log_throw" => "pages#server_side_log_throw"
+  get "server_side_log_throw_plain_js" => "pages#server_side_log_throw_plain_js"
+  get "server_side_log_throw_raise" => "pages#server_side_log_throw_raise"
+  get "server_side_log_throw_raise_invoker" => "pages#server_side_log_throw_raise_invoker"
+  get "server_side_hello_world_es5" => "pages#server_side_hello_world_es5"
+  get "server_side_redux_app" => "pages#server_side_redux_app"
+  get "server_side_hello_world_with_options" => "pages#server_side_hello_world_with_options"
+  get "server_side_redux_app_cached" => "pages#server_side_redux_app_cached"
+  get "client_side_manual_render" => "pages#client_side_manual_render"
+  get "render_js" => "pages#render_js"
+  get "react_router(/*all)" => "react_router#index", as: :react_router
+  get "pure_component" => "pages#pure_component"
+  get "react_compiler_example" => "pages#react_compiler_example"
+  get "css_modules_images_fonts_example" => "pages#css_modules_images_fonts_example"
+  get "turbolinks_cache_disabled" => "pages#turbolinks_cache_disabled"
+  get "rendered_html" => "pages#rendered_html"
+  get "xhr_refresh" => "pages#xhr_refresh"
+  get "react_helmet" => "pages#react_helmet"
+  get "react_helmet_broken" => "pages#react_helmet_broken"
+  get "broken_app" => "pages#broken_app"
+  get "image_example" => "pages#image_example"
+  get "font_optimization_example" => "pages#font_optimization_example"
+  get "client_side_activity" => "pages#client_side_activity"
+  get "server_side_activity" => "pages#server_side_activity"
+  get "context_function_return_jsx" => "pages#context_function_return_jsx"
+  get "pure_component_wrapped_in_function" => "pages#pure_component_wrapped_in_function"
+  get "turbo_frame_tag_hello_world" => "pages#turbo_frame_tag_hello_world"
+  post "turbo_stream_send_hello_world" => "pages#turbo_stream_send_hello_world"
+  get "manual_render_test" => "pages#manual_render_test"
+  get "async_component_shared_store" => "pages#async_component_shared_store"
+  get "async_component_shared_store_island" => "pages#async_component_shared_store_island"
+  get "root_error_callbacks" => "pages#root_error_callbacks"
+  get "hydration_scheduling" => "pages#hydration_scheduling"
+
+  # EXPERIMENTAL View Transitions demo (issue #3888). Inert by default: the
+  # route only exists when the dummy app is booted with VIEW_TRANSITIONS_DEMO=true.
+  # See docs/oss/building-features/view-transitions.md.
+  get "view_transitions_demo" => "pages#view_transitions_demo" if ENV["VIEW_TRANSITIONS_DEMO"] == "true"
+
+  # useRailsForm example (issue #3872): client form + JSON mutation endpoint.
+  get "rails_form" => "pages#rails_form"
+  get "typed_rails_action" => "pages#typed_rails_action"
+  post "contact_messages" => "contact_messages#create"
+end

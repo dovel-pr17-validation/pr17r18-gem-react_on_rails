@@ -1,0 +1,764 @@
+#!/usr/bin/env bash
+# Switch between CI test configurations locally
+#
+# Usage:
+#   bin/ci-switch-config minimum   # minimum Ruby/Node profile and dependencies
+#   bin/ci-switch-config latest    # latest Ruby/Node profile and dependencies
+#   bin/ci-switch-config status    # Show current configuration
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MINIMUM_TOOL_VERSIONS_FILE="$PROJECT_ROOT/.minimum.tool-versions"
+MAXIMUM_TOOL_VERSIONS_FILE="$PROJECT_ROOT/.maximum.tool-versions"
+MAXIMUM_TOOL_VERSIONS_HEAD_FILE="$PROJECT_ROOT/.maximum.tool-versions.head"
+CI_DEPENDENCY_VERSIONS_FILE="$PROJECT_ROOT/.ci-dependency-versions"
+
+require_committed_file() {
+  local file="$1"
+
+  if [ ! -f "$file" ]; then
+    echo "Error: $file not found. This file is required at script load time and should be committed." >&2
+    exit 1
+  fi
+}
+
+# Shared .tool-versions parser (defines read_tool_version); the
+# .github/actions/read-tool-versions workflow action executes the same helper.
+# shellcheck source=bin/read-tool-version
+source "$SCRIPT_DIR/read-tool-version"
+
+current_git_head() {
+  # Non-git contexts return an empty string; callers must guard empty output.
+  git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true
+}
+
+saved_tool_versions_valid_for_restore() {
+  if [ ! -f "$MAXIMUM_TOOL_VERSIONS_FILE" ]; then
+    return 1
+  fi
+
+  if [ -f "$MAXIMUM_TOOL_VERSIONS_HEAD_FILE" ]; then
+    local current_head
+    local saved_head
+
+    current_head="$(current_git_head)"
+    saved_head="$(cat "$MAXIMUM_TOOL_VERSIONS_HEAD_FILE")"
+    if [ -n "$saved_head" ] && [ "$saved_head" = "$current_head" ]; then
+      # The sidecar HEAD match is necessary but not sufficient: also require
+      # content equality with the committed profile so stale or locally-bumped
+      # runtime versions cannot persist across branch updates or pulls.
+      saved_tool_versions_match_committed_profile
+      return
+    else
+      # A stale sidecar is intentionally authoritative: do not fall through to
+      # legacy content comparison when a backup advertises a different HEAD.
+      return 1
+    fi
+  fi
+
+  # Legacy fallback for backups created before the HEAD sidecar existed. With no
+  # sidecar, content identity is the only safe proxy for "captured at this head".
+  # Accept the backup only when it already matches the committed latest profile.
+  saved_tool_versions_match_committed_profile
+}
+
+saved_tool_versions_match_committed_profile() {
+  local committed_tool_versions
+
+  committed_tool_versions="$(git -C "$PROJECT_ROOT" show HEAD:.tool-versions 2>/dev/null || true)"
+  if [ -z "$committed_tool_versions" ]; then
+    return 1
+  fi
+
+  # printf adds back the trailing newline that command substitution stripped.
+  cmp -s "$MAXIMUM_TOOL_VERSIONS_FILE" <(printf "%s\n" "$committed_tool_versions")
+}
+
+read_committed_tool_version() {
+  local tool="$1"
+  local emit_warnings="${2:-true}"
+  local committed_tool_versions
+  local version
+
+  committed_tool_versions="$(git -C "$PROJECT_ROOT" show HEAD:.tool-versions 2>/dev/null || true)"
+  if [ -n "$committed_tool_versions" ]; then
+    version="$(awk -v tool="$tool" '$1 == tool { print $2; exit }' <<<"$committed_tool_versions")"
+  else
+    version=""
+  fi
+  if [ -n "$version" ]; then
+    echo "$version"
+    return
+  fi
+
+  # Fallback for non-git contexts. Always warn because the local file may already
+  # be switched to the minimum profile when no valid latest backup exists.
+  if [ "$emit_warnings" = true ]; then
+    echo "Warning: could not read committed latest $tool version from git; falling back to current .tool-versions" >&2
+    if [ -f "$MINIMUM_TOOL_VERSIONS_FILE" ] && cmp -s "$PROJECT_ROOT/.tool-versions" "$MINIMUM_TOOL_VERSIONS_FILE"; then
+      echo "Warning: current .tool-versions matches the minimum profile; latest $tool may be under-reported" >&2
+    fi
+  fi
+  read_tool_version "$PROJECT_ROOT/.tool-versions" "$tool"
+}
+
+read_latest_tool_version() {
+  local tool="$1"
+  local emit_warnings="${2:-true}"
+
+  if saved_tool_versions_valid_for_restore; then
+    read_tool_version "$MAXIMUM_TOOL_VERSIONS_FILE" "$tool"
+  else
+    read_committed_tool_version "$tool" "$emit_warnings"
+  fi
+}
+
+reload_latest_tool_version_globals() {
+  local emit_warnings="${1:-false}"
+
+  LATEST_RUBY_VERSION="$(read_latest_tool_version ruby "$emit_warnings")"
+  LATEST_RUBY_MINOR_VERSION="${LATEST_RUBY_VERSION%.*}"
+  LATEST_NODE_VERSION="$(read_latest_tool_version nodejs "$emit_warnings")"
+  LATEST_NODE_MAJOR_VERSION="${LATEST_NODE_VERSION%%.*}"
+}
+
+# Run at load time (outside main) so sourced test harnesses get populated globals.
+# Requires .minimum.tool-versions and .ci-dependency-versions to be present before sourcing.
+require_committed_file "$MINIMUM_TOOL_VERSIONS_FILE"
+require_committed_file "$CI_DEPENDENCY_VERSIONS_FILE"
+
+MINIMUM_RUBY_VERSION="$(read_tool_version "$MINIMUM_TOOL_VERSIONS_FILE" ruby)"
+MINIMUM_RUBY_MINOR_VERSION="${MINIMUM_RUBY_VERSION%.*}"
+MINIMUM_NODE_VERSION="$(read_tool_version "$MINIMUM_TOOL_VERSIONS_FILE" nodejs)"
+MINIMUM_NODE_MAJOR_VERSION="${MINIMUM_NODE_VERSION%%.*}"
+# Shakapacker/React profile versions live in .ci-dependency-versions: asdf/mise
+# do not manage npm packages, so they cannot live in .tool-versions alongside Ruby/Node.
+MINIMUM_SHAKAPACKER_VERSION="$(read_tool_version "$CI_DEPENDENCY_VERSIONS_FILE" minimum-shakapacker)"
+MINIMUM_REACT_VERSION="$(read_tool_version "$CI_DEPENDENCY_VERSIONS_FILE" minimum-react)"
+MINIMUM_REACT_MAJOR_VERSION="${MINIMUM_REACT_VERSION%%.*}"
+reload_latest_tool_version_globals false
+LATEST_SHAKAPACKER_VERSION="$(read_tool_version "$CI_DEPENDENCY_VERSIONS_FILE" latest-shakapacker)"
+LATEST_REACT_VERSION="$(read_tool_version "$CI_DEPENDENCY_VERSIONS_FILE" latest-react)"
+LATEST_REACT_MAJOR_VERSION="${LATEST_REACT_VERSION%%.*}"
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+print_header() {
+  echo -e "${BLUE}==>${NC} $1"
+}
+
+print_success() {
+  echo -e "${GREEN}✓${NC} $1"
+}
+
+print_warning() {
+  echo -e "${YELLOW}⚠${NC} $1"
+}
+
+warn_if_latest_profile_may_be_under_reported() {
+  if saved_tool_versions_valid_for_restore; then
+    return
+  fi
+
+  if git -C "$PROJECT_ROOT" show HEAD:.tool-versions >/dev/null 2>&1; then
+    return
+  fi
+
+  if [ -f "$MINIMUM_TOOL_VERSIONS_FILE" ] && cmp -s "$PROJECT_ROOT/.tool-versions" "$MINIMUM_TOOL_VERSIONS_FILE"; then
+    print_warning "Could not read the committed latest runtime profile; latest Ruby/Node may be under-reported."
+  fi
+}
+
+print_error() {
+  echo -e "${RED}✗${NC} $1"
+}
+
+read_package_version() {
+  local package_file="$1"
+  local package_name="$2"
+
+  grep -F "\"$package_name\"" "$package_file" | head -1 | sed -E -n 's/.*"[~^]?([0-9][^"]*)".*/\1/p' || true
+}
+
+read_shakapacker_npm_dependency() {
+  local package_file="$1"
+  local package_name
+  local package_version
+
+  for package_name in shakapacker-webpack shakapacker-rspack shakapacker; do
+    package_version=$(read_package_version "$package_file" "$package_name")
+    if [ -n "$package_version" ]; then
+      echo "$package_name:$package_version"
+      return
+    fi
+  done
+}
+
+check_version_manager() {
+  if command -v mise &> /dev/null; then
+    echo "mise"
+  elif command -v asdf &> /dev/null; then
+    echo "asdf"
+  elif command -v rvm &> /dev/null && command -v nvm &> /dev/null; then
+    echo "rvm+nvm"
+  elif command -v rvm &> /dev/null; then
+    echo "rvm"
+  elif command -v nvm &> /dev/null; then
+    echo "nvm"
+  else
+    print_error "No version manager found. Please install one of:"
+    echo "  mise (recommended): https://mise.jdx.dev/"
+    echo "  asdf:               https://asdf-vm.com/"
+    echo "  rvm + nvm:          https://rvm.io/ + https://github.com/nvm-sh/nvm"
+    exit 1
+  fi
+}
+
+set_ruby_version() {
+  local version="$1"
+  local version_manager="$2"
+
+  case "$version_manager" in
+    mise|asdf)
+      # Handled via .tool-versions
+      ;;
+    rvm|rvm+nvm)
+      print_header "Setting Ruby $version with rvm"
+      # Check if version exists using rvm list rubies for consistent output
+      # Anchor to start of line to avoid false matches (e.g., 3.3.7 shouldn't match 13.3.7)
+      # Allow optional leading whitespace and ruby- prefix, no end anchor to allow patch suffixes
+      if ! rvm list rubies | grep -qE "^[[:space:]]*(ruby-)?${version}"; then
+        print_warning "Ruby $version not installed. Installing..."
+        if ! rvm install "$version"; then
+          print_error "Failed to install Ruby $version with rvm"
+          print_warning "Make sure rvm is properly configured. Try running: source ~/.rvm/scripts/rvm"
+          exit 1
+        fi
+      fi
+      if ! rvm use "$version"; then
+        print_error "Failed to switch to Ruby $version"
+        print_warning "Make sure rvm is properly configured. Try running: source ~/.rvm/scripts/rvm"
+        exit 1
+      fi
+      print_success "Switched to Ruby $version"
+      ;;
+    nvm)
+      print_error "Cannot set Ruby version: nvm doesn't manage Ruby"
+      echo "Please install one of the following to manage Ruby versions:"
+      echo "  - rvm:  https://rvm.io/"
+      echo "  - mise: https://mise.jdx.dev/ (recommended, manages both Ruby and Node)"
+      echo "  - asdf: https://asdf-vm.com/ (manages both Ruby and Node)"
+      exit 1
+      ;;
+  esac
+}
+
+set_node_version() {
+  local version="$1"
+  local version_manager="$2"
+
+  case "$version_manager" in
+    mise|asdf)
+      # Handled via .tool-versions
+      ;;
+    nvm|rvm+nvm)
+      print_header "Setting Node $version with nvm"
+
+      # Source nvm if not already loaded - try multiple common locations
+      if ! command -v nvm &> /dev/null; then
+        # Try standard nvm location
+        if [ -s "$HOME/.nvm/nvm.sh" ]; then
+          export NVM_DIR="$HOME/.nvm"
+          \. "$NVM_DIR/nvm.sh"
+        # Try Homebrew location (macOS)
+        elif [ -s "/opt/homebrew/opt/nvm/nvm.sh" ]; then
+          export NVM_DIR="/opt/homebrew/opt/nvm"
+          \. "/opt/homebrew/opt/nvm/nvm.sh"
+        # Try XDG config location
+        elif [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/nvm/nvm.sh" ]; then
+          export NVM_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nvm"
+          \. "$NVM_DIR/nvm.sh"
+        else
+          print_error "Could not find nvm installation"
+          print_warning "Tried locations: ~/.nvm, /opt/homebrew/opt/nvm, ~/.config/nvm"
+          echo "Please source nvm manually or install it from: https://github.com/nvm-sh/nvm"
+          exit 1
+        fi
+      fi
+
+      # Check if version is already installed using nvm version for reliability
+      if ! nvm version "$version" &> /dev/null; then
+        print_warning "Node $version not installed. Installing..."
+        if ! nvm install "$version"; then
+          print_error "Failed to install Node $version with nvm"
+          exit 1
+        fi
+      fi
+
+      if ! nvm use "$version"; then
+        print_error "Failed to switch to Node $version"
+        print_warning "Make sure nvm is properly configured. Try running: nvm use $version"
+        exit 1
+      fi
+      print_success "Switched to Node $version"
+      ;;
+    rvm)
+      print_error "Cannot set Node version: rvm doesn't manage Node"
+      echo "Please install one of the following to manage Node versions:"
+      echo "  - nvm:  https://github.com/nvm-sh/nvm"
+      echo "  - mise: https://mise.jdx.dev/ (recommended, manages both Ruby and Node)"
+      echo "  - asdf: https://asdf-vm.com/ (manages both Ruby and Node)"
+      exit 1
+      ;;
+  esac
+}
+
+set_tool_versions_to_minimum() {
+  print_header "Setting runtime versions in .tool-versions"
+
+  if [ -f "$PROJECT_ROOT/.tool-versions" ] &&
+    ! cmp -s "$PROJECT_ROOT/.tool-versions" "$PROJECT_ROOT/.minimum.tool-versions"; then
+    if saved_tool_versions_valid_for_restore; then
+      print_success "Preserved existing latest runtime-version backup"
+    else
+      local current_head
+
+      cp "$PROJECT_ROOT/.tool-versions" "$MAXIMUM_TOOL_VERSIONS_FILE"
+      current_head="$(current_git_head)"
+      if [ -n "$current_head" ]; then
+        echo "$current_head" > "$MAXIMUM_TOOL_VERSIONS_HEAD_FILE"
+      else
+        rm -f "$MAXIMUM_TOOL_VERSIONS_HEAD_FILE"
+      fi
+    fi
+  elif [ -f "$MAXIMUM_TOOL_VERSIONS_FILE" ] && ! saved_tool_versions_valid_for_restore; then
+    print_warning "Stale runtime-version backup exists from a different branch; it will be discarded on restore."
+  fi
+
+  cp "$PROJECT_ROOT/.minimum.tool-versions" "$PROJECT_ROOT/.tool-versions"
+  print_success "Copied .minimum.tool-versions to .tool-versions"
+}
+
+restore_tool_versions_to_latest() {
+  print_header "Setting runtime versions in .tool-versions"
+
+  if saved_tool_versions_valid_for_restore; then
+    cp "$MAXIMUM_TOOL_VERSIONS_FILE" "$PROJECT_ROOT/.tool-versions"
+  else
+    local git_err
+
+    # `git restore` requires Git 2.23+; GitHub Actions runners satisfy this.
+    git_err="$(git -C "$PROJECT_ROOT" restore -- .tool-versions 2>&1)" || {
+      echo "Error: could not restore .tool-versions from git. Restore it manually to the latest profile." >&2
+      [ -n "$git_err" ] && echo "  git: $git_err" >&2
+      exit 1
+    }
+    if [ -f "$MAXIMUM_TOOL_VERSIONS_FILE" ]; then
+      print_warning "Local runtime-version backup was stale or mismatched; restored .tool-versions from git."
+    fi
+  fi
+  rm -f "$MAXIMUM_TOOL_VERSIONS_FILE" "$MAXIMUM_TOOL_VERSIONS_HEAD_FILE"
+
+  # Refresh script globals so downstream set_* calls use the restored latest profile.
+  reload_latest_tool_version_globals false
+
+  print_success "Restored .tool-versions with Ruby $LATEST_RUBY_VERSION and Node $LATEST_NODE_VERSION"
+}
+
+install_bundle_to_vendor() {
+  local bundle_dir="${1:-$PWD}"
+  local lockfile="$bundle_dir/Gemfile.lock"
+  local bundler_version=""
+
+  if [ -f "$lockfile" ]; then
+    bundler_version=$(awk '
+      /^BUNDLED WITH$/ {
+        getline
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        print
+        exit
+      }
+    ' "$lockfile")
+  fi
+
+  (
+    cd "$bundle_dir"
+
+    if [ -n "$bundler_version" ]; then
+      if ! gem list bundler -i -v "$bundler_version" > /dev/null 2>&1; then
+        print_header "Installing Bundler $bundler_version"
+        gem install bundler -v "$bundler_version"
+      fi
+
+      bundle "_${bundler_version}_" config set --local path vendor/bundle
+      bundle "_${bundler_version}_" install
+    else
+      bundle config set --local path vendor/bundle
+      bundle install
+    fi
+  )
+}
+
+show_status() {
+  print_header "Current Configuration"
+  echo ""
+  warn_if_latest_profile_may_be_under_reported
+
+  echo "Runtime versions:"
+  echo "  Ruby: $(read_tool_version "$PROJECT_ROOT/.tool-versions" ruby) (configured)"
+  echo "  Node: $(read_tool_version "$PROJECT_ROOT/.tool-versions" nodejs) (configured)"
+
+  echo ""
+  echo "Dependency versions:"
+
+  SHAKAPACKER_GEM=""
+  if [ -f "$PROJECT_ROOT/Gemfile.development_dependencies" ]; then
+    SHAKAPACKER_GEM=$(grep 'gem "shakapacker"' "$PROJECT_ROOT/Gemfile.development_dependencies" | sed -E 's/.*"([0-9.]+)".*/\1/' || echo "")
+    echo "  Shakapacker (gem): ${SHAKAPACKER_GEM:-not found}"
+  fi
+
+  local SHAKAPACKER_NPM=""
+  local SHAKAPACKER_NPM_PACKAGE=""
+  local SHAKAPACKER_NPM_DEPENDENCY=""
+  if [ -f "$PROJECT_ROOT/react_on_rails/spec/dummy/package.json" ]; then
+    SHAKAPACKER_NPM_DEPENDENCY=$(read_shakapacker_npm_dependency "$PROJECT_ROOT/react_on_rails/spec/dummy/package.json")
+    SHAKAPACKER_NPM="${SHAKAPACKER_NPM_DEPENDENCY#*:}"
+    SHAKAPACKER_NPM_PACKAGE="${SHAKAPACKER_NPM_DEPENDENCY%%:*}"
+    if [ -n "$SHAKAPACKER_NPM" ]; then
+      echo "  Shakapacker (npm, $SHAKAPACKER_NPM_PACKAGE): $SHAKAPACKER_NPM"
+    else
+      echo "  Shakapacker (npm): not found"
+    fi
+  fi
+
+  REACT_ROOT=""
+  if [ -f "$PROJECT_ROOT/package.json" ]; then
+    REACT_ROOT=$(grep '"react":' "$PROJECT_ROOT/package.json" | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+    echo "  React (root): ${REACT_ROOT:-not found}"
+  fi
+
+  REACT_DUMMY=""
+  if [ -f "$PROJECT_ROOT/react_on_rails/spec/dummy/package.json" ]; then
+    REACT_DUMMY=$(grep '"react":' "$PROJECT_ROOT/react_on_rails/spec/dummy/package.json" | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+    echo "  React (dummy): ${REACT_DUMMY:-not found}"
+  fi
+
+  echo ""
+  if [[ "${SHAKAPACKER_GEM}" == "$MINIMUM_SHAKAPACKER_VERSION" ]] && [[ "${REACT_ROOT}" =~ ^\^?${MINIMUM_REACT_MAJOR_VERSION}(\.|$) ]]; then
+    echo -e "Current config: ${GREEN}minimum${NC} (matches CI: Ruby $MINIMUM_RUBY_MINOR_VERSION, Node $MINIMUM_NODE_MAJOR_VERSION, minimum deps)"
+  elif [[ "${SHAKAPACKER_GEM}" == "$LATEST_SHAKAPACKER_VERSION" ]] && [[ "${REACT_ROOT}" =~ ^\^?${LATEST_REACT_MAJOR_VERSION}(\.|$) ]]; then
+    echo -e "Current config: ${GREEN}latest${NC} (matches CI: Ruby $LATEST_RUBY_MINOR_VERSION, Node $LATEST_NODE_MAJOR_VERSION, latest deps)"
+  else
+    echo -e "Current config: ${YELLOW}unknown/mixed${NC} (run 'bin/ci-switch-config latest' or 'minimum' to align with CI)"
+  fi
+}
+
+switch_to_minimum() {
+  local VERSION_MANAGER=$(check_version_manager)
+
+  print_header "Switching to MINIMUM configuration"
+  echo "  Target: Ruby $MINIMUM_RUBY_MINOR_VERSION, Node $MINIMUM_NODE_MAJOR_VERSION, Shakapacker $MINIMUM_SHAKAPACKER_VERSION, React $MINIMUM_REACT_VERSION"
+  echo "  Using version manager: $VERSION_MANAGER"
+  echo ""
+
+  # Check if we have git changes
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    print_warning "You have uncommitted changes. This script will modify files."
+    read -p "Continue? (y/N) " -n 1 -r REPLY
+    echo
+    if [[ ! "${REPLY}" =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+
+  # Always write .tool-versions: CI reads it directly regardless of version manager.
+  set_tool_versions_to_minimum
+
+  case "$VERSION_MANAGER" in
+    rvm|rvm+nvm)
+      print_header "Creating .ruby-version for rvm"
+      echo "$MINIMUM_RUBY_VERSION" > "$PROJECT_ROOT/.ruby-version"
+      print_success "Created .ruby-version with Ruby $MINIMUM_RUBY_VERSION"
+      ;;
+  esac
+
+  case "$VERSION_MANAGER" in
+    nvm|rvm+nvm)
+      print_header "Creating .nvmrc for nvm"
+      echo "$MINIMUM_NODE_VERSION" > "$PROJECT_ROOT/.nvmrc"
+      print_success "Created .nvmrc with Node $MINIMUM_NODE_VERSION"
+      ;;
+  esac
+
+  set_ruby_version "$MINIMUM_RUBY_VERSION" "$VERSION_MANAGER"
+  set_node_version "$MINIMUM_NODE_VERSION" "$VERSION_MANAGER"
+
+  # Run conversion script
+  # NOTE: This executes 'ruby' before the version manager reloads in your current shell.
+  # The script/convert file requires Ruby 2.6+ and uses basic file I/O operations.
+  # Most modern Ruby versions (2.6+) are compatible. The version manager changes above
+  # only take effect after shell reload, so this uses your current Ruby installation.
+  print_header "Running script/convert to downgrade dependencies"
+  cd "$PROJECT_ROOT"
+  ruby script/convert
+  print_success "Dependency versions downgraded"
+
+  # Clean and reinstall
+  print_header "Cleaning node_modules and reinstalling"
+  rm -rf node_modules
+  if [ -f pnpm-lock.yaml ]; then
+    rm pnpm-lock.yaml
+  fi
+
+  print_header "Installing root dependencies (without --frozen-lockfile)"
+  pnpm install --no-frozen-lockfile
+
+  print_header "Cleaning react_on_rails/spec/dummy and reinstalling"
+  cd react_on_rails/spec/dummy
+  rm -rf node_modules vendor/bundle
+  if [ -f pnpm-lock.yaml ]; then
+    rm pnpm-lock.yaml
+  fi
+
+  pnpm install --no-frozen-lockfile
+  install_bundle_to_vendor "$PWD"
+
+  print_success "Dependencies installed"
+
+  # Reload version manager to pick up new versions
+  print_header "Reloading $VERSION_MANAGER to use new versions"
+  case "$VERSION_MANAGER" in
+    mise)
+      # mise will auto-detect .tool-versions on next cd
+      ;;
+    asdf)
+      # Note: This only affects the script's subshell, not the user's current shell
+      if [ -f "$HOME/.asdf/asdf.sh" ]; then
+        source "$HOME/.asdf/asdf.sh"
+      fi
+      ;;
+    rvm|rvm+nvm)
+      # Versions already set via rvm use
+      ;;
+    nvm)
+      # Version already set via nvm use
+      ;;
+  esac
+
+  echo ""
+  print_success "Switched to MINIMUM configuration"
+
+  case "$VERSION_MANAGER" in
+    rvm+nvm|rvm|nvm)
+      print_warning "IMPORTANT: Version changes in this script don't persist to your current shell."
+      print_warning "The rvm/nvm commands run in a subshell and cannot affect your terminal."
+      echo ""
+      print_warning "Choose one of these options to activate the new versions:"
+      echo "  Option 1 (Recommended): Open a new terminal and cd into the project"
+      echo "  Option 2: Source your shell config:"
+      [ "$VERSION_MANAGER" = "rvm" ] || [ "$VERSION_MANAGER" = "rvm+nvm" ] && echo "    source ~/.rvm/scripts/rvm"
+      [ "$VERSION_MANAGER" = "nvm" ] || [ "$VERSION_MANAGER" = "rvm+nvm" ] && echo "    source \$NVM_DIR/nvm.sh"
+      echo ""
+      ;;
+  esac
+
+  print_warning "After activating versions, verify with:"
+  echo "  cd $PROJECT_ROOT"
+  case "$VERSION_MANAGER" in
+    mise)
+      echo "  mise current"
+      ;;
+    asdf)
+      echo "  asdf current"
+      ;;
+    rvm+nvm)
+      echo "  rvm current && nvm current"
+      ;;
+    rvm)
+      echo "  rvm current"
+      ;;
+    nvm)
+      echo "  nvm current"
+      ;;
+  esac
+  echo ""
+  print_warning "Next steps to build and test:"
+  echo "  rake node_package"
+  echo "  cd react_on_rails/spec/dummy && bin/shakapacker-precompile-hook && RAILS_ENV=test bin/shakapacker"
+  echo "  bundle exec rake run_rspec:all_dummy"
+}
+
+restore_to_latest() {
+  local VERSION_MANAGER=$(check_version_manager)
+
+  print_header "Restoring to LATEST configuration"
+  echo "  Target: Ruby $LATEST_RUBY_MINOR_VERSION, Node $LATEST_NODE_MAJOR_VERSION, Shakapacker $LATEST_SHAKAPACKER_VERSION, React $LATEST_REACT_VERSION"
+  echo "  Using version manager: $VERSION_MANAGER"
+  echo ""
+
+  # Check if we have git changes
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    print_warning "You have uncommitted changes. This script will restore from git."
+    read -p "Continue? This will discard changes to package.json, Gemfile, etc. (y/N) " -n 1 -r REPLY
+    echo
+    if [[ ! "${REPLY}" =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+
+  # Set Ruby and Node versions
+  restore_tool_versions_to_latest
+
+  case "$VERSION_MANAGER" in
+    rvm|rvm+nvm)
+      print_header "Creating .ruby-version for rvm"
+      echo "$LATEST_RUBY_VERSION" > "$PROJECT_ROOT/.ruby-version"
+      print_success "Created .ruby-version with Ruby $LATEST_RUBY_VERSION"
+      ;;
+  esac
+
+  case "$VERSION_MANAGER" in
+    nvm|rvm+nvm)
+      print_header "Creating .nvmrc for nvm"
+      echo "$LATEST_NODE_VERSION" > "$PROJECT_ROOT/.nvmrc"
+      print_success "Created .nvmrc with Node $LATEST_NODE_VERSION"
+      ;;
+  esac
+
+  set_ruby_version "$LATEST_RUBY_VERSION" "$VERSION_MANAGER"
+  set_node_version "$LATEST_NODE_VERSION" "$VERSION_MANAGER"
+
+  # Restore files from git
+  print_header "Restoring dependency files from git"
+  cd "$PROJECT_ROOT"
+  if ! git restore Gemfile.development_dependencies package.json react_on_rails/spec/dummy/package.json packages/react-on-rails-pro/package.json 2>/dev/null; then
+    print_warning "Some files could not be restored (may not exist in git)"
+  else
+    print_success "Files restored from git"
+  fi
+
+  # Clean and reinstall
+  print_header "Cleaning node_modules and reinstalling"
+  rm -rf node_modules
+  if [ -f pnpm-lock.yaml ]; then
+    rm pnpm-lock.yaml
+  fi
+
+  print_header "Installing root dependencies with --frozen-lockfile"
+  pnpm install --frozen-lockfile
+
+  print_header "Cleaning react_on_rails/spec/dummy and reinstalling"
+  cd react_on_rails/spec/dummy
+  rm -rf node_modules vendor/bundle
+  if [ -f pnpm-lock.yaml ]; then
+    rm pnpm-lock.yaml
+  fi
+
+  pnpm install --frozen-lockfile
+  install_bundle_to_vendor "$PWD"
+
+  print_success "Dependencies installed"
+
+  # Reload version manager to pick up new versions
+  print_header "Reloading $VERSION_MANAGER to use new versions"
+  case "$VERSION_MANAGER" in
+    mise)
+      # mise will auto-detect .tool-versions on next cd
+      ;;
+    asdf)
+      # Note: This only affects the script's subshell, not the user's current shell
+      if [ -f "$HOME/.asdf/asdf.sh" ]; then
+        source "$HOME/.asdf/asdf.sh"
+      fi
+      ;;
+    rvm|rvm+nvm)
+      # Versions already set via rvm use
+      ;;
+    nvm)
+      # Version already set via nvm use
+      ;;
+  esac
+
+  echo ""
+  print_success "Restored to LATEST configuration"
+
+  case "$VERSION_MANAGER" in
+    rvm+nvm|rvm|nvm)
+      print_warning "IMPORTANT: Version changes in this script don't persist to your current shell."
+      print_warning "The rvm/nvm commands run in a subshell and cannot affect your terminal."
+      echo ""
+      print_warning "Choose one of these options to activate the new versions:"
+      echo "  Option 1 (Recommended): Open a new terminal and cd into the project"
+      echo "  Option 2: Source your shell config:"
+      [ "$VERSION_MANAGER" = "rvm" ] || [ "$VERSION_MANAGER" = "rvm+nvm" ] && echo "    source ~/.rvm/scripts/rvm"
+      [ "$VERSION_MANAGER" = "nvm" ] || [ "$VERSION_MANAGER" = "rvm+nvm" ] && echo "    source \$NVM_DIR/nvm.sh"
+      echo ""
+      ;;
+  esac
+
+  print_warning "After activating versions, verify with:"
+  echo "  cd $PROJECT_ROOT"
+  case "$VERSION_MANAGER" in
+    mise)
+      echo "  mise current"
+      ;;
+    asdf)
+      echo "  asdf current"
+      ;;
+    rvm+nvm)
+      echo "  rvm current && nvm current"
+      ;;
+    rvm)
+      echo "  rvm current"
+      ;;
+    nvm)
+      echo "  nvm current"
+      ;;
+  esac
+  echo ""
+  print_warning "Next steps to build and test:"
+  echo "  rake node_package"
+  echo "  cd react_on_rails/spec/dummy && bin/shakapacker-precompile-hook && RAILS_ENV=test bin/shakapacker"
+  echo "  bundle exec rake run_rspec:all_dummy"
+}
+
+main() {
+  case "${1:-}" in
+    minimum)
+      switch_to_minimum
+      ;;
+    latest)
+      restore_to_latest
+      ;;
+    status)
+      show_status
+      ;;
+    *)
+      echo "Usage: $0 {minimum|latest|status}"
+      echo ""
+      echo "Commands:"
+      echo "  minimum  - Switch to Ruby $MINIMUM_RUBY_MINOR_VERSION, Node $MINIMUM_NODE_MAJOR_VERSION, minimum dependencies (Shakapacker $MINIMUM_SHAKAPACKER_VERSION, React $MINIMUM_REACT_VERSION)"
+      echo "  latest   - Switch to Ruby $LATEST_RUBY_MINOR_VERSION, Node $LATEST_NODE_MAJOR_VERSION, latest dependencies (Shakapacker $LATEST_SHAKAPACKER_VERSION, React $LATEST_REACT_VERSION)"
+      echo "  status   - Show current configuration"
+      echo ""
+      echo "Examples:"
+      echo "  $0 status           # Check current config"
+      echo "  $0 minimum          # Switch to minimum deps for testing CI failures"
+      echo "  $0 latest           # Switch back to latest deps"
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

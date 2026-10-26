@@ -1,0 +1,736 @@
+# frozen_string_literal: true
+
+require "json"
+require_relative "version_syntax_converter"
+require_relative "shakapacker_config_helpers"
+require_relative "rsc_rspack_support"
+require_relative "version_checker/lockfile_resolution"
+
+module ReactOnRails
+  # Responsible for checking versions of rubygem versus yarn node package
+  # against each other at runtime.
+  class VersionChecker # rubocop:disable Metrics/ClassLength
+    include ShakapackerConfigHelpers
+    include RscRspackSupport
+
+    attr_reader :node_package_version
+
+    # Semver uses - to separate pre-release, but RubyGems use .
+    # Possessive quantifiers (++) keep matching linear on adversarial inputs (e.g. a version
+    # string of thousands of digits): a digit run never needs to backtrack for the following
+    # "." to match, so the semantics are unchanged.
+    VERSION_PARTS_REGEX = /(\d++)\.(\d++)\.(\d++)(?:[-.]([0-9A-Za-z.-]++))?/
+    def self.build
+      new(NodePackageVersion.build)
+    end
+
+    def initialize(node_package_version)
+      @node_package_version = node_package_version
+    end
+
+    # Validates version and package compatibility.
+    # Raises ReactOnRails::Error if:
+    # - package.json file is not found
+    # - Both react-on-rails and react-on-rails-pro packages are installed
+    # - Pro gem is installed but using react-on-rails package
+    # - Pro package is installed but Pro gem is not installed
+    # - Non-exact version is used
+    # - Versions don't match
+    def validate_version_and_package_compatibility!
+      validate_package_json_exists!
+      validate_package_gem_compatibility!
+      validate_exact_version!
+      validate_version_match!
+      validate_rsc_rspack_version!
+    end
+
+    private
+
+    def validate_package_json_exists!
+      return if File.exist?(node_package_version.package_json)
+
+      base_install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails", npm_version_for_package("react-on-rails")
+      )
+      pro_install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails-pro", npm_version_for_package("react-on-rails-pro")
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: package.json file not found.
+
+        Expected location: #{node_package_version.package_json}
+
+        React on Rails requires a package.json file with either 'react-on-rails' or
+        'react-on-rails-pro' package installed.
+
+        Fix:
+          1. Ensure you have a package.json in your project root
+          2. Run: #{base_install_cmd}
+
+          Or if using React on Rails Pro:
+          Run: #{pro_install_cmd}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_package_gem_compatibility!
+      has_base_package = node_package_version.react_on_rails_package?
+      has_pro_package = node_package_version.react_on_rails_pro_package?
+      is_pro_gem = ReactOnRails::Utils.react_on_rails_pro?
+
+      validate_packages_installed!(has_base_package, has_pro_package)
+      validate_no_duplicate_packages!(has_base_package, has_pro_package)
+      validate_pro_gem_uses_pro_package!(is_pro_gem, has_pro_package)
+      validate_pro_package_has_pro_gem!(is_pro_gem, has_pro_package)
+    end
+
+    def validate_packages_installed!(has_base_package, has_pro_package)
+      return if has_base_package || has_pro_package
+
+      base_install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails", npm_version_for_package("react-on-rails")
+      )
+      pro_install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails-pro", npm_version_for_package("react-on-rails-pro")
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: No React on Rails npm package is installed.
+
+        You must install either 'react-on-rails' or 'react-on-rails-pro' package.
+
+        Fix:
+          If using the standard (free) version:
+          Run: #{base_install_cmd}
+
+          Or if using React on Rails Pro:
+          Run: #{pro_install_cmd}
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_no_duplicate_packages!(has_base_package, has_pro_package)
+      return unless has_base_package && has_pro_package
+
+      remove_cmd = ReactOnRails::Utils.package_manager_remove_command("react-on-rails")
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: Both 'react-on-rails' and 'react-on-rails-pro' packages are installed.
+
+        If you're using React on Rails Pro, only install the 'react-on-rails-pro' package.
+        The Pro package already includes all functionality from the base package.
+
+        Fix:
+          1. Remove 'react-on-rails' from your package.json dependencies
+          2. Run: #{remove_cmd}
+          3. Keep only: react-on-rails-pro
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_pro_gem_uses_pro_package!(is_pro_gem, has_pro_package)
+      return unless is_pro_gem && !has_pro_package
+
+      remove_cmd = ReactOnRails::Utils.package_manager_remove_command("react-on-rails")
+      install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails-pro", npm_version_for_package("react-on-rails-pro")
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: You have the Pro gem installed but are using the base 'react-on-rails' package.
+
+        When using React on Rails Pro, you must use the 'react-on-rails-pro' npm package.
+
+        If you're upgrading from React on Rails to Pro, run the generator with validation skipped:
+          REACT_ON_RAILS_SKIP_VALIDATION=true rails g react_on_rails:install --pro
+
+        The generator will automatically replace the base package with the Pro package.
+
+        Or fix manually:
+          1. Remove the base package: #{remove_cmd}
+          2. Install the Pro package: #{install_cmd}
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_pro_package_has_pro_gem!(is_pro_gem, has_pro_package)
+      return unless !is_pro_gem && has_pro_package
+
+      remove_pro_cmd = ReactOnRails::Utils.package_manager_remove_command("react-on-rails-pro")
+      install_base_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        "react-on-rails", npm_version_for_package("react-on-rails")
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: You have the 'react-on-rails-pro' package installed but the Pro gem is not installed.
+
+        The Pro npm package requires the Pro gem to function.
+
+        Fix:
+          1. Install the Pro gem by adding to your Gemfile:
+             gem 'react_on_rails_pro'
+          2. Run: bundle install
+
+        Or if you meant to use the base version:
+          1. Remove the Pro package: #{remove_pro_cmd}
+          2. Install the base package: #{install_base_cmd}
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_exact_version!
+      return if node_package_version.raw.nil? || node_package_version.local_path_or_url? ||
+                node_package_version.workspace_protocol?
+
+      return unless node_package_version.semver_wildcard?
+
+      package_name = node_package_version.package_name
+      install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        package_name, npm_version_for_package(package_name)
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: The '#{package_name}' package version is not an exact version.
+
+        Detected: #{node_package_version.raw}
+             Gem: #{gem_version}
+
+        React on Rails checks the INSTALLED package version against the gem version, so semver
+        ranges like ^ or ~ in package.json are fine when a lockfile can resolve them. No lockfile
+        could resolve the installed version here, so the package.json version itself must be an
+        exact version matching the gem.
+
+        Fix:
+          Run: #{install_cmd}
+          Or run: bundle exec rake react_on_rails:sync_versions WRITE=true
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_version_match!
+      return if node_package_version.raw.nil? || node_package_version.local_path_or_url? ||
+                node_package_version.workspace_protocol?
+
+      return if node_package_version.parts == gem_version_parts
+
+      package_name = node_package_version.package_name
+      install_cmd = ReactOnRails::Utils.package_manager_install_exact_command(
+        package_name, npm_version_for_package(package_name)
+      )
+
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: The '#{package_name}' package version does not match the gem version.
+
+        Package: #{node_package_version.raw}
+            Gem: #{gem_version}
+
+        The npm package and gem versions must match exactly for compatibility.
+
+        Fix:
+          Run: #{install_cmd}
+          Or run: bundle exec rake react_on_rails:sync_versions WRITE=true
+
+        #{package_json_location}
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def validate_rsc_rspack_version!
+      return unless active_assets_bundler == "rspack"
+      return unless rsc_support_enabled?
+
+      rspack_version = detected_rspack_version_for_rsc
+      rspack_major_version = rsc_package_major_version(rspack_version)
+      return if rspack_major_version >= MINIMUM_RSC_RSPACK_MAJOR
+      if rsc_rspack_version_provably_incompatible?(rspack_version, rspack_major_version)
+        raise ReactOnRails::Error, rsc_rspack_version_error(rspack_version)
+      end
+
+      warn_undetermined_rsc_rspack_version(rspack_version)
+    end
+
+    def detected_rspack_version_for_rsc
+      package_root = rsc_configured_package_root(File.dirname(node_package_version.package_json))
+      declared_spec = package_dependency_spec(RSC_RSPACK_PACKAGE)
+      declared_version = rsc_normalized_declared_package_version(declared_spec) || declared_spec
+      declared_major_version = rsc_package_major_version(declared_spec)
+      return declared_version if rsc_rspack_version_provably_incompatible?(declared_spec, declared_major_version)
+
+      if rsc_flat_installed_package_version(package_root, RSC_RSPACK_PACKAGE)
+        installed_version = rsc_installed_package_version(package_root, RSC_RSPACK_PACKAGE)
+        return installed_version if installed_version
+      end
+
+      return declared_version if declared_major_version >= MINIMUM_RSC_RSPACK_MAJOR
+
+      rsc_installed_package_version(package_root, RSC_RSPACK_PACKAGE) || declared_spec
+    end
+
+    def rsc_support_enabled?
+      rsc_support_enabled_config_value
+    rescue StandardError => e
+      raise ReactOnRails::Error, <<~MSG.strip
+        **ERROR** ReactOnRails: could not determine whether React Server Components are enabled.
+
+        React on Rails Pro configuration raised while validating RSC/Rspack compatibility:
+          #{e.class}: #{e.message}
+
+        Fix:
+          Ensure ReactOnRailsPro.configuration loads and exposes enable_rsc_support.
+
+        #{ReactOnRails::DOCTOR_RECOMMENDATION}
+      MSG
+    end
+
+    def package_dependency_spec(package_name)
+      rsc_declared_package_spec(node_package_version.package_json, package_name)
+    end
+
+    def rsc_rspack_version_error(rspack_version)
+      rsc_rspack_version_requirement_error(
+        rspack_version,
+        error_prefix: "**ERROR** ReactOnRails:",
+        include_doctor_recommendation: true,
+        package_json_path: node_package_version.package_json
+      )
+    end
+
+    def rsc_rspack_version_provably_incompatible?(rspack_version, rspack_major_version)
+      rspack_spec = rsc_static_rspack_version_spec(rspack_version)
+      return false if rspack_spec.empty?
+      return rsc_rspack_or_range_below_minimum?(rspack_spec) if rspack_spec.include?("||")
+
+      rsc_rspack_single_range_below_minimum?(rspack_spec, rspack_major_version)
+    end
+
+    def rsc_static_rspack_version_spec(rspack_version)
+      rspack_version.to_s.strip.sub(%r{\Anpm:(?:@[^/]+/)?[^@]+@}, "")
+    end
+
+    def rsc_rspack_or_range_below_minimum?(rspack_version)
+      clauses = rspack_version.split("||").map(&:strip).reject(&:empty?)
+      clauses.any? && clauses.all? { |clause| rsc_rspack_single_range_below_minimum?(clause) }
+    end
+
+    def rsc_rspack_single_range_below_minimum?(
+      rspack_version,
+      rspack_major_version = rsc_package_major_version(rspack_version)
+    )
+      return false if rsc_rspack_open_lower_bound_below_minimum?(rspack_version)
+      return rspack_major_version < MINIMUM_RSC_RSPACK_MAJOR if rspack_major_version.positive?
+
+      normalized_version = rsc_normalized_declared_package_version(rspack_version)
+      return normalized_version.split(".").first.to_i < MINIMUM_RSC_RSPACK_MAJOR if normalized_version
+
+      rsc_rspack_major_shorthand_below_minimum?(rspack_version) ||
+        rsc_rspack_upper_bound_below_minimum?(rspack_version) ||
+        rsc_rspack_hyphen_range_below_minimum?(rspack_version) ||
+        rsc_rspack_compound_static_clause_below_minimum?(rspack_version)
+    end
+
+    def rsc_rspack_open_lower_bound_below_minimum?(rspack_version)
+      lower_bound = rspack_version.to_s.strip.match(
+        /\A>=?\s*v?(?<major>\d+)(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?\z/
+      )
+      return false unless lower_bound
+
+      lower_bound[:major].to_i < MINIMUM_RSC_RSPACK_MAJOR
+    end
+
+    def rsc_rspack_major_shorthand_below_minimum?(rspack_version)
+      shorthand = rspack_version.to_s.strip.match(
+        /\A[~^=]?\s*v?(?<major>\d+)(?:\.(?:x|\*|\d+))?(?:\.(?:x|\*|\d+))?\z/i
+      )
+      return false unless shorthand
+
+      shorthand[:major].to_i < MINIMUM_RSC_RSPACK_MAJOR
+    end
+
+    def rsc_rspack_upper_bound_below_minimum?(rspack_version)
+      return false if rspack_version.to_s.include?("||")
+
+      upper_bound_pattern = /(?<operator><=?)\s*v?(?<major>\d+)(?:\.(?<minor>\d+))?(?:\.(?<patch>\d+))?/
+      rspack_version.to_s.strip.to_enum(:scan, upper_bound_pattern).any? do
+        upper_bound = Regexp.last_match
+        next true if upper_bound[:major].to_i < MINIMUM_RSC_RSPACK_MAJOR
+
+        upper_bound[:operator] == "<" &&
+          upper_bound[:major].to_i == MINIMUM_RSC_RSPACK_MAJOR &&
+          [upper_bound[:minor], upper_bound[:patch]].compact.all? { |part| part.to_i.zero? }
+      end
+    end
+
+    def rsc_rspack_hyphen_range_below_minimum?(rspack_version)
+      hyphen_range = rspack_version.to_s.strip.match(
+        /
+          \A
+          v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?
+          \s+-\s+
+          v?(?<upper_major>\d+)(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?
+          \z
+        /x
+      )
+      return false unless hyphen_range
+
+      hyphen_range[:upper_major].to_i < MINIMUM_RSC_RSPACK_MAJOR
+    end
+
+    def rsc_rspack_compound_static_clause_below_minimum?(rspack_version)
+      range = rspack_version.to_s.strip
+      return false unless range.match?(/\s/)
+      return false if range.match?(/\s+-\s+/)
+
+      clause_pattern = /
+        (?:\A|\s)
+        (?<operator>[~^=]|[<>]=?)?
+        \s*
+        v?(?<major>\d+)
+        (?:\.(?:x|\*|\d+))?
+        (?:\.(?:x|\*|\d+))?
+        (?:-[0-9A-Za-z.-]+)?
+        (?=\s|\z)
+      /ix
+      range.to_enum(:scan, clause_pattern).any? do
+        clause = Regexp.last_match
+        operator = clause[:operator].to_s
+        next false if operator.start_with?("<", ">")
+
+        clause[:major].to_i < MINIMUM_RSC_RSPACK_MAJOR
+      end
+    end
+
+    def warn_undetermined_rsc_rspack_version(rspack_version)
+      detected_version = rspack_version || "not found"
+      Rails.logger&.warn(
+        "[React on Rails] Could not verify #{RSC_RSPACK_PACKAGE} >= v#{MINIMUM_RSC_RSPACK_MAJOR} for RSC " \
+        "(detected: #{detected_version}). Boot will continue; " \
+        "run bundle exec rake react_on_rails:doctor to verify before deploy."
+      )
+    end
+
+    def gem_version
+      ReactOnRails::VERSION
+    end
+
+    # Returns the npm-formatted version for install commands.
+    # For Pro packages, prefers ReactOnRailsPro::VERSION when available.
+    def npm_version_for_package(package_name)
+      version = if package_name == "react-on-rails-pro"
+                  pro_version = ReactOnRails::Utils.react_on_rails_pro_version
+                  pro_version.empty? ? gem_version : pro_version
+                else
+                  gem_version
+                end
+      ReactOnRails::VersionSyntaxConverter.new.rubygem_to_npm(version)
+    end
+
+    def gem_version_parts
+      gem_version.match(VERSION_PARTS_REGEX)&.captures&.compact
+    end
+
+    def package_json_location
+      "Package.json location: #{VersionChecker::NodePackageVersion.package_json_path}"
+    end
+
+    # rubocop:disable Metrics/ClassLength
+    class NodePackageVersion
+      attr_reader :package_json, :yarn_lock, :package_lock
+
+      def self.build
+        new(package_json_path, yarn_lock_path, package_lock_path)
+      end
+
+      def self.package_json_path
+        Rails.root.join(ReactOnRails.configuration.node_modules_location, "package.json")
+      end
+
+      def self.yarn_lock_path
+        # Lockfiles are in the same directory as package.json
+        # If node_modules_location is empty, use Rails.root
+        base_dir = ReactOnRails.configuration.node_modules_location.presence || ""
+        Rails.root.join(base_dir, "yarn.lock").to_s
+      end
+
+      def self.package_lock_path
+        # Lockfiles are in the same directory as package.json
+        # If node_modules_location is empty, use Rails.root
+        base_dir = ReactOnRails.configuration.node_modules_location.presence || ""
+        Rails.root.join(base_dir, "package-lock.json").to_s
+      end
+
+      def initialize(package_json, yarn_lock = nil, package_lock = nil)
+        @package_json = package_json
+        @yarn_lock = yarn_lock
+        @package_lock = package_lock
+      end
+
+      def raw
+        return @raw if defined?(@raw)
+
+        return @raw = nil unless File.exist?(package_json)
+
+        parsed = parsed_package_contents
+        return @raw = nil unless parsed.key?("dependencies")
+
+        deps = parsed["dependencies"]
+
+        # Check for react-on-rails-pro first (Pro takes precedence)
+        if deps.key?("react-on-rails-pro")
+          @raw = resolve_version(deps["react-on-rails-pro"], "react-on-rails-pro")
+          return @raw
+        end
+
+        # Fall back to react-on-rails
+        if deps.key?("react-on-rails")
+          @raw = resolve_version(deps["react-on-rails"], "react-on-rails")
+          return @raw
+        end
+
+        # Neither package found
+        msg = "No 'react-on-rails' or 'react-on-rails-pro' entry in the dependencies of " \
+              "#{NodePackageVersion.package_json_path}, which is the expected location according to " \
+              "ReactOnRails.configuration.node_modules_location"
+        Rails.logger.warn(msg)
+        @raw = nil
+      end
+
+      def react_on_rails_package?
+        package_installed?("react-on-rails")
+      end
+
+      def react_on_rails_pro_package?
+        package_installed?("react-on-rails-pro")
+      end
+
+      def package_name
+        return "react-on-rails-pro" if react_on_rails_pro_package?
+
+        "react-on-rails"
+      end
+
+      def semver_wildcard?
+        # See https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies
+        # We want to disallow all expressions other than exact versions
+        # and the ones allowed by local_path_or_url?
+        return true if raw.blank?
+
+        special_version_string? || wildcard_or_x_range? || range_operator? || range_syntax?
+      end
+
+      def special_version_string?
+        %w[latest next canary beta alpha rc].include?(raw.downcase)
+      end
+
+      def wildcard_or_x_range?
+        raw == "*" ||
+          raw =~ /^[xX*]$/ ||
+          raw =~ /^[xX*]\./ ||
+          raw =~ /\.[xX*]\b/ ||
+          raw =~ /\.[xX*]$/
+      end
+
+      def range_operator?
+        raw.start_with?(/[~^><*]/)
+      end
+
+      def range_syntax?
+        raw.include?(" - ") || raw.include?(" || ")
+      end
+
+      def local_path_or_url?
+        # See https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies
+        # All path and protocol "version ranges" include / somewhere,
+        # but we want to make an exception for npm:@scope/pkg@version.
+        !raw.nil? && raw.include?("/") && !raw.start_with?("npm:")
+      end
+
+      def workspace_protocol?
+        # pnpm workspace protocol: workspace:* or workspace:^
+        # Used for monorepo internal dependencies
+        !raw.nil? && raw.start_with?("workspace:")
+      end
+
+      def parts
+        return if local_path_or_url? || workspace_protocol?
+
+        match = raw.match(VERSION_PARTS_REGEX)
+        unless match
+          raise ReactOnRails::Error,
+                "Cannot parse version number '#{raw}' (only exact versions are supported). " \
+                "#{ReactOnRails::DOCTOR_RECOMMENDATION}"
+        end
+
+        match.captures.compact
+      end
+
+      private
+
+      # Resolve version from lockfiles if available, otherwise use package.json version
+      def resolve_version(package_json_version, package_name)
+        # If package.json specifies a local path, URL, or workspace link, don't try to resolve
+        # from lockfiles. Lockfiles record placeholders for links (e.g. "0.0.0", the Yarn Berry
+        # "0.0.0-use.local"), and keeping the raw spec lets the validators apply their
+        # local/workspace exemptions. A JSON null dependency value stays nil (validators treat a
+        # nil raw as "not installed").
+        return package_json_version if package_json_version.nil? ||
+                                       local_path_or_url_version?(package_json_version) ||
+                                       package_json_version.start_with?("workspace:")
+
+        # Fall back to the package.json version when no lockfile resolves one.
+        lockfile_version(package_name) || package_json_version
+      end
+
+      # Try yarn.lock first, then package-lock.json, then the other package managers'
+      # lockfiles (pnpm-lock.yaml, bun.lock), which live in the same directory as package.json.
+      def lockfile_version(package_name)
+        if yarn_lock && File.exist?(yarn_lock)
+          version = version_from_yarn_lock(package_name)
+          return version if version
+        end
+
+        if package_lock && File.exist?(package_lock)
+          version = version_from_package_lock(package_name)
+          return version if version
+        end
+
+        LockfileResolution.version(File.dirname(package_json.to_s), package_name)
+      end
+
+      # Check if a version string represents a local path or URL
+      def local_path_or_url_version?(version)
+        return false if version.nil?
+
+        version.include?("/") && !version.start_with?("npm:")
+      end
+
+      # Parse version from yarn.lock
+      # Looks for entries like:
+      #   react-on-rails@^16.1.1:
+      #     version "16.1.1"
+      # The pattern ensures exact package name match to avoid matching similar names
+      # (e.g., "react-on-rails" won't match "react-on-rails-pro")
+      # rubocop:disable Metrics/CyclomaticComplexity
+      def version_from_yarn_lock(package_name)
+        return nil unless yarn_lock && File.exist?(yarn_lock)
+
+        # Yarn Berry (yarn 2+) writes the same yarn.lock filename in a YAML format marked by an
+        # __metadata section near the top; the format is decided by content, not by the yarn
+        # version in use. Sniff only the file head so the classic path below keeps streaming.
+        if File.open(yarn_lock) { |f| f.read(1024) }.to_s.include?("__metadata:")
+          return LockfileResolution.berry_yarn_version(File.read(yarn_lock), package_name)
+        end
+
+        in_package_block = false
+        File.foreach(yarn_lock) do |line|
+          # Check if we're starting the block for our package
+          # Pattern: optionally quoted package name, followed by @, ensuring it's not followed by more word chars
+          # This prevents "react-on-rails" from matching "react-on-rails-pro"
+          if line.match?(/^"?#{Regexp.escape(package_name)}@/)
+            in_package_block = true
+            next
+          end
+
+          # If we're in the package block, look for the version line
+          next unless in_package_block
+          # Version line looks like:  version "16.1.1"
+          if (match = line.match(/^\s+version\s+"([^"]+)"/))
+            return match[1]
+          end
+
+          # If we hit a blank line or new package, we've left the block
+          break if line.strip.empty? || (line[0] != " " && line[0] != "\t")
+        end
+
+        nil
+      end
+      # rubocop:enable Metrics/CyclomaticComplexity
+
+      # Parse version from package-lock.json
+      # Supports both v1 (dependencies) and v2/v3 (packages) formats
+      # rubocop:disable Metrics/CyclomaticComplexity
+      def version_from_package_lock(package_name)
+        return nil unless package_lock && File.exist?(package_lock)
+
+        begin
+          parsed = JSON.parse(File.read(package_lock))
+
+          # Try v2/v3 format first (packages)
+          if parsed["packages"]
+            # Look for node_modules/package-name entry
+            node_modules_key = "node_modules/#{package_name}"
+            package_data = parsed["packages"][node_modules_key]
+            return package_data["version"] if package_data&.key?("version")
+          end
+
+          # Fall back to v1 format (dependencies)
+          if parsed["dependencies"]
+            dependency_data = parsed["dependencies"][package_name]
+            # In v1, the dependency can be a hash with a "version" key
+            return dependency_data["version"] if dependency_data.is_a?(Hash) && dependency_data.key?("version")
+          end
+        rescue JSON::ParserError
+          # If we can't parse the lockfile, fall back to package.json version
+          nil
+        end
+
+        nil
+      end
+      # rubocop:enable Metrics/CyclomaticComplexity
+
+      def package_installed?(package_name)
+        return false unless File.exist?(package_json)
+
+        parsed = parsed_package_contents
+        parsed.dig("dependencies", package_name).present?
+      end
+
+      def package_json_contents
+        @package_json_contents ||= File.read(package_json)
+      end
+
+      def parsed_package_contents
+        return @parsed_package_contents if defined?(@parsed_package_contents)
+
+        begin
+          @parsed_package_contents = JSON.parse(package_json_contents)
+        rescue JSON::ParserError => e
+          raise ReactOnRails::Error, <<~MSG.strip
+            **ERROR** ReactOnRails: Failed to parse package.json file.
+
+            Location: #{package_json}
+            Error: #{e.message}
+
+            The package.json file contains invalid JSON. Please check the file for syntax errors.
+
+            Common issues:
+              - Missing or extra commas
+              - Unquoted keys or values
+              - Trailing commas (not allowed in JSON)
+              - Comments (not allowed in standard JSON)
+
+            #{ReactOnRails::DOCTOR_RECOMMENDATION}
+          MSG
+        end
+      end
+    end
+    # rubocop:enable Metrics/ClassLength
+  end
+end

@@ -1,0 +1,55 @@
+node_modules/
+package.json
+# pnpm config file (INI format, not parseable by prettier)
+.npmrc
+packages/react-on-rails-pro-node-renderer/tests/fixtures/projects
+tmp/
+coverage/
+**/app/assets/webpack/
+gen-examples/examples/*
+packages/*/lib/*
+spec/react_on_rails/dummy-for-generators/app/javascript/bundles/HelloWorld/*
+bundle/
+react_on_rails/spec/dummy/lib/bs/**
+react_on_rails/spec/dummy/public
+react_on_rails_pro/**/public
+**/.yalc/**
+**/.node-renderer-bundles
+**/*generated*
+*.res.js
+**/vendor
+
+# Prettier doesn't understand ERB syntax in YAML files and can damage templates
+*.yml
+*.yaml
+# Intentionally invalid
+spec/react_on_rails/fixtures/i18n/locales_symbols/
+
+# Internal documentation - ignore formatting
+CLAUDE.md
+
+# Byte-identical shared source-pack copy; the pinned drift gate owns formatting.
+.agents/docs/installation-and-upgrades.md
+
+# Generated ShakaPerf investigation reports; keep the archived HTML untouched.
+internal/analysis/rsc-fouc-shakaperf-artifacts/reports/**/*.html
+
+# PPR evidence-base experiment artifacts (#4885); byte-faithful to what ran.
+internal/analysis/experiments/
+
+# Pinned generated Rails fixtures and recorded benchmark output.
+benchmarks/rspack-vite-rails-dx/starters/
+benchmarks/rspack-vite-rails-dx/results/*.json
+
+# Byte-verbatim historical generator output; rsc_generator_spec.rb pins that the generator
+# leaves this shape unchanged, so formatters must never rewrite it.
+react_on_rails/spec/react_on_rails/fixtures/previous_generated_rsc_configs/*.js
+
+# Legal copies follow the byte faithful precedents above for the pinned shared copy and PPR evidence artifacts.
+# Their required digest is verified by package_license_metadata_spec.rb.
+REACT-ON-RAILS-PRO-LICENSE.md
+packages/react-on-rails-pro/LICENSE.md
+packages/react-on-rails-pro-node-renderer/LICENSE.md
+
+# Intentionally invalid JSON fixture (lockfile parser resilience test)
+react_on_rails/spec/react_on_rails/fixtures/lockfiles/npm_malformed/package-lock.json

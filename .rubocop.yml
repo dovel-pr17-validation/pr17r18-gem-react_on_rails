@@ -1,0 +1,112 @@
+# Root RuboCop configuration for React on Rails monorepo
+# This contains shared settings inherited by react_on_rails/ and react_on_rails_pro/
+require:
+  - rubocop-performance
+  - rubocop-rspec
+
+AllCops:
+  NewCops: enable
+  DisplayCopNames: true
+  SuggestExtensions: false
+  TargetRubyVersion: 3.3
+
+  Include:
+    - '**/Rakefile'
+    - '**/config.ru'
+    - '**/Gemfile'
+    - '**/*.rb'
+    - '**/*.rake'
+
+  Exclude:
+    - '**/*.js'
+    - 'bin/conductor-exec' # Shell script, not Ruby
+    - '**/node_modules/**/*'
+    - '**/public/**/*'
+    - '**/tmp/**/*'
+    - 'coverage/**/*'
+    - 'gen-examples/**/*'
+    - 'node_modules/**/*'
+    - 'spec/fixtures/**/*'
+    - 'spec/react_on_rails/dummy-for-generators/**/*'
+    # Root-wide RuboCop uses root-relative paths. Keep generated/package-specific
+    # exclusions here so the root sweep does not fail on files package CI exempts.
+    - 'react_on_rails/spec/react_on_rails/dummy-for-generators/**/*'
+    - 'react_on_rails/spike/**/*'
+    # Pinned generated Rails fixtures use their own application toolchains.
+    - 'benchmarks/rspack-vite-rails-dx/starters/**/*'
+    - 'react_on_rails_pro/spec/dummy/db/schema.rb'
+    - 'react_on_rails_pro/spec/dummy/db/seeds.rb'
+    - 'react_on_rails/spec/dummy/bin/**/*'
+    - 'react_on_rails_pro/spec/dummy/bin/**/*'
+    - 'react_on_rails_pro/spec/execjs-compatible-dummy/bin/**/*'
+    - '**/vendor/**/*'
+
+Naming/FileName:
+  Exclude:
+    - '**/Gemfile'
+    - '**/Gemfile.*'
+    - '**/Rakefile'
+
+Layout/LineLength:
+  Max: 120
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/Documentation:
+  Enabled: false
+
+Style/HashEachMethods:
+  Enabled: true
+
+Style/HashTransformKeys:
+  Enabled: true
+
+Style/HashTransformValues:
+  Enabled: true
+
+Metrics/AbcSize:
+  Max: 28
+
+Metrics/ClassLength:
+  Max: 150
+
+Metrics/CyclomaticComplexity:
+  Max: 8
+
+Metrics/PerceivedComplexity:
+  Max: 10
+
+Metrics/ParameterLists:
+  Max: 5
+  CountKeywordArgs: false
+
+Metrics/MethodLength:
+  Max: 41
+
+Metrics/ModuleLength:
+  Max: 180
+
+RSpec/DescribeClass:
+  Enabled: false
+
+RSpec/ExampleLength:
+  Enabled: false
+
+RSpec/MessageSpies:
+  Enabled: false
+
+RSpec/MessageChain:
+  Enabled: false
+
+RSpec/MultipleExpectations:
+  Enabled: false
+
+RSpec/MultipleMemoizedHelpers:
+  Max: 12
+
+RSpec/NestedGroups:
+  Max: 5
+
+Style/FrozenStringLiteralComment:
+  EnforcedStyle: always

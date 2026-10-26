@@ -1,0 +1,124 @@
+---
+name: Detect Invalid CI Commands
+
+"on":
+  issue_comment:
+    types: [created]
+
+jobs:
+  detect-invalid-commands:
+    # Only run on PR comments that contain potential commands but don't match
+    # valid commands.
+    if: |
+      github.event.issue.pull_request &&
+      (
+        contains(github.event.comment.body, '/ci') ||
+        contains(github.event.comment.body, '/run') ||
+        contains(github.event.comment.body, '/stop') ||
+        contains(github.event.comment.body, '/delete') ||
+        contains(github.event.comment.body, '/deploy') ||
+        contains(github.event.comment.body, '/help')
+      )
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check for similar commands
+        id: check_command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+
+            // Detect command attempts at the start of a line.
+            // Matches /ci*, /run*, /stop*, /delete*, /deploy*, and /help*
+            // at the beginning of a comment or after a newline.
+            const commandPattern = new RegExp(
+              String.raw`(?:^|\n)\s*` +
+                String.raw`(/(ci|run|stop|delete|deploy|help)[\w-]*)`,
+              'gi',
+            );
+            const matches = [...comment.matchAll(commandPattern)];
+
+            if (matches.length === 0) {
+              console.log('No potential commands found at line start');
+              return { shouldRespond: false };
+            }
+
+            // Legacy slash CI commands were removed; CI commands now use +ci-*.
+            const validCommands = [];
+
+            // Check if any command is invalid
+            const invalidCommands = matches
+              .map(m => m[1].toLowerCase())
+              .filter(cmd => !validCommands.includes(cmd));
+
+            if (invalidCommands.length > 0) {
+              console.log('Found invalid commands:', invalidCommands);
+              return {
+                shouldRespond: true,
+                invalidCommands: invalidCommands
+              };
+            }
+
+            return { shouldRespond: false };
+          # Default result-encoding (json) JSON.stringifies the returned object.
+          # That lets downstream `fromJSON(...)` and `JSON.parse` read it.
+          # `result-encoding: string` would coerce the object to
+          # "[object Object]", which breaks `fromJSON` and fails each job.
+
+      - name: Post helpful comment
+        if: >-
+          steps.check_command.outputs.result != '' &&
+          fromJSON(steps.check_command.outputs.result).shouldRespond == true
+        uses: actions/github-script@v7
+        env:
+          CHECK_RESULT: ${{ steps.check_command.outputs.result }}
+        with:
+          script: |
+            const result = JSON.parse(process.env.CHECK_RESULT);
+            const invalidCommands = result.invalidCommands || [];
+
+            const invalidCmdsList = invalidCommands.length > 0
+              ? [
+                  '',
+                  '**Invalid command(s) detected:** ' +
+                    invalidCommands.map((cmd) => `\`${cmd}\``).join(', '),
+                ]
+              : [];
+
+            const body = [
+              '👋 It looks like you may have tried to use a CI command, ' +
+                "but it doesn't match the available commands.",
+              ...invalidCmdsList,
+              '',
+              'CI commands are `+ci-*` PR comments handled by the current ' +
+                'CI command workflow.',
+              'Comment `+ci-help` at the start of a new PR comment line to ' +
+                'show the current command list.',
+              '',
+              'Legacy slash aliases were removed. Use `+ci-*` commands ' +
+                "because GitHub's comment editor reserves `/` for built-in " +
+                'slash command autocomplete.',
+              '',
+              '📖 For more details, see the [Contributing Guide]' +
+                '(https://github.com/shakacode/react_on_rails/blob/main/' +
+                'CONTRIBUTING.md#using-comment-commands-to-trigger-ci)'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+            // Add reaction to original comment
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });

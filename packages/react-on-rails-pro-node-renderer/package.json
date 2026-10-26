@@ -1,0 +1,182 @@
+{
+  "name": "react-on-rails-pro-node-renderer",
+  "version": "17.0.0-rc.6",
+  "protocolVersion": "2.0.0",
+  "description": "React on Rails Pro Node Renderer for server-side rendering",
+  "engines": {
+    "node": ">=18.19.0"
+  },
+  "main": "lib/ReactOnRailsProNodeRenderer.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/ReactOnRailsProNodeRenderer.d.ts",
+      "default": "./lib/ReactOnRailsProNodeRenderer.js"
+    },
+    "./master": {
+      "types": "./lib/master.d.ts",
+      "default": "./lib/master.js"
+    },
+    "./worker": {
+      "types": "./lib/worker.d.ts",
+      "default": "./lib/worker.js"
+    },
+    "./integrations/internal/*": null,
+    "./integrations/*": {
+      "types": "./lib/integrations/*.d.ts",
+      "default": "./lib/integrations/*.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "LICENSE.md",
+    "README.md",
+    "lib/**/*.js",
+    "lib/**/*.d.ts"
+  ],
+  "dependencies": {
+    "@fastify/formbody": "^7.4.0 || ^8.0.2",
+    "@fastify/multipart": "^8.3.1 || ^9.0.3",
+    "fastify": "^5.8.5",
+    "fs-extra": "^11.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "lockfile": "^1.0.4",
+    "pino": "^9.14.0 || ^10.1.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.6",
+    "@babel/preset-env": "^7.20.2",
+    "@babel/preset-react": "^7.26.3",
+    "@babel/preset-typescript": "^7.27.1",
+    "@honeybadger-io/js": "^6.10.1",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.214.0",
+    "@fastify/otel": "^0.18.1",
+    "@opentelemetry/instrumentation": "^0.214.0",
+    "@opentelemetry/instrumentation-http": "^0.214.0",
+    "@opentelemetry/resources": "^2.0.1",
+    "@opentelemetry/sdk-trace-base": "^2.0.1",
+    "@opentelemetry/sdk-trace-node": "^2.0.1",
+    "@opentelemetry/semantic-conventions": "^1.36.0",
+    "@sentry/node": "^7.120.0",
+    "@types/fs-extra": "^11.0.4",
+    "@types/jest": "^29.5.12",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/lockfile": "^1.0.4",
+    "@types/touch": "^3.1.5",
+    "babel-jest": "^29.7.0",
+    "form-data": "^4.0.6",
+    "jest-junit": "^16.0.0",
+    "node-html-parser": "^7.0.1",
+    "pino-pretty": "^13.0.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-on-rails": "workspace:*",
+    "react-on-rails-rsc": "19.3.1-rc.0",
+    "redis": "^5.0.1",
+    "sentry-testkit": "^5.0.6",
+    "touch": "^3.1.0",
+    "typescript": "^5.4.3"
+  },
+  "peerDependencies": {
+    "@honeybadger-io/js": ">=4.0.0",
+    "@opentelemetry/api": ">=1.9.0 <2.0.0",
+    "@opentelemetry/exporter-trace-otlp-http": ">=0.214.0 <1.0.0",
+    "@fastify/otel": ">=0.18.0 <1.0.0",
+    "@opentelemetry/instrumentation": ">=0.214.0 <1.0.0",
+    "@opentelemetry/instrumentation-http": ">=0.214.0 <1.0.0",
+    "@opentelemetry/resources": ">=2.0.0 <3.0.0",
+    "@opentelemetry/sdk-trace-base": ">=2.0.0 <3.0.0",
+    "@opentelemetry/sdk-trace-node": ">=2.0.0 <3.0.0",
+    "@opentelemetry/semantic-conventions": ">=1.36.0 <2.0.0",
+    "@sentry/node": ">=5.0.0 <11.0.0",
+    "@sentry/tracing": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@honeybadger-io/js": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-http": {
+      "optional": true
+    },
+    "@fastify/otel": {
+      "optional": true
+    },
+    "@opentelemetry/instrumentation": {
+      "optional": true
+    },
+    "@opentelemetry/instrumentation-http": {
+      "optional": true
+    },
+    "@opentelemetry/resources": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace-base": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace-node": {
+      "optional": true
+    },
+    "@opentelemetry/semantic-conventions": {
+      "optional": true
+    },
+    "@sentry/node": {
+      "optional": true
+    },
+    "@sentry/tracing": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "pnpm run clean && tsc --project src/tsconfig.json",
+    "build-watch": "pnpm run clean && tsc --watch --project src/tsconfig.json",
+    "clean": "rm -rf ./lib",
+    "ci": "jest --ci --runInBand --reporters=default --reporters=jest-junit",
+    "test": "jest tests",
+    "type-check": "tsc --noEmit --noErrorTruncation --project src/tsconfig.json && tsc --noEmit --noErrorTruncation --project type-tests/tsconfig.json",
+    "prepare": "[ -f lib/ReactOnRailsProNodeRenderer.js ] || (rm -rf ./lib && tsc --project src/tsconfig.json)",
+    "prepublishOnly": "pnpm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shakacode/react_on_rails.git",
+    "directory": "packages/react-on-rails-pro-node-renderer"
+  },
+  "keywords": [
+    "react",
+    "webpack",
+    "JavaScript",
+    "Ruby",
+    "on",
+    "Rails"
+  ],
+  "author": "justin@shakacode.com",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "bugs": {
+    "url": "https://github.com/shakacode/react_on_rails/issues"
+  },
+  "homepage": "https://reactonrails.com/docs/pro/node-renderer/",
+  "jest": {
+    "clearMocks": true,
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
+    "resetModules": true,
+    "resetMocks": true,
+    "roots": [
+      "."
+    ],
+    "setupFiles": [
+      "./tests/helper.ts"
+    ],
+    "testEnvironment": "node",
+    "transform": {
+      "^.+\\.[jt]sx?$": "babel-jest"
+    }
+  }
+}

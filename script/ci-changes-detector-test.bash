@@ -1,0 +1,2212 @@
+#!/usr/bin/env bash
+# Test harness for script/ci-changes-detector. Requires bash, git, and perl
+# (perl is used for inline fixture rewrites). Run with
+# `bash script/ci-changes-detector-test.bash`.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DETECTOR="$SCRIPT_DIR/ci-changes-detector"
+CI_LOCAL="$SCRIPT_DIR/../bin/ci-local"
+
+TESTS_RUN=0
+TESTS_FAILED=0
+CURRENT_TEST=""
+FAILURES=()
+
+fail() {
+  local message="$1"
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  FAILURES+=("$CURRENT_TEST: $message")
+  # When invoked from inside a run_test subshell, also persist the message so
+  # the outer summary can show the specific assertion rather than a generic
+  # "subshell exited" line.
+  if [ -n "${SUBSHELL_FAILURES_FILE:-}" ]; then
+    printf '%s\n' "$CURRENT_TEST: $message" >> "$SUBSHELL_FAILURES_FILE"
+  fi
+  echo "  FAIL: $message" >&2
+}
+
+assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local label="${3:-output}"
+  case "$haystack" in
+    *"$needle"*) ;;
+    *)
+      fail "$label: expected to contain '$needle', got '$haystack'"
+      return 1
+      ;;
+  esac
+}
+
+run_test() {
+  local test_fn="$1"
+  CURRENT_TEST="$test_fn"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  echo "-> $test_fn"
+
+  local tmpdir before_failed had_errexit=false subshell_failures
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/ci-changes-detector-test.XXXXXX")"
+  subshell_failures="$tmpdir/failures.log"
+  : > "$subshell_failures"
+  before_failed="$TESTS_FAILED"
+
+  case "$-" in
+    *e*) had_errexit=true ;;
+  esac
+
+  set +e
+  (
+    set -euo pipefail
+    SUBSHELL_FAILURES_FILE="$subshell_failures"
+    export SUBSHELL_FAILURES_FILE
+    cd "$tmpdir" || exit 1
+    "$test_fn"
+  )
+  local rc=$?
+  if [ "$had_errexit" = true ]; then
+    set -e
+  fi
+
+  # Ingest detailed failure messages recorded inside the subshell so the final
+  # summary reflects the actual assertion text instead of a generic exit code.
+  if [ -s "$subshell_failures" ]; then
+    while IFS= read -r failure_line; do
+      [ -n "$failure_line" ] || continue
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      FAILURES+=("$failure_line")
+    done < "$subshell_failures"
+  fi
+  rm -rf "$tmpdir"
+
+  if [ "$rc" -ne 0 ] && [ "$TESTS_FAILED" -eq "$before_failed" ]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILURES+=("$CURRENT_TEST: subshell exited $rc (see stderr above for details)")
+    echo "  FAIL: subshell exited $rc" >&2
+  fi
+}
+
+setup_repo() {
+  git init -b main >/dev/null
+  git config user.email test@example.com
+  git config user.name "CI Detector Test"
+
+  mkdir -p docs react_on_rails/lib/react_on_rails packages/react-on-rails/src
+  mkdir -p packages/react-on-rails-pro-node-renderer/src
+  mkdir -p react_on_rails/spec/react_on_rails
+  mkdir -p react_on_rails/app/helpers
+  mkdir -p react_on_rails_pro/app/controllers/react_on_rails_pro/rolling_deploy
+  mkdir -p react_on_rails_pro/spec/dummy/spec/requests
+  mkdir -p benchmarks/lib
+  cat > docs/guide.md <<'DOC'
+# Guide
+DOC
+  cat > react_on_rails/lib/react_on_rails/example.rb <<'RUBY'
+module ReactOnRails
+  class Example
+    def call
+      "ok"
+    end
+  end
+end
+RUBY
+  cat > packages/react-on-rails/src/example.ts <<'TS'
+export function example(): string {
+  return 'ok';
+}
+TS
+  cat > packages/react-on-rails/src/template.ts <<'TS'
+export const template = `
+// runtime fixture text
+`;
+TS
+  cat > packages/react-on-rails-pro-node-renderer/src/example.ts <<'TS'
+export function render(): string {
+  return 'ok';
+}
+TS
+  cat > react_on_rails/spec/react_on_rails/example_spec.rb <<'RUBY'
+RSpec.describe "example" do
+  it "works" do
+    expect(true).to be(true)
+  end
+end
+RUBY
+  cat > react_on_rails/app/helpers/react_on_rails_helper.rb <<'RUBY'
+module ReactOnRails
+  module Helper
+    def react_component
+      "ok"
+    end
+  end
+end
+RUBY
+  cat > benchmarks/lib/sample.rb <<'RUBY'
+module BenchmarkSample
+  def self.call
+    "ok"
+  end
+end
+RUBY
+  cat > react_on_rails_pro/app/controllers/react_on_rails_pro/rolling_deploy/bundles_controller.rb <<'RUBY'
+module ReactOnRailsPro
+  module RollingDeploy
+    class BundlesController
+      def call
+        "ok"
+      end
+    end
+  end
+end
+RUBY
+  cat > react_on_rails_pro/spec/dummy/spec/requests/posts_page_spec.rb <<'RUBY'
+RSpec.describe "posts page" do
+  it "renders" do
+    expect(true).to be(true)
+  end
+end
+RUBY
+
+  git add .
+  git commit -m "initial fixture" >/dev/null
+}
+
+setup_ci_local_repo() {
+  git init -b main >/dev/null
+  git config user.email test@example.com
+  git config user.name "CI Local Test"
+
+  mkdir -p bin script test-bin node_modules vendor/bundle
+  mkdir -p react_on_rails/spec/dummy/node_modules
+  cp "$CI_LOCAL" bin/ci-local
+  chmod +x bin/ci-local
+  : > Gemfile
+  : > react_on_rails/Gemfile
+  : > react_on_rails/spec/dummy/Gemfile
+
+  cat > script/check-docs-sidebar <<'BASH'
+#!/usr/bin/env bash
+exit 0
+BASH
+  chmod +x script/check-docs-sidebar
+
+  cat > script/ci-changes-detector <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_ruby=false
+run_dummy=false
+run_gem_generator_specs=false
+run_release_supervisor_tests=false
+run_generators=false
+run_js=false
+run_pro_tests=false
+case "${CI_LOCAL_FIXTURE_SELECTION:?}" in
+  core_ruby)
+    run_ruby=true
+    run_gem_generator_specs=true
+    ;;
+  gem_generator_specs) run_gem_generator_specs=true ;;
+  release_supervisor) run_release_supervisor_tests=true ;;
+  dummy) run_dummy=true ;;
+  pro_tests) run_pro_tests=true ;;
+  js_and_pro_tests)
+    run_js=true
+    run_pro_tests=true
+    ;;
+  # Consumer-contract fixture: the current detector never emits this one-sided
+  # combination, but ci-local must not couple two independent JSON fields.
+  generated_examples) run_generators=true ;;
+  generator_change)
+    run_ruby=true
+    run_gem_generator_specs=true
+    run_generators=true
+    ;;
+  *) exit 2 ;;
+esac
+
+cat <<JSON
+{
+  "docs_only": false,
+  "run_lint": false,
+  "run_ruby_tests": $run_ruby,
+  "run_js_tests": $run_js,
+  "run_dummy_tests": $run_dummy,
+  "run_gem_generator_specs": $run_gem_generator_specs,
+  "run_release_supervisor_tests": $run_release_supervisor_tests,
+  "run_generators": $run_generators,
+  "run_pro_lint": false,
+  "run_pro_tests": $run_pro_tests
+}
+JSON
+
+if [ "$run_ruby" = true ]; then
+  echo "  ✓ RSpec gem tests"
+fi
+if [ "$run_dummy" = true ]; then
+  echo "  ✓ Dummy app integration tests"
+fi
+if [ "$run_gem_generator_specs" = true ]; then
+  echo "  ✓ RSpec gem generator specs"
+fi
+if [ "$run_release_supervisor_tests" = true ]; then
+  echo "  ✓ Release supervisor integration tests"
+fi
+if [ "$run_generators" = true ]; then
+  echo "  ✓ Generator tests"
+fi
+if [ "$run_pro_tests" = true ]; then
+  echo "  ✓ React on Rails Pro tests"
+fi
+BASH
+  chmod +x script/ci-changes-detector
+
+  cat > script/release-test.bash <<'BASH'
+#!/usr/bin/env bash
+printf 'release-supervisor-test\n' >> "$CI_LOCAL_COMMAND_LOG"
+[ "${CI_LOCAL_FAIL_RELEASE_SUPERVISOR:-false}" != true ] || exit 42
+BASH
+  chmod +x script/release-test.bash
+
+  cat > test-bin/gh <<'BASH'
+#!/usr/bin/env bash
+exit 1
+BASH
+  chmod +x test-bin/gh
+
+  cat > test-bin/bundle <<'BASH'
+#!/usr/bin/env bash
+{
+  printf 'bundle'
+  printf '\t%s' "$@"
+  printf '\n'
+} >> "$CI_LOCAL_COMMAND_LOG"
+exit 0
+BASH
+  chmod +x test-bin/bundle
+
+  cat > test-bin/pnpm <<'BASH'
+#!/usr/bin/env bash
+{
+  printf 'pnpm'
+  printf '\t%s' "$@"
+  printf '\n'
+  printf 'pnpm-cwd\t%s' "$PWD"
+  printf '\t%s' "$@"
+  printf '\n'
+} >> "$CI_LOCAL_COMMAND_LOG"
+if [ "$*" = "install" ]; then
+  printf 'pnpm-install-pwd\t%s\n' "$PWD" >> "$CI_LOCAL_COMMAND_LOG"
+fi
+if [ "${CI_LOCAL_FAIL_DUMMY_BUILD:-false}" = true ] && [ "$*" = "run build:test" ]; then
+  exit 42
+fi
+exit 0
+BASH
+  chmod +x test-bin/pnpm
+
+  git add .
+  git commit -m "ci-local fixture" >/dev/null
+}
+
+ci_local_output() {
+  local command_log="$PWD/ci-local-commands.log"
+  : > "$command_log"
+  CI_LOCAL_COMMAND_LOG="$command_log"
+  PATH="$PWD/test-bin:$PATH"
+  BASH_ENV=/dev/null
+  export BASH_ENV CI_LOCAL_COMMAND_LOG PATH
+  hash -r
+  if [ "$(command -v bundle)" != "$PWD/test-bin/bundle" ]; then
+    printf 'fixture bundle resolution mismatch: expected %s, got %s\n' \
+      "$PWD/test-bin/bundle" "$(command -v bundle)" >&2
+    return 1
+  fi
+  bin/ci-local "$@"
+}
+
+test_ci_local_fast_mode_keeps_generator_specs_out_of_unit_job() {
+  setup_ci_local_repo
+
+  local output
+  if ! output="$(ci_local_output --all --fast 2>&1)"; then
+    fail "ci-local fixture failed: $output"
+    return 1
+  fi
+
+  local commands
+  commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$commands" \
+    $'bundle\texec\trake\trun_rspec:gem_unit' \
+    "ci-local command log"
+  case "$commands" in
+    *$'bundle\texec\trake\trun_rspec:gem_generators'*|\
+    *$'bundle\texec\trake\trun_rspec:shakapacker_examples'*|\
+    *$'pnpm\trun\tbuild:test'*|\
+    *$'bundle\texec\trake\trun_rspec:dummy'*)
+      fail "ci-local command log: --fast must skip dummy and generator jobs"
+      ;;
+  esac
+  assert_contains "$output" "Skipping dummy app tests in --fast mode" "ci-local fast output"
+  assert_contains "$output" "Skipping gem generator specs in --fast mode" "ci-local fast output"
+  assert_contains "$output" "Skipping generated example app tests in --fast mode" "ci-local fast output"
+}
+
+test_ci_local_builds_dummy_assets_before_rspec_with_dependencies_present() {
+  setup_ci_local_repo
+
+  [ -d react_on_rails/spec/dummy/node_modules ] || fail "fixture must start with dummy node_modules present"
+  [ ! -e react_on_rails/spec/dummy/public/webpack/test/manifest.json ] ||
+    fail "fixture must start without a dummy test manifest"
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=dummy
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local dummy fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_contains "$commands" $'pnpm\trun\tbuild:test' "dummy command log"
+  assert_contains "$commands" $'bundle\texec\trake\trun_rspec:dummy' "dummy command log"
+  case "$commands" in
+    *$'pnpm\trun\tbuild:test'*$'bundle\texec\trake\trun_rspec:dummy'*) ;;
+    *) fail "dummy command log: bundle build must precede integration RSpec: $commands" ;;
+  esac
+}
+
+test_ci_local_installs_missing_dummy_node_modules_before_build_and_rspec() {
+  setup_ci_local_repo
+  rm -r react_on_rails/spec/dummy/node_modules
+
+  local output commands fixture_root
+  fixture_root="$(pwd -P)"
+  export CI_LOCAL_FIXTURE_SELECTION=dummy
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local missing dummy dependencies fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$commands" \
+    $'pnpm-install-pwd\t'"$fixture_root/react_on_rails/spec/dummy" \
+    "dummy install working directory"
+  case "$commands" in
+    *$'pnpm\tinstall'*$'pnpm\trun\tbuild:test'*$'bundle\texec\trake\trun_rspec:dummy'*) ;;
+    *) fail "dummy command log: install, build, and RSpec must run in order: $commands" ;;
+  esac
+}
+
+test_ci_local_dummy_paths_are_not_reparsed_as_shell_code() {
+  # shellcheck disable=SC2016 # Literal command substitution is the attack fixture.
+  local checkout='checkout space $(touch ci-local-eval-injection)'
+  mkdir "$checkout"
+  cd "$checkout"
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=dummy
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local shell-sensitive checkout fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  [ ! -e react_on_rails/spec/dummy/ci-local-eval-injection ] ||
+    fail "dummy Gemfile path was reparsed as shell code"
+  assert_contains "$commands" $'pnpm\trun\tbuild:test' "shell-sensitive dummy command log"
+  assert_contains "$commands" $'bundle\texec\trake\trun_rspec:dummy' "shell-sensitive dummy command log"
+}
+
+test_ci_local_records_dummy_build_failure_and_skips_rspec() {
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=dummy
+  export CI_LOCAL_FAIL_DUMMY_BUILD=true
+  if output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local must fail when dummy bundle preparation fails: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_contains "$commands" $'pnpm\trun\tbuild:test' "failed dummy-build command log"
+  assert_contains "$output" "Dummy App Test Bundles failed" "failed dummy-build output"
+  case "$commands" in
+    *$'bundle\texec\trake\trun_rspec:dummy'*)
+      fail "dummy integration RSpec must not run after bundle preparation fails"
+      ;;
+  esac
+}
+
+test_ci_local_preserves_independent_generator_selectors() {
+  setup_ci_local_repo
+
+  local output core_ruby_commands generated_example_commands generator_change_commands
+  export CI_LOCAL_FIXTURE_SELECTION=core_ruby
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local core-Ruby fixture failed: $output"
+    return 1
+  fi
+  core_ruby_commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$core_ruby_commands" \
+    $'bundle\texec\trake\trun_rspec:gem_unit' \
+    "core-Ruby command log"
+  assert_contains \
+    "$core_ruby_commands" \
+    $'bundle\texec\trake\trun_rspec:gem_generators' \
+    "core-Ruby command log"
+  case "$core_ruby_commands" in
+    *$'bundle\texec\trake\trun_rspec:shakapacker_examples'*|\
+    *$'bundle\texec\trake\trun_rspec:gem\t'*)
+      fail "core Ruby must not select generated example app tests or the unsharded gem task"
+      ;;
+  esac
+
+  export CI_LOCAL_FIXTURE_SELECTION=generated_examples
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local generated-example fixture failed: $output"
+    return 1
+  fi
+  generated_example_commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$generated_example_commands" \
+    $'bundle\texec\trake\trun_rspec:shakapacker_examples' \
+    "generated-example command log"
+  case "$generated_example_commands" in
+    *$'bundle\texec\trake\trun_rspec:gem_generators'*|\
+    *$'bundle\texec\trake\trun_rspec:gem_unit'*)
+      fail "generated example app selector must not select either gem RSpec shard"
+      ;;
+  esac
+
+  export CI_LOCAL_FIXTURE_SELECTION=generator_change
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local generator-change fixture failed: $output"
+    return 1
+  fi
+  generator_change_commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$generator_change_commands" \
+    $'bundle\texec\trake\trun_rspec:gem_unit' \
+    "generator-change command log"
+  assert_contains \
+    "$generator_change_commands" \
+    $'bundle\texec\trake\trun_rspec:gem_generators' \
+    "generator-change command log"
+  assert_contains \
+    "$generator_change_commands" \
+    $'bundle\texec\trake\trun_rspec:shakapacker_examples' \
+    "generator-change command log"
+}
+
+assert_ci_local_gem_generator_only_commands() {
+  local commands="$1"
+  local context="$2"
+
+  assert_contains "$commands" $'bundle\tcheck' "$context"
+  assert_contains \
+    "$commands" \
+    $'bundle\texec\trake\trun_rspec:gem_generators' \
+    "$context"
+  case "$commands" in
+    *$'bundle\texec\trake\trun_rspec:gem_unit'*|\
+    *$'bundle\texec\trake\trun_rspec:gem\t'*|\
+    *$'bundle\texec\trake\trun_rspec:shakapacker_examples'*)
+      fail "$context: gem-generator-only selection ran an unselected Ruby job"
+      ;;
+  esac
+}
+
+test_ci_local_json_preserves_gem_generator_only_selector() {
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=gem_generator_specs
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local JSON gem-generator-only fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_ci_local_gem_generator_only_commands "$commands" "JSON gem-generator-only command log"
+}
+
+assert_ci_local_release_supervisor_selected() {
+  local commands="$1"
+  local context="$2"
+
+  assert_contains "$commands" "release-supervisor-test" "$context"
+}
+
+test_ci_local_json_runs_release_supervisor_selector() {
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=release_supervisor
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local JSON release-supervisor fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_ci_local_release_supervisor_selected "$commands" "JSON release-supervisor command log"
+}
+
+test_ci_local_text_fallback_runs_release_supervisor_selector() {
+  setup_ci_local_repo
+  cat > test-bin/jq <<'BASH'
+#!/usr/bin/env bash
+exit 1
+BASH
+  chmod +x test-bin/jq
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=release_supervisor
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local text release-supervisor fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_ci_local_release_supervisor_selected "$commands" "text release-supervisor command log"
+}
+
+test_ci_local_all_runs_release_supervisor_harness() {
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=core_ruby
+  if ! output="$(ci_local_output --all --fast 2>&1)"; then
+    fail "ci-local all release-supervisor fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_ci_local_release_supervisor_selected "$commands" "all-mode release-supervisor command log"
+}
+
+test_ci_local_release_supervisor_failure_continues_selected_jobs() {
+  setup_ci_local_repo
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=core_ruby
+  export CI_LOCAL_FAIL_RELEASE_SUPERVISOR=true
+  if output="$(ci_local_output --all --fast 2>&1)"; then
+    fail "ci-local must report a failing release-supervisor harness"
+    return 1
+  fi
+  unset CI_LOCAL_FAIL_RELEASE_SUPERVISOR
+
+  commands="$(cat ci-local-commands.log)"
+  assert_contains "$commands" "release-supervisor-test" "release-supervisor failure command log"
+  assert_contains \
+    "$commands" \
+    $'bundle\texec\trake\trun_rspec:gem_unit' \
+    "release-supervisor failure command log"
+  assert_contains "$output" "Failed jobs:" "release-supervisor failure summary"
+  assert_contains \
+    "$output" \
+    "Release Supervisor Integration Tests" \
+    "release-supervisor failure summary"
+}
+
+test_ci_local_text_fallback_preserves_gem_generator_only_selector() {
+  setup_ci_local_repo
+  cat > test-bin/jq <<'BASH'
+#!/usr/bin/env bash
+exit 1
+BASH
+  chmod +x test-bin/jq
+
+  local output commands
+  export CI_LOCAL_FIXTURE_SELECTION=gem_generator_specs
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local text-fallback gem-generator-only fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_ci_local_gem_generator_only_commands "$commands" "text-fallback gem-generator-only command log"
+}
+
+test_ci_local_pro_tests_use_hosted_workspace_command_from_root() {
+  setup_ci_local_repo
+  mkdir -p react_on_rails_pro/node_modules react_on_rails_pro/vendor/bundle
+  : > react_on_rails_pro/Gemfile
+
+  local output commands fixture_root
+  fixture_root="$(pwd -P)"
+  export CI_LOCAL_FIXTURE_SELECTION=pro_tests
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local Pro-tests-only fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  assert_contains \
+    "$commands" \
+    $'pnpm-cwd\t'"$fixture_root"$'\t--filter\treact-on-rails-pro\ttest' \
+    "Pro-tests-only command log"
+  assert_contains "$commands" $'bundle\texec\trspec' "Pro-tests-only command log"
+  case "$commands" in
+    *$'pnpm-cwd\t'"$fixture_root/react_on_rails_pro"$'\trun\tnps\ttest'*)
+      fail "Pro tests must not use the unresolvable package-local nps command"
+      ;;
+  esac
+  case "$commands" in
+    *$'pnpm-cwd\t'"$fixture_root"$'\t--filter\treact-on-rails-pro\ttest'*$'bundle\texec\trspec'*) ;;
+    *) fail "Pro workspace tests must precede the preserved Pro RSpec lane: $commands" ;;
+  esac
+}
+
+test_ci_local_combined_js_and_pro_selection_runs_pro_js_once() {
+  setup_ci_local_repo
+  mkdir -p react_on_rails_pro/node_modules react_on_rails_pro/vendor/bundle
+  : > react_on_rails_pro/Gemfile
+
+  local output commands fixture_root pro_js_count
+  fixture_root="$(pwd -P)"
+  export CI_LOCAL_FIXTURE_SELECTION=js_and_pro_tests
+  if ! output="$(ci_local_output --changed 2>&1)"; then
+    fail "ci-local combined JS and Pro fixture failed: $output"
+    return 1
+  fi
+  commands="$(cat ci-local-commands.log)"
+  pro_js_count="$(grep -Fc $'pnpm-cwd\t'"$fixture_root"$'\t--filter\treact-on-rails-pro\ttest' <<<"$commands")"
+  [ "$pro_js_count" = 1 ] || fail "combined JS and Pro selection ran Pro JS $pro_js_count times"
+  assert_contains "$commands" $'bundle\texec\trspec' "combined JS and Pro command log"
+}
+
+detector_output() {
+  CI=true CI_JSON_OUTPUT=1 "$DETECTOR" HEAD~1 HEAD
+}
+
+commit_change() {
+  local message="$1"
+  git add .
+  git commit -m "$message" >/dev/null
+}
+
+write_file_change() {
+  local path="$1"
+  local content="${2:-changed}"
+
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$content" > "$path"
+  commit_change "change $path"
+}
+
+test_docs_changes_are_non_runtime_only() {
+  setup_repo
+  printf '\nMore docs.\n' >> docs/guide.md
+  commit_change "docs"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "docs output"
+  assert_contains "$out" '"non_runtime_only": true' "docs output"
+  assert_contains "$out" '"run_lint": false' "docs output"
+  assert_contains "$out" '"run_gem_generator_specs": false' "docs output"
+  assert_contains "$out" '"run_release_supervisor_tests": false' "docs output"
+}
+
+# Regression for PR #3597: an internal docs/planning YAML (e.g.
+# internal/contributor-info/demo-fleet.yml) used to fall through to the
+# uncategorized catch-all, forcing the entire test + benchmark suite to run.
+test_internal_non_markdown_docs_are_non_runtime_only() {
+  setup_repo
+  write_file_change "internal/contributor-info/demo-fleet.yml" "fleet: []"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "internal yaml output"
+  assert_contains "$out" '"non_runtime_only": true' "internal yaml output"
+  assert_contains "$out" '"run_lint": false' "internal yaml output"
+  assert_contains "$out" '"run_ruby_tests": false' "internal yaml output"
+  assert_contains "$out" '"benchmarks_changed": false' "internal yaml output"
+}
+
+# Regression for PR #3597: a GitHub issue template (.github/ISSUE_TEMPLATE/*.yml)
+# is repo metadata, not CI infrastructure, and must not trigger any test suite.
+test_issue_template_changes_are_non_runtime_only() {
+  setup_repo
+  write_file_change ".github/ISSUE_TEMPLATE/rc-release-tracking.yml" "name: RC release"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "issue template output"
+  assert_contains "$out" '"non_runtime_only": true' "issue template output"
+  assert_contains "$out" '"run_lint": false' "issue template output"
+  assert_contains "$out" '"run_ruby_tests": false' "issue template output"
+}
+
+# Regression for PR #3597 (the exact file set): mixed internal markdown +
+# internal YAML + an issue-template YAML in one docs-only PR stays non-runtime,
+# so it never triggers the benchmark suite.
+test_docs_pr_with_internal_and_issue_template_yaml_is_non_runtime_only() {
+  setup_repo
+  mkdir -p internal/contributor-info .github/ISSUE_TEMPLATE
+  printf 'design notes\n' > internal/contributor-info/rc-testing-plan.md
+  printf 'fleet: []\n' > internal/contributor-info/demo-fleet.yml
+  printf 'name: RC release\n' > .github/ISSUE_TEMPLATE/rc-release-tracking.yml
+  commit_change "docs-only RC planning PR"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "docs PR output"
+  assert_contains "$out" '"non_runtime_only": true' "docs PR output"
+  assert_contains "$out" '"run_lint": false' "docs PR output"
+  assert_contains "$out" '"run_ruby_tests": false' "docs PR output"
+  assert_contains "$out" '"run_js_tests": false' "docs PR output"
+  assert_contains "$out" '"benchmarks_changed": false' "docs PR output"
+}
+
+# Regression for PR #4006: a docs-only PR under docs-internal/ that also ships a
+# binary asset (the .png infographic) used to fall through to the uncategorized
+# catch-all, forcing the ENTIRE JS + Ruby + Pro test suite to run. The markdown
+# itself was always caught by the *.md extension; the image was not, and
+# docs-internal/ was not recognized as a documentation directory the way docs/
+# and internal/ are. Everything under docs-internal/ is internal documentation
+# and must stay non-runtime regardless of file type.
+test_docs_internal_tree_with_image_asset_is_non_runtime_only() {
+  setup_repo
+  mkdir -p docs-internal/rsc-architecture-deep-dive/images
+  printf '# Deep dive\n' > docs-internal/rsc-architecture-deep-dive/00-START-HERE.md
+  printf 'binary-ish png bytes\n' > docs-internal/rsc-architecture-deep-dive/images/flow.png
+  commit_change "internal architecture docs with infographic"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "docs-internal image output"
+  assert_contains "$out" '"non_runtime_only": true' "docs-internal image output"
+  assert_contains "$out" '"run_lint": false' "docs-internal image output"
+  assert_contains "$out" '"run_ruby_tests": false' "docs-internal image output"
+  assert_contains "$out" '"run_js_tests": false' "docs-internal image output"
+  assert_contains "$out" '"benchmarks_changed": false' "docs-internal image output"
+}
+
+# Companion to PR #4006: the contract is that EVERYTHING under docs-internal/ is
+# non-runtime regardless of file type, not just markdown and images. A plain
+# non-markdown text file (here a .yml) is matched by the docs-internal/ directory
+# globs alone — .yml is not one of the extensions the documentation branch
+# recognizes, so without those globs it would hit the uncategorized catch-all and
+# force the full suite, exactly as the .png did. Mirrors the internal/ sibling
+# (test_internal_non_markdown_docs_are_non_runtime_only).
+test_docs_internal_non_markdown_file_is_non_runtime_only() {
+  setup_repo
+  write_file_change "docs-internal/rsc-architecture-deep-dive/metrics.yml" "rps: 1000"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "docs-internal yaml output"
+  assert_contains "$out" '"non_runtime_only": true' "docs-internal yaml output"
+  assert_contains "$out" '"run_lint": false' "docs-internal yaml output"
+  assert_contains "$out" '"run_ruby_tests": false' "docs-internal yaml output"
+  assert_contains "$out" '"run_js_tests": false' "docs-internal yaml output"
+  assert_contains "$out" '"benchmarks_changed": false' "docs-internal yaml output"
+}
+
+# Isolation guard for PR #4006: the binary asset ALONE (no accompanying markdown)
+# must be non-runtime. The combined regression test above ships both a .md and the
+# .png; the .md is caught by *.md whether or not the docs-internal/ globs exist, so
+# this strips it to prove the image is precisely what those globs rescue from the
+# catch-all. Defends against a future partial revert (e.g. dropping the binary glob
+# while keeping a docs-internal/**/*.md one) that the combined test would not catch.
+test_docs_internal_image_only_is_non_runtime_only() {
+  setup_repo
+  write_file_change "docs-internal/rsc-architecture-deep-dive/images/flow.png" "binary-ish png bytes"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "docs-internal image-only output"
+  assert_contains "$out" '"non_runtime_only": true' "docs-internal image-only output"
+  assert_contains "$out" '"run_js_tests": false' "docs-internal image-only output"
+  assert_contains "$out" '"run_ruby_tests": false' "docs-internal image-only output"
+}
+
+# Guard: the docs-internal/ globs must not swallow a genuine runtime change shipped
+# in the same PR. An internal doc paired with a real core-gem source edit still runs
+# the Ruby suite and benchmarks — non_runtime_only flips false the moment any non-doc
+# file appears, exactly as it does for the other documentation directories.
+test_docs_internal_doc_plus_runtime_source_still_runs_tests() {
+  setup_repo
+  mkdir -p docs-internal/rsc-architecture-deep-dive
+  printf '# Deep dive\n' > docs-internal/rsc-architecture-deep-dive/00-START-HERE.md
+  # A genuine executable edit (string value change, not a comment) to core gem code.
+  perl -0pi -e 's/"ok"/"changed"/' react_on_rails/lib/react_on_rails/example.rb
+  commit_change "internal docs plus real source change"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "docs-internal mixed output"
+  assert_contains "$out" '"run_ruby_tests": true' "docs-internal mixed output"
+  # Core gem source underlies all three benchmark suites.
+  assert_contains "$out" '"run_core_benchmarks": true' "docs-internal mixed output"
+}
+
+# Regression for PR #3717: agent/editor tooling under .claude/** and .agents/**
+# is non-runtime. The .claude/skills symlink (a tracked path with no extension)
+# used to miss every category and hit the catch-all, forcing the full test +
+# benchmark suite — Bencher even posted results on that docs-only PR.
+test_agent_tooling_changes_are_non_runtime_only() {
+  setup_repo
+  mkdir -p .agents/skills/verify .claude .cursor
+  printf 'verify skill\n' > .agents/skills/verify/SKILL.md
+  # Mirror the offending file: an extensionless path under .claude/ (the PR added
+  # it as a symlink; the detector categorizes purely by path, so a plain file at
+  # the same path exercises the same case branch).
+  printf '../.agents/skills\n' > .claude/skills
+  # Exercise extensionless files under the other agent/editor tooling globs too.
+  printf 'entry\n' > .agents/skills/verify/run
+  printf 'rules\n' > .cursor/rules
+  commit_change "convert claude commands to agent skills"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "agent tooling output"
+  assert_contains "$out" '"non_runtime_only": true' "agent tooling output"
+  assert_contains "$out" '"run_lint": false' "agent tooling output"
+  assert_contains "$out" '"run_ruby_tests": false' "agent tooling output"
+  assert_contains "$out" '"run_js_tests": false' "agent tooling output"
+  assert_contains "$out" '"benchmarks_changed": false' "agent tooling output"
+}
+
+test_agent_bin_change_runs_ci_infrastructure_without_benchmarks() {
+  setup_repo
+  mkdir -p .agents/bin
+  printf '#!/usr/bin/env ruby\nputs "validate"\n' > .agents/bin/validate
+  commit_change "update agent workflow binstub"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "agent bin output"
+  assert_contains "$out" '"non_runtime_only": false' "agent bin output"
+  assert_contains "$out" '"run_lint": true' "agent bin output"
+  assert_contains "$out" '"run_ruby_tests": true' "agent bin output"
+  assert_contains "$out" '"run_gem_generator_specs": true' "agent bin output"
+  assert_contains "$out" '"run_js_tests": true' "agent bin output"
+  assert_contains "$out" '"run_dummy_tests": true' "agent bin output"
+  assert_contains "$out" '"run_generators": true' "agent bin output"
+  assert_contains "$out" '"run_e2e_tests": true' "agent bin output"
+  assert_contains "$out" '"run_pro_lint": true' "agent bin output"
+  assert_contains "$out" '"run_pro_tests": true' "agent bin output"
+  assert_contains "$out" '"run_pro_dummy_tests": true' "agent bin output"
+  assert_contains "$out" '"run_pro_node_renderer_tests": true' "agent bin output"
+  assert_contains "$out" '"run_core_benchmarks": false' "agent bin output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "agent bin output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "agent bin output"
+}
+
+test_agent_bin_markdown_change_is_non_runtime_only() {
+  setup_repo
+  mkdir -p .agents/bin
+  printf '# Agent workflow binstubs\n' > .agents/bin/README.md
+  commit_change "document agent workflow binstubs"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "agent bin markdown output"
+  assert_contains "$out" '"non_runtime_only": true' "agent bin markdown output"
+  assert_contains "$out" '"run_lint": false' "agent bin markdown output"
+  assert_contains "$out" '"run_ruby_tests": false' "agent bin markdown output"
+  assert_contains "$out" '"run_js_tests": false' "agent bin markdown output"
+  assert_contains "$out" '"benchmarks_changed": false' "agent bin markdown output"
+}
+
+test_agent_workflow_config_change_runs_ci_infrastructure_without_benchmarks() {
+  setup_repo
+  mkdir -p .agents
+  printf 'version: 1\n' > .agents/agent-workflow.yml
+  commit_change "update agent workflow seam config"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "agent workflow config output"
+  assert_contains "$out" '"non_runtime_only": false' "agent workflow config output"
+  assert_contains "$out" '"run_lint": true' "agent workflow config output"
+  assert_contains "$out" '"run_ruby_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_js_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_dummy_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_generators": true' "agent workflow config output"
+  assert_contains "$out" '"run_e2e_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_pro_lint": true' "agent workflow config output"
+  assert_contains "$out" '"run_pro_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_pro_dummy_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_pro_node_renderer_tests": true' "agent workflow config output"
+  assert_contains "$out" '"run_core_benchmarks": false' "agent workflow config output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "agent workflow config output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "agent workflow config output"
+}
+
+# Regression for PR #3697 (the exact file set): a CI-infrastructure PR — a
+# suite-specific workflow YAML plus the detector's own test harness — must still
+# run the relevant TEST suites to validate the change, but must NOT run any
+# benchmark suite. CI plumbing can't move runtime performance, so a Bencher run
+# is noise. The script/ harness lands in the CI-infra arm (all tests, no bench),
+# and pro-integration-tests.yml runs pro dummy tests but is guarded out of the
+# BENCH_* flags.
+test_ci_infrastructure_only_change_runs_tests_but_skips_benchmarks() {
+  setup_repo
+  mkdir -p .github/workflows script
+  printf 'name: Pro integration\non: [pull_request]\n' > .github/workflows/pro-integration-tests.yml
+  printf '# detector test harness tweak\n' >> script/ci-changes-detector-test.bash
+  commit_change "ci: fix pro dummy integration gating"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "ci infra output"
+  assert_contains "$out" '"non_runtime_only": false' "ci infra output"
+  # Tests still run to validate the CI change (script/ forces the full suite,
+  # pro-integration-tests.yml independently requests pro dummy tests) ...
+  assert_contains "$out" '"run_ruby_tests": true' "ci infra output"
+  assert_contains "$out" '"run_release_supervisor_tests": true' "ci infra output"
+  assert_contains "$out" '"run_pro_dummy_tests": true' "ci infra output"
+  assert_contains "$out" '"run_pro_node_renderer_tests": true' "ci infra output"
+  # ... but every benchmark suite is off.
+  assert_contains "$out" '"run_core_benchmarks": false' "ci infra output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "ci infra output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "ci infra output"
+}
+
+# A suite-specific workflow YAML on its own runs only that suite's tests, not the
+# hosted CI-infrastructure suite, and never benchmarks — editing the workflow can't
+# move performance. This is the part of #3697 that the CI-infra arm doesn't cover.
+test_suite_workflow_file_runs_its_tests_but_no_benchmark() {
+  setup_repo
+  mkdir -p .github/workflows
+  printf 'name: Pro integration\non: [pull_request]\n' > .github/workflows/pro-integration-tests.yml
+  commit_change "tweak pro integration workflow"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": false' "workflow-only output"
+  assert_contains "$out" '"run_js_tests": false' "workflow-only output"
+  assert_contains "$out" '"run_dummy_tests": false' "workflow-only output"
+  assert_contains "$out" '"run_pro_tests": false' "workflow-only output"
+  assert_contains "$out" '"run_pro_dummy_tests": true' "workflow-only output"
+  assert_contains "$out" '"run_pro_node_renderer_tests": false' "workflow-only output"
+  assert_contains "$out" '"run_core_benchmarks": false' "workflow-only output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "workflow-only output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "workflow-only output"
+}
+
+test_gem_tests_workflow_change_keeps_generator_specs_fail_closed() {
+  setup_repo
+  mkdir -p .github/workflows
+  printf 'name: Gem tests\non: [pull_request]\n' > .github/workflows/gem-tests.yml
+  commit_change "tweak gem tests workflow"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": true' "gem workflow output"
+  assert_contains "$out" '"run_gem_generator_specs": true' "gem workflow output"
+}
+
+# A CI-infra change mixed with a real runtime-source change DOES benchmark: the
+# genuine source edit sets the BENCH_* flags the workflow/script changes don't.
+test_ci_infra_plus_runtime_source_still_benchmarks() {
+  setup_repo
+  mkdir -p .github/workflows
+  printf 'name: Pro integration\non: [pull_request]\n' > .github/workflows/pro-integration-tests.yml
+  # A genuine executable edit (string value change, not a comment) to core gem code.
+  perl -0pi -e 's/"ok"/"changed"/' react_on_rails/lib/react_on_rails/example.rb
+  commit_change "ci tweak plus real source change"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "mixed output"
+  assert_contains "$out" '"run_ruby_tests": true' "mixed output"
+  # Core gem source underlies all three benchmark suites.
+  assert_contains "$out" '"run_core_benchmarks": true' "mixed output"
+  assert_contains "$out" '"run_pro_benchmarks": true' "mixed output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": true' "mixed output"
+}
+
+# Genuine node-renderer package source must benchmark the node-renderer suite —
+# the case the spurious #3697 run pretended to cover.
+test_node_renderer_source_change_runs_node_renderer_benchmark() {
+  setup_repo
+  printf 'export const x = 1;\n' > packages/react-on-rails-pro-node-renderer/src/example.ts
+  commit_change "node renderer source change"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": true' "node renderer output"
+  assert_contains "$out" '"run_pro_benchmarks": true' "node renderer output"
+  # Node renderer changes don't touch the core suite.
+  assert_contains "$out" '"run_core_benchmarks": false' "node renderer output"
+}
+
+# An uncategorized file (e.g. a new CI/tooling dotfile like .ci-dependency-versions,
+# the #3855 case) runs the full TEST suite for safety, but must NOT benchmark:
+# unknown files are almost always tooling, not a hot runtime path, so a Bencher
+# run here is pure noise. Main pushes benchmark unconditionally, so a genuinely
+# new runtime path is still measured once it lands.
+test_uncategorized_file_runs_tests_but_skips_benchmarks() {
+  setup_repo
+  write_file_change ".ci-dependency-versions" "ruby: 3.2"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "uncategorized output"
+  # Full test suite still runs (the safety the catch-all is there for).
+  assert_contains "$out" '"run_ruby_tests": true' "uncategorized output"
+  assert_contains "$out" '"run_gem_generator_specs": true' "uncategorized output"
+  assert_contains "$out" '"run_release_supervisor_tests": true' "uncategorized output"
+  assert_contains "$out" '"run_pro_tests": true' "uncategorized output"
+  # ... but no benchmark suite.
+  assert_contains "$out" '"run_core_benchmarks": false' "uncategorized output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "uncategorized output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "uncategorized output"
+}
+
+# Spec-only changes run the gem tests but never benchmark: specs are not shipped,
+# so they cannot move runtime performance (#3854 changed only CI-config specs yet
+# ran the core+pro suites).
+test_rspec_only_change_skips_benchmarks() {
+  setup_repo
+  write_file_change "react_on_rails/spec/react_on_rails/some_bench_spec.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": true' "rspec-bench output"
+  assert_contains "$out" '"run_core_benchmarks": false' "rspec-bench output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "rspec-bench output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "rspec-bench output"
+}
+
+test_ruby_comment_only_change_skips_heavy_tests_but_keeps_lint() {
+  setup_repo
+  perl -0pi -e 's/class Example/class Example\n    # Explain the fixture./' \
+    react_on_rails/lib/react_on_rails/example.rb
+  commit_change "ruby comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "ruby comment output"
+  assert_contains "$out" '"non_runtime_only": true' "ruby comment output"
+  assert_contains "$out" '"run_lint": true' "ruby comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "ruby comment output"
+  assert_contains "$out" '"run_dummy_tests": false' "ruby comment output"
+}
+
+test_ruby_block_comment_only_change_skips_heavy_tests_but_keeps_lint() {
+  setup_repo
+  perl -0pi -e 's/module ReactOnRails/=begin\nExplains the fixture.\n=end\nmodule ReactOnRails/' \
+    react_on_rails/lib/react_on_rails/example.rb
+  commit_change "ruby block comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "ruby block comment output"
+  assert_contains "$out" '"run_lint": true' "ruby block comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "ruby block comment output"
+}
+
+test_wrapping_ruby_code_with_block_comment_delimiters_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/module ReactOnRails/=begin\nmodule ReactOnRails/' react_on_rails/lib/react_on_rails/example.rb
+  printf '\n=end\n' >> react_on_rails/lib/react_on_rails/example.rb
+  commit_change "comment out ruby code"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "commented ruby code output"
+  assert_contains "$out" '"run_ruby_tests": true' "commented ruby code output"
+}
+
+test_javascript_block_comment_only_change_skips_heavy_tests_but_keeps_lint() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\*\n * Explains the fixture.\n *\/\nexport function/' \
+    packages/react-on-rails/src/example.ts
+  commit_change "js comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "js comment output"
+  assert_contains "$out" '"run_lint": true' "js comment output"
+  assert_contains "$out" '"run_js_tests": false' "js comment output"
+}
+
+test_wrapping_code_with_block_comment_delimiters_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\*\nexport function/' packages/react-on-rails/src/example.ts
+  printf '\n*/\n' >> packages/react-on-rails/src/example.ts
+  commit_change "comment out code"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "commented code output"
+  assert_contains "$out" '"run_js_tests": true' "commented code output"
+}
+
+test_prose_comment_containing_webpack_is_not_a_runtime_directive() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\/ Documents a webpack migration note.\nexport function/' \
+    packages/react-on-rails/src/example.ts
+  commit_change "webpack prose comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "webpack prose output"
+  assert_contains "$out" '"run_js_tests": false' "webpack prose output"
+}
+
+test_webpack_magic_comment_keyword_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\/ webpackChunkName: "example"\nexport function/' \
+    packages/react-on-rails/src/example.ts
+  commit_change "webpack directive comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "webpack directive output"
+  assert_contains "$out" '"run_js_tests": true' "webpack directive output"
+}
+
+test_prose_comment_containing_encoding_is_not_a_runtime_directive() {
+  setup_repo
+  perl -0pi -e 's/class Example/class Example\n    # Documents response encoding: utf-8./' \
+    react_on_rails/lib/react_on_rails/example.rb
+  commit_change "encoding prose comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "encoding prose output"
+  assert_contains "$out" '"run_ruby_tests": false' "encoding prose output"
+}
+
+test_typescript_suppression_comment_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\/ \@ts-expect-error documents expected type failure\nexport function/' \
+    packages/react-on-rails/src/example.ts
+  commit_change "typescript directive comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "typescript directive output"
+  assert_contains "$out" '"run_js_tests": true' "typescript directive output"
+}
+
+test_code_line_starting_with_plus_plus_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/  return .ok.;/  \/\/ Count calls.\n  ++counter;\n  return counter.toString();/' \
+    packages/react-on-rails/src/example.ts
+  commit_change "prefix increment code"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "prefix increment output"
+  assert_contains "$out" '"run_js_tests": true' "prefix increment output"
+}
+
+test_comment_like_template_literal_change_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/runtime fixture text/changed fixture text/' packages/react-on-rails/src/template.ts
+  commit_change "template literal text"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "template literal output"
+  assert_contains "$out" '"run_js_tests": true' "template literal output"
+}
+
+test_spec_comment_only_change_skips_rspec() {
+  setup_repo
+  perl -0pi -e 's/it "works"/# Fixture intent.\n  it "works"/' \
+    react_on_rails/spec/react_on_rails/example_spec.rb
+  commit_change "spec comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "spec comment output"
+  assert_contains "$out" '"run_lint": true' "spec comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "spec comment output"
+}
+
+test_core_app_comment_only_change_skips_heavy_tests_but_keeps_lint() {
+  setup_repo
+  perl -0pi -e 's/    def react_component/    # Document the helper.\n    def react_component/' \
+    react_on_rails/app/helpers/react_on_rails_helper.rb
+  commit_change "core app comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "core app comment output"
+  assert_contains "$out" '"non_runtime_only": true' "core app comment output"
+  assert_contains "$out" '"run_lint": true' "core app comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "core app comment output"
+}
+
+test_core_app_source_change_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/"ok"/"changed"/' react_on_rails/app/helpers/react_on_rails_helper.rb
+  commit_change "core app source"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "core app source output"
+  assert_contains "$out" '"run_ruby_tests": true' "core app source output"
+}
+
+# Regression for PR #3474: a comment-only change to a controller under
+# react_on_rails_pro/app/ used to fall through to the uncategorized catch-all,
+# which forced the entire test + benchmark suite to run.
+test_pro_app_comment_only_change_runs_pro_lint_only() {
+  setup_repo
+  perl -0pi -e 's/    class BundlesController/    class BundlesController\n      # Document the controller./' \
+    react_on_rails_pro/app/controllers/react_on_rails_pro/rolling_deploy/bundles_controller.rb
+  commit_change "pro app comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "pro app comment output"
+  assert_contains "$out" '"non_runtime_only": true' "pro app comment output"
+  assert_contains "$out" '"run_lint": false' "pro app comment output"
+  assert_contains "$out" '"run_pro_lint": true' "pro app comment output"
+  assert_contains "$out" '"run_pro_tests": false' "pro app comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "pro app comment output"
+}
+
+test_pro_app_source_change_runs_pro_tests_only() {
+  setup_repo
+  perl -0pi -e 's/"ok"/"changed"/' \
+    react_on_rails_pro/app/controllers/react_on_rails_pro/rolling_deploy/bundles_controller.rb
+  commit_change "pro app source"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "pro app source output"
+  assert_contains "$out" '"run_pro_tests": true' "pro app source output"
+  # Scoped to Pro: a Pro app change must not drag in the core gem suite the way
+  # the old uncategorized catch-all did.
+  assert_contains "$out" '"run_ruby_tests": false' "pro app source output"
+  assert_contains "$out" '"run_js_tests": false' "pro app source output"
+}
+
+test_pro_dummy_only_change_runs_pro_dummy_tests_without_pro_unit_tests() {
+  setup_repo
+  perl -0pi -e 's/renders/renders seeded data/' react_on_rails_pro/spec/dummy/spec/requests/posts_page_spec.rb
+  commit_change "pro dummy spec"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_pro_dummy_tests": true' "pro dummy output"
+  assert_contains "$out" '"run_pro_tests": false' "pro dummy output"
+}
+
+test_pro_node_renderer_comment_only_change_runs_pro_lint_only() {
+  setup_repo
+  perl -0pi -e 's/export function/\/\/ Explains the Pro node renderer fixture.\nexport function/' \
+    packages/react-on-rails-pro-node-renderer/src/example.ts
+  commit_change "pro node renderer comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "pro node renderer comment output"
+  assert_contains "$out" '"run_lint": false' "pro node renderer comment output"
+  assert_contains "$out" '"run_pro_lint": true' "pro node renderer comment output"
+  assert_contains "$out" '"run_pro_node_renderer_tests": false' "pro node renderer comment output"
+}
+
+test_mixed_comment_and_code_change_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/    def call/    # Explain the fixture.\n    def call/' \
+    react_on_rails/lib/react_on_rails/example.rb
+  perl -0pi -e 's/"ok"/"changed"/' react_on_rails/lib/react_on_rails/example.rb
+  commit_change "mixed comment and code"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "mixed output"
+  assert_contains "$out" '"run_ruby_tests": true' "mixed output"
+}
+
+test_ruby_magic_comment_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/module ReactOnRails/# frozen_string_literal: true\n\nmodule ReactOnRails/' \
+    react_on_rails/lib/react_on_rails/example.rb
+  commit_change "ruby magic comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "ruby magic output"
+  assert_contains "$out" '"run_ruby_tests": true' "ruby magic output"
+}
+
+test_executable_source_change_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's/"ok"/"changed"/' react_on_rails/lib/react_on_rails/example.rb
+  commit_change "runtime source"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "runtime source output"
+  assert_contains "$out" '"run_ruby_tests": true' "runtime source output"
+}
+
+test_jsdoc_jsx_import_source_pragma_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's{export function}{/** \@jsxImportSource @emotion/react */\nexport function}' \
+    packages/react-on-rails/src/example.ts
+  commit_change "jsdoc jsx import source pragma"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "jsdoc pragma output"
+  assert_contains "$out" '"run_js_tests": true' "jsdoc pragma output"
+}
+
+test_inline_block_comment_license_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's{export function}{/* \@license MIT */\nexport function}' \
+    packages/react-on-rails/src/example.ts
+  commit_change "inline block comment license"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "license directive output"
+  assert_contains "$out" '"run_js_tests": true' "license directive output"
+}
+
+test_pure_annotation_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's{export function}{/* \@__PURE__ */\nexport function}' \
+    packages/react-on-rails/src/example.ts
+  commit_change "pure annotation"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "pure annotation output"
+  assert_contains "$out" '"run_js_tests": true' "pure annotation output"
+}
+
+test_block_comment_with_trailing_code_remains_runtime_affecting() {
+  setup_repo
+  perl -0pi -e 's{export function}{/* note */ exports.flag = true;\nexport function}' \
+    packages/react-on-rails/src/example.ts
+  commit_change "block comment plus trailing code"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": false' "trailing code after block close output"
+  assert_contains "$out" '"run_js_tests": true' "trailing code after block close output"
+}
+
+test_pro_only_changes_do_not_request_e2e() {
+  setup_repo
+  write_file_change "react_on_rails_pro/lib/react_on_rails_pro/example.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_e2e_tests": false' "pro-only output"
+}
+
+test_rspec_only_changes_do_not_request_e2e() {
+  setup_repo
+  write_file_change "react_on_rails/spec/react_on_rails/some_spec.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": true' "rspec-only output"
+  assert_contains "$out" '"run_release_supervisor_tests": false' "rspec-only output"
+  assert_contains "$out" '"run_gem_generator_specs": false' "rspec-only output"
+  assert_contains "$out" '"run_dummy_tests": false' "rspec-only output"
+  assert_contains "$out" '"run_e2e_tests": false' "rspec-only output"
+}
+
+assert_generator_spec_support_change_routes_generator_shard() {
+  local file="$1"
+  setup_repo
+  write_file_change "$file"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": true' "$file output"
+  assert_contains "$out" '"run_gem_generator_specs": true' "$file output"
+  assert_contains "$out" '"run_generators": false' "$file output"
+}
+
+test_generator_spec_helper_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/support/generator_spec_helper.rb"
+}
+
+test_generated_tree_approval_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/support/generated_tree_approval.rb"
+}
+
+test_generator_shared_spec_helper_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/spec_helper.rb"
+}
+
+test_generator_simplecov_helper_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/simplecov_helper.rb"
+}
+
+test_generator_shared_example_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/support/shared_examples/base_generator_examples.rb"
+}
+
+test_generator_version_helper_change_routes_generator_shard() {
+  assert_generator_spec_support_change_routes_generator_shard \
+    "react_on_rails/spec/react_on_rails/support/version_test_helpers.rb"
+}
+
+test_generator_only_changes_do_not_request_e2e() {
+  setup_repo
+  write_file_change "react_on_rails/lib/generators/react_on_rails/install/example.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_ruby_tests": true' "generator-only output"
+  assert_contains "$out" '"run_gem_generator_specs": true' "generator-only output"
+  assert_contains "$out" '"run_generators": true' "generator-only output"
+  assert_contains "$out" '"run_dummy_tests": false' "generator-only output"
+  assert_contains "$out" '"run_e2e_tests": false' "generator-only output"
+}
+
+test_dummy_app_changes_request_e2e() {
+  setup_repo
+  write_file_change "react_on_rails/spec/dummy/app/views/pages/example.html.erb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_e2e_tests": true' "dummy app output"
+}
+
+test_core_ruby_changes_request_e2e() {
+  setup_repo
+  write_file_change "react_on_rails/lib/react_on_rails/example.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_gem_generator_specs": true' "core ruby output"
+  assert_contains "$out" '"run_generators": false' "core ruby output"
+  assert_contains "$out" '"run_dummy_tests": true' "core ruby output"
+  assert_contains "$out" '"run_e2e_tests": true' "core ruby output"
+}
+
+test_core_js_changes_request_e2e() {
+  setup_repo
+  write_file_change "packages/react-on-rails/src/example.ts"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"run_gem_generator_specs": true' "core js output"
+  assert_contains "$out" '"run_e2e_tests": true' "core js output"
+}
+
+test_benchmark_source_change_lints_and_flags_benchmarks_only() {
+  setup_repo
+  write_file_change "benchmarks/generate_matrix.rb"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"benchmarks_changed": true' "benchmark source output"
+  assert_contains "$out" '"run_lint": true' "benchmark source output"
+  # Benchmark scripts have no coverage in the gem suite, dummy app, or Pro stack.
+  assert_contains "$out" '"run_ruby_tests": false' "benchmark source output"
+  assert_contains "$out" '"run_dummy_tests": false' "benchmark source output"
+  assert_contains "$out" '"run_e2e_tests": false' "benchmark source output"
+  assert_contains "$out" '"run_pro_tests": false' "benchmark source output"
+  assert_contains "$out" '"run_core_benchmarks": false' "benchmark source output"
+  assert_contains "$out" '"run_pro_benchmarks": false' "benchmark source output"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "benchmark source output"
+}
+
+test_benchmark_comment_only_change_is_non_runtime_but_keeps_lint() {
+  setup_repo
+  perl -0pi -e 's/module BenchmarkSample/# Describe the sample.\nmodule BenchmarkSample/' \
+    benchmarks/lib/sample.rb
+  commit_change "benchmark comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "benchmark comment output"
+  assert_contains "$out" '"run_lint": true' "benchmark comment output"
+  assert_contains "$out" '"benchmarks_changed": false' "benchmark comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "benchmark comment output"
+}
+
+# Release tooling (rakelib/release.rake + script/release-* helpers) is covered
+# ONLY by the release rspec suite, never by generators or JS. It must request the
+# Ruby tests (so those specs run) AND lint (rubocop covers this Ruby/Bash) while
+# keeping run_generators / run_js_tests false, so required-pr-gate
+# (script/ci-required-hosted-gate) does not force the full hosted matrix. Before
+# this arm existed, rakelib/release.rake hit the uncategorized catch-all and set
+# run_generators=true.
+#
+# All release-tooling paths share one contract, asserted identically via
+# this helper so a one-character typo in any pattern can't silently fall through
+# to the generator-sensitive script/* CI-infra arm.
+assert_release_tooling_contract() {
+  local out="$1"
+  local label="$2"
+  assert_contains "$out" '"docs_only": false' "$label"
+  assert_contains "$out" '"non_runtime_only": false' "$label"
+  # Rubocop must run so release tooling is linted (the lint job is hosted-gated
+  # on run_lint; without this it would never lint these paths).
+  assert_contains "$out" '"run_lint": true' "$label"
+  # Release specs run (release_rake_helpers_spec / release_forward_port_script_spec).
+  assert_contains "$out" '"run_ruby_tests": true' "$label"
+  # The supervised wrapper has a separate deterministic integration harness. This
+  # selector is consumed by gem-tests.yml, which runs it once on the latest
+  # unit leg instead of assuming the RSpec suite exercises the shell process
+  # and per-write-fence contract.
+  assert_contains "$out" '"run_release_supervisor_tests": true' "$label"
+  # Primary goal: NOT generator-sensitive, so required-pr-gate won't force hosted CI.
+  assert_contains "$out" '"run_generators": false' "$label"
+  assert_contains "$out" '"run_gem_generator_specs": false' "$label"
+  assert_contains "$out" '"run_js_tests": false' "$label"
+  # Release tooling does not exercise the dummy app, E2E, or benchmarks. Assert
+  # the FULL benchmark contract so a regression that flips any benchmark suite
+  # (e.g. a stray BENCH_PRO_CHANGED) cannot pass.
+  assert_contains "$out" '"run_dummy_tests": false' "$label"
+  assert_contains "$out" '"run_e2e_tests": false' "$label"
+  assert_contains "$out" '"run_core_benchmarks": false' "$label"
+  assert_contains "$out" '"run_pro_benchmarks": false' "$label"
+  assert_contains "$out" '"run_pro_node_renderer_benchmarks": false' "$label"
+}
+
+test_release_rake_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "rakelib/release.rake" "task :release do; end"
+
+  assert_release_tooling_contract "$(detector_output)" "release rake output"
+}
+
+test_release_lease_guard_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "rakelib/release_lease_guard.rb" "module ReleaseLeaseGuard; end"
+
+  assert_release_tooling_contract "$(detector_output)" "release lease guard output"
+}
+
+test_release_atomic_claim_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "rakelib/release_atomic_claim.rb" "module ReleaseAtomicClaim; end"
+
+  assert_release_tooling_contract "$(detector_output)" "release atomic claim output"
+}
+
+test_release_changelog_selector_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "rakelib/release_changelog_selector.rb" "module ReleaseChangelogSelector; end"
+
+  assert_release_tooling_contract "$(detector_output)" "release changelog selector output"
+}
+
+test_release_commit_classifier_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "rakelib/release_commit_classifier.rb" "module ReleaseCommitClassifier; end"
+
+  assert_release_tooling_contract "$(detector_output)" "release commit classifier output"
+}
+
+test_release_claim_script_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-claim" "#!/usr/bin/env ruby"
+
+  assert_release_tooling_contract "$(detector_output)" "release-claim output"
+}
+
+# The release helper scripts under script/ must be caught by the release-tooling
+# arm, not the broad script/* CI-infrastructure arm (which would set
+# run_generators=true and force hosted CI). Same contract as release.rake.
+test_release_finish_script_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-finish" "#!/usr/bin/env bash"
+
+  assert_release_tooling_contract "$(detector_output)" "release-finish output"
+}
+
+test_release_script_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release" "#!/usr/bin/env ruby"
+
+  assert_release_tooling_contract "$(detector_output)" "release wrapper output"
+}
+
+test_release_script_test_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-test.bash" "#!/usr/bin/env bash"
+
+  assert_release_tooling_contract "$(detector_output)" "release wrapper test output"
+}
+
+# Per-path coverage for the remaining three release-tooling globs. Without these,
+# a typo in any single pattern would route that path to the generator-sensitive
+# script/* CI-infra arm undetected.
+test_release_forward_port_script_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-forward-port" "#!/usr/bin/env bash"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port output"
+}
+
+test_release_forward_port_test_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-forward-port-test.bash" "#!/usr/bin/env bash"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port-test output"
+}
+
+test_release_finish_test_change_runs_ruby_tests_and_lint_without_generators() {
+  setup_repo
+  write_file_change "script/release-finish-test.bash" "#!/usr/bin/env bash"
+
+  assert_release_tooling_contract "$(detector_output)" "release-finish-test output"
+}
+
+assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs() {
+  local script_path="$1"
+  local label="$2"
+
+  setup_repo
+  mkdir -p "$(dirname "$script_path")"
+  cat > "$script_path" <<'RUBY'
+#!/usr/bin/env ruby
+FIXTURE = <<~CHANGELOG
+# Change Log
+
+### [Unreleased]
+
+#### Added
+
+- Original fixture.
+CHANGELOG
+
+puts FIXTURE
+RUBY
+  commit_change "add ${label} heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' "$script_path"
+  commit_change "${label} fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "${label} heredoc output"
+}
+
+test_release_forward_port_heredoc_fixture_change_runs_release_specs() {
+  assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "script/release-forward-port" \
+    "release-forward-port"
+}
+
+test_release_finish_heredoc_fixture_change_runs_release_specs() {
+  assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "script/release-finish" \
+    "release-finish"
+}
+
+test_release_atomic_claim_heredoc_fixture_change_runs_release_specs() {
+  assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "rakelib/release_atomic_claim.rb" \
+    "release-atomic-claim"
+}
+
+test_release_changelog_selector_heredoc_fixture_change_runs_release_specs() {
+  assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "rakelib/release_changelog_selector.rb" \
+    "release-changelog-selector"
+}
+
+test_release_claim_heredoc_fixture_change_runs_release_specs() {
+  assert_ruby_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "script/release-claim" \
+    "release-claim"
+}
+
+test_release_forward_port_plain_heredoc_fixture_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+FIXTURE = <<changelog
+# Change Log
+
+### [Unreleased]
+changelog
+
+puts FIXTURE
+RUBY
+  commit_change "add release-forward-port plain heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-forward-port
+  commit_change "release-forward-port plain heredoc heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port plain heredoc output"
+}
+
+test_release_finish_method_plain_heredoc_fixture_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-finish <<'RUBY'
+#!/usr/bin/env ruby
+puts <<CHANGELOG
+# Change Log
+
+### [Unreleased]
+CHANGELOG
+RUBY
+  commit_change "add release-finish method plain heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-finish
+  commit_change "release-finish method plain heredoc heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-finish method plain heredoc output"
+}
+
+test_release_forward_port_quoted_numeric_heredoc_fixture_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+FIXTURE = <<-'123'
+# Change Log
+
+### [Unreleased]
+123
+
+puts FIXTURE
+RUBY
+  commit_change "add release-forward-port quoted numeric heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-forward-port
+  commit_change "release-forward-port quoted numeric heredoc heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port quoted numeric heredoc output"
+}
+
+test_release_forward_port_plain_heredoc_indented_delimiter_text_stays_in_body() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+FIXTURE = <<CHANGELOG
+# Change Log
+  CHANGELOG
+# Body after indented delimiter text
+CHANGELOG
+
+puts FIXTURE
+RUBY
+  commit_change "add release-forward-port plain heredoc with indented delimiter text"
+  perl -0pi -e 's/# Body after indented delimiter text/# Changed body after indented delimiter text/' \
+    script/release-forward-port
+  commit_change "release-forward-port plain heredoc later body heading"
+
+  assert_release_tooling_contract \
+    "$(detector_output)" \
+    "release-forward-port plain heredoc indented delimiter text output"
+}
+
+test_release_forward_port_multiple_heredocs_on_one_line_track_later_body() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+puts <<~MAIN, <<~RELEASE
+# Main
+MAIN
+# Release
+RELEASE
+RUBY
+  commit_change "add release-forward-port multiple heredoc fixture"
+  perl -0pi -e 's/# Release/# Release changed/' script/release-forward-port
+  commit_change "release-forward-port second heredoc body heading"
+
+  assert_release_tooling_contract \
+    "$(detector_output)" \
+    "release-forward-port multiple heredoc output"
+}
+
+assert_bash_release_tooling_heredoc_fixture_change_runs_release_specs() {
+  local script_path="$1"
+  local label="$2"
+
+  setup_repo
+  mkdir -p script
+  cat > "$script_path" <<'BASH'
+#!/usr/bin/env bash
+cat <<'EOF' > release.md
+# Change Log
+
+### [Unreleased]
+EOF
+BASH
+  commit_change "add ${label} bash heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' "$script_path"
+  commit_change "${label} bash fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "${label} heredoc output"
+}
+
+test_release_forward_port_test_heredoc_fixture_change_runs_release_specs() {
+  assert_bash_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "script/release-forward-port-test.bash" \
+    "release-forward-port-test"
+}
+
+test_release_finish_test_heredoc_fixture_change_runs_release_specs() {
+  assert_bash_release_tooling_heredoc_fixture_change_runs_release_specs \
+    "script/release-finish-test.bash" \
+    "release-finish-test"
+}
+
+test_release_forward_port_test_lowercase_bash_heredoc_fixture_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<'fixture' > release.md
+# Change Log
+
+### [Unreleased]
+fixture
+BASH
+  commit_change "add release-forward-port-test lowercase bash heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-forward-port-test.bash
+  commit_change "release-forward-port-test lowercase bash fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port-test lowercase bash heredoc output"
+}
+
+test_release_forward_port_test_hyphenated_bash_heredoc_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<'CHANGE-LOG' > release.md
+# Change Log
+
+### [Unreleased]
+CHANGE-LOG
+BASH
+  commit_change "add release-forward-port-test hyphenated bash heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-forward-port-test.bash
+  commit_change "release-forward-port-test hyphenated bash fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-forward-port-test hyphenated bash heredoc output"
+}
+
+test_release_forward_port_test_unquoted_hyphenated_bash_heredoc_terminates_before_later_comment() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<release-fixture > release.md
+# Change Log
+release-fixture
+
+echo "done"
+BASH
+  commit_change "add release-forward-port-test unquoted hyphenated bash heredoc fixture"
+  perl -0pi -e 's/echo "done"/# Explain the release test.\necho "done"/' \
+    script/release-forward-port-test.bash
+  commit_change "release-forward-port-test comment after unquoted hyphenated bash heredoc"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "release-forward-port-test unquoted hyphenated comment output"
+  assert_contains "$out" '"non_runtime_only": true' "release-forward-port-test unquoted hyphenated comment output"
+  assert_contains "$out" '"run_lint": true' "release-forward-port-test unquoted hyphenated comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "release-forward-port-test unquoted hyphenated comment output"
+  assert_contains "$out" '"run_generators": false' "release-forward-port-test unquoted hyphenated comment output"
+}
+
+test_release_forward_port_test_arithmetic_shift_comment_only_change_stays_non_runtime() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port-test.bash <<'BASH'
+#!/usr/bin/env bash
+flags=1
+mask=2
+value=$((flags << mask))
+echo "$value"
+BASH
+  commit_change "add release-forward-port-test arithmetic shift fixture"
+  perl -0pi -e 's/echo "\$value"/# Explain the release test.\necho "\$value"/' \
+    script/release-forward-port-test.bash
+  commit_change "release-forward-port-test comment after arithmetic shift"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "release-forward-port-test arithmetic shift comment output"
+  assert_contains "$out" '"non_runtime_only": true' "release-forward-port-test arithmetic shift comment output"
+  assert_contains "$out" '"run_lint": true' "release-forward-port-test arithmetic shift comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "release-forward-port-test arithmetic shift comment output"
+  assert_contains "$out" '"run_generators": false' "release-forward-port-test arithmetic shift comment output"
+}
+
+test_release_finish_test_compact_bash_heredoc_redirect_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-finish-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<'fixture'>release.md
+# Change Log
+
+### [Unreleased]
+fixture
+BASH
+  commit_change "add release-finish-test compact bash heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-finish-test.bash
+  commit_change "release-finish-test compact bash fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-finish-test compact bash heredoc output"
+}
+
+test_release_finish_test_backslash_bash_heredoc_change_runs_release_specs() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-finish-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<\fixture > release.md
+# Change Log
+
+### [Unreleased]
+fixture
+BASH
+  commit_change "add release-finish-test backslash bash heredoc fixture"
+  perl -0pi -e 's/# Change Log/# Release Change Log/' script/release-finish-test.bash
+  commit_change "release-finish-test backslash bash fixture heading"
+
+  assert_release_tooling_contract "$(detector_output)" "release-finish-test backslash bash heredoc output"
+}
+
+test_release_finish_test_multiple_bash_heredocs_on_one_line_track_later_body() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-finish-test.bash <<'BASH'
+#!/usr/bin/env bash
+cat <<MAIN <<RELEASE
+# Main
+MAIN
+# Release
+RELEASE
+BASH
+  commit_change "add release-finish-test multiple bash heredoc fixture"
+  perl -0pi -e 's/# Release/# Release changed/' script/release-finish-test.bash
+  commit_change "release-finish-test second bash heredoc body heading"
+
+  assert_release_tooling_contract \
+    "$(detector_output)" \
+    "release-finish-test multiple bash heredoc output"
+}
+
+# Comment-only change to release tooling takes the SOURCE_COMMENT_ONLY_CHANGED
+# branch of the release arm (not RELEASE_TOOLING_CHANGED), so it stays
+# non-runtime — rubocop still runs (lint catches comment-affecting style) but the
+# release rspec suite does not. Mirrors
+# test_benchmark_comment_only_change_is_non_runtime_but_keeps_lint. The fixture
+# uses plain Ruby with no heredoc so source_file_has_multiline_string_construct
+# does not (correctly, conservatively) force a full run.
+test_release_tooling_comment_only_change_is_non_runtime_but_keeps_lint() {
+  setup_repo
+  mkdir -p rakelib
+  printf 'namespace :release do\n  task :stub do\n    puts "ok"\n  end\nend\n' > rakelib/release.rake
+  commit_change "add release rake stub"
+  perl -0pi -e 's/namespace :release do/# Describe the release tasks.\nnamespace :release do/' \
+    rakelib/release.rake
+  commit_change "release rake comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "release comment output"
+  assert_contains "$out" '"non_runtime_only": true' "release comment output"
+  assert_contains "$out" '"run_lint": true' "release comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "release comment output"
+  assert_contains "$out" '"run_generators": false' "release comment output"
+}
+
+test_release_tooling_shovel_operator_comment_only_change_stays_non_runtime() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+items = []
+items << release_item
+puts items
+RUBY
+  commit_change "add release script with shovel operator"
+  perl -0pi -e 's/items = \[\]/# Explain the release items.\nitems = []/' script/release-forward-port
+  commit_change "release script comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "release shovel comment output"
+  assert_contains "$out" '"non_runtime_only": true' "release shovel comment output"
+  assert_contains "$out" '"run_lint": true' "release shovel comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "release shovel comment output"
+  assert_contains "$out" '"run_generators": false' "release shovel comment output"
+}
+
+test_release_tooling_comment_only_change_outside_existing_heredoc_stays_non_runtime() {
+  setup_repo
+  mkdir -p script
+  cat > script/release-forward-port <<'RUBY'
+#!/usr/bin/env ruby
+USAGE = <<~USAGE
+# Usage
+USAGE
+
+puts "ok"
+RUBY
+  commit_change "add release script with heredoc"
+  perl -0pi -e 's/puts "ok"/# Explain the release script.\nputs "ok"/' script/release-forward-port
+  commit_change "release script outside-heredoc comment"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": false' "release outside-heredoc comment output"
+  assert_contains "$out" '"non_runtime_only": true' "release outside-heredoc comment output"
+  assert_contains "$out" '"run_lint": true' "release outside-heredoc comment output"
+  assert_contains "$out" '"run_ruby_tests": false' "release outside-heredoc comment output"
+  assert_contains "$out" '"run_generators": false' "release outside-heredoc comment output"
+}
+
+# Regression guard: a CHANGELOG.md-only change is documentation (matched by the
+# *.md docs arm) and must stay skippable — docs_only / non_runtime_only true,
+# every run_* false. Release stamping touches CHANGELOG.md, so this keeps that
+# path from ever forcing CI.
+test_changelog_only_change_is_non_runtime_only() {
+  setup_repo
+  write_file_change "CHANGELOG.md" "## [Unreleased]"
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"docs_only": true' "changelog output"
+  assert_contains "$out" '"non_runtime_only": true' "changelog output"
+  assert_contains "$out" '"run_lint": false' "changelog output"
+  assert_contains "$out" '"run_ruby_tests": false' "changelog output"
+  assert_contains "$out" '"run_js_tests": false' "changelog output"
+  assert_contains "$out" '"run_generators": false' "changelog output"
+  assert_contains "$out" '"benchmarks_changed": false' "changelog output"
+}
+
+test_empty_diff_skips_everything() {
+  setup_repo
+  git commit --allow-empty -m "no file changes" >/dev/null
+
+  local out
+  out="$(detector_output)"
+  assert_contains "$out" '"non_runtime_only": true' "empty diff output"
+  assert_contains "$out" '"run_lint": false' "empty diff output"
+  assert_contains "$out" '"run_ruby_tests": false' "empty diff output"
+  assert_contains "$out" '"run_gem_generator_specs": false' "empty diff output"
+  assert_contains "$out" '"benchmarks_changed": false' "empty diff output"
+}
+
+run_test test_empty_diff_skips_everything
+run_test test_release_rake_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_lease_guard_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_atomic_claim_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_changelog_selector_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_commit_classifier_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_claim_script_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_finish_script_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_script_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_script_test_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_forward_port_script_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_forward_port_test_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_finish_test_change_runs_ruby_tests_and_lint_without_generators
+run_test test_release_forward_port_heredoc_fixture_change_runs_release_specs
+run_test test_release_finish_heredoc_fixture_change_runs_release_specs
+run_test test_release_atomic_claim_heredoc_fixture_change_runs_release_specs
+run_test test_release_changelog_selector_heredoc_fixture_change_runs_release_specs
+run_test test_release_claim_heredoc_fixture_change_runs_release_specs
+run_test test_release_forward_port_plain_heredoc_fixture_change_runs_release_specs
+run_test test_release_finish_method_plain_heredoc_fixture_change_runs_release_specs
+run_test test_release_forward_port_quoted_numeric_heredoc_fixture_change_runs_release_specs
+run_test test_release_forward_port_plain_heredoc_indented_delimiter_text_stays_in_body
+run_test test_release_forward_port_multiple_heredocs_on_one_line_track_later_body
+run_test test_release_forward_port_test_heredoc_fixture_change_runs_release_specs
+run_test test_release_finish_test_heredoc_fixture_change_runs_release_specs
+run_test test_release_forward_port_test_lowercase_bash_heredoc_fixture_change_runs_release_specs
+run_test test_release_forward_port_test_hyphenated_bash_heredoc_change_runs_release_specs
+run_test test_release_forward_port_test_unquoted_hyphenated_bash_heredoc_terminates_before_later_comment
+run_test test_release_forward_port_test_arithmetic_shift_comment_only_change_stays_non_runtime
+run_test test_release_finish_test_compact_bash_heredoc_redirect_change_runs_release_specs
+run_test test_release_finish_test_backslash_bash_heredoc_change_runs_release_specs
+run_test test_release_finish_test_multiple_bash_heredocs_on_one_line_track_later_body
+run_test test_release_tooling_comment_only_change_is_non_runtime_but_keeps_lint
+run_test test_release_tooling_shovel_operator_comment_only_change_stays_non_runtime
+run_test test_release_tooling_comment_only_change_outside_existing_heredoc_stays_non_runtime
+run_test test_changelog_only_change_is_non_runtime_only
+run_test test_docs_changes_are_non_runtime_only
+run_test test_internal_non_markdown_docs_are_non_runtime_only
+run_test test_issue_template_changes_are_non_runtime_only
+run_test test_docs_pr_with_internal_and_issue_template_yaml_is_non_runtime_only
+run_test test_docs_internal_tree_with_image_asset_is_non_runtime_only
+run_test test_docs_internal_non_markdown_file_is_non_runtime_only
+run_test test_docs_internal_image_only_is_non_runtime_only
+run_test test_docs_internal_doc_plus_runtime_source_still_runs_tests
+run_test test_agent_tooling_changes_are_non_runtime_only
+run_test test_agent_bin_change_runs_ci_infrastructure_without_benchmarks
+run_test test_agent_bin_markdown_change_is_non_runtime_only
+run_test test_agent_workflow_config_change_runs_ci_infrastructure_without_benchmarks
+run_test test_ci_local_fast_mode_keeps_generator_specs_out_of_unit_job
+run_test test_ci_local_builds_dummy_assets_before_rspec_with_dependencies_present
+run_test test_ci_local_installs_missing_dummy_node_modules_before_build_and_rspec
+run_test test_ci_local_dummy_paths_are_not_reparsed_as_shell_code
+run_test test_ci_local_records_dummy_build_failure_and_skips_rspec
+run_test test_ci_local_preserves_independent_generator_selectors
+run_test test_ci_local_json_preserves_gem_generator_only_selector
+run_test test_ci_local_text_fallback_preserves_gem_generator_only_selector
+run_test test_ci_local_json_runs_release_supervisor_selector
+run_test test_ci_local_text_fallback_runs_release_supervisor_selector
+run_test test_ci_local_all_runs_release_supervisor_harness
+run_test test_ci_local_release_supervisor_failure_continues_selected_jobs
+run_test test_ci_local_pro_tests_use_hosted_workspace_command_from_root
+run_test test_ci_local_combined_js_and_pro_selection_runs_pro_js_once
+run_test test_ci_infrastructure_only_change_runs_tests_but_skips_benchmarks
+run_test test_suite_workflow_file_runs_its_tests_but_no_benchmark
+run_test test_gem_tests_workflow_change_keeps_generator_specs_fail_closed
+run_test test_ci_infra_plus_runtime_source_still_benchmarks
+run_test test_node_renderer_source_change_runs_node_renderer_benchmark
+run_test test_uncategorized_file_runs_tests_but_skips_benchmarks
+run_test test_rspec_only_change_skips_benchmarks
+run_test test_ruby_comment_only_change_skips_heavy_tests_but_keeps_lint
+run_test test_ruby_block_comment_only_change_skips_heavy_tests_but_keeps_lint
+run_test test_wrapping_ruby_code_with_block_comment_delimiters_remains_runtime_affecting
+run_test test_javascript_block_comment_only_change_skips_heavy_tests_but_keeps_lint
+run_test test_wrapping_code_with_block_comment_delimiters_remains_runtime_affecting
+run_test test_prose_comment_containing_webpack_is_not_a_runtime_directive
+run_test test_webpack_magic_comment_keyword_remains_runtime_affecting
+run_test test_prose_comment_containing_encoding_is_not_a_runtime_directive
+run_test test_typescript_suppression_comment_remains_runtime_affecting
+run_test test_code_line_starting_with_plus_plus_remains_runtime_affecting
+run_test test_comment_like_template_literal_change_remains_runtime_affecting
+run_test test_spec_comment_only_change_skips_rspec
+run_test test_core_app_comment_only_change_skips_heavy_tests_but_keeps_lint
+run_test test_core_app_source_change_remains_runtime_affecting
+run_test test_pro_app_comment_only_change_runs_pro_lint_only
+run_test test_pro_app_source_change_runs_pro_tests_only
+run_test test_pro_dummy_only_change_runs_pro_dummy_tests_without_pro_unit_tests
+run_test test_pro_node_renderer_comment_only_change_runs_pro_lint_only
+run_test test_mixed_comment_and_code_change_remains_runtime_affecting
+run_test test_ruby_magic_comment_remains_runtime_affecting
+run_test test_executable_source_change_remains_runtime_affecting
+run_test test_jsdoc_jsx_import_source_pragma_remains_runtime_affecting
+run_test test_inline_block_comment_license_remains_runtime_affecting
+run_test test_pure_annotation_remains_runtime_affecting
+run_test test_block_comment_with_trailing_code_remains_runtime_affecting
+run_test test_pro_only_changes_do_not_request_e2e
+run_test test_rspec_only_changes_do_not_request_e2e
+run_test test_generator_spec_helper_change_routes_generator_shard
+run_test test_generated_tree_approval_change_routes_generator_shard
+run_test test_generator_shared_spec_helper_change_routes_generator_shard
+run_test test_generator_simplecov_helper_change_routes_generator_shard
+run_test test_generator_shared_example_change_routes_generator_shard
+run_test test_generator_version_helper_change_routes_generator_shard
+run_test test_generator_only_changes_do_not_request_e2e
+run_test test_dummy_app_changes_request_e2e
+run_test test_core_ruby_changes_request_e2e
+run_test test_core_js_changes_request_e2e
+run_test test_benchmark_source_change_lints_and_flags_benchmarks_only
+run_test test_benchmark_comment_only_change_is_non_runtime_but_keeps_lint
+
+echo
+echo "CI changes detector tests: $TESTS_RUN run, $TESTS_FAILED failed"
+
+if [ "$TESTS_FAILED" -ne 0 ]; then
+  printf '\nFailures:\n' >&2
+  printf '  - %s\n' "${FAILURES[@]}" >&2
+  exit 1
+fi

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <% if content_for?(:title) %>
+    <%= yield(:title) %>
+  <% else %>
+    <title>Dummy</title>
+  <% end %>
+  <meta name="theme-color" content="#0B1118">
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <link rel="icon" href="/icon-512.png" sizes="512x512" type="image/png">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="manifest" href="/site.webmanifest">
+
+  <%= yield :head %>
+
+  <%= stylesheet_pack_tag %>
+  <%= javascript_pack_tag('client-bundle', 'data-turbo-track': 'reload', defer: true) %>
+
+  <%= csrf_meta_tags %>
+</head>
+<body>
+<% flash.each do |key, value| %>
+  <%= content_tag :div, value, class: "flash #{key}" %>
+<% end %>
+<%= render "shared/header" %>
+
+<%= yield %>
+
+<!-- This is a placeholder for ReactOnRails to know where to render the store props for
+     client side hydration -->
+<%= redux_store_hydration_data %>
+
+</body>
+</html>

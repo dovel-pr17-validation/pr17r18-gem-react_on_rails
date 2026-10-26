@@ -1,0 +1,259 @@
+# frozen_string_literal: true
+
+# Defines tasks related to generating example apps using the gem's generator.
+# Allows us to create and test apps generated using a wide range of options.
+#
+# Also see example_type.rb
+
+require "yaml"
+require "rails/version"
+require "pathname"
+require "json"
+
+require_relative "example_type"
+require_relative "task_helpers"
+
+namespace :shakapacker_examples do # rubocop:disable Metrics/BlockLength
+  include ReactOnRails::TaskHelpers
+
+  # Pins the shakapacker npm package version to exactly match the installed gem version.
+  # Prevents semver range resolution (e.g., ^9.5.0 -> 9.6.0) from causing version mismatches.
+  def pin_shakapacker_npm_version(dir) # rubocop:disable Metrics/CyclomaticComplexity
+    gem_version = shakapacker_gem_version_from_lockfile(dir)
+    return unless gem_version
+
+    package_json_path = File.join(dir, "package.json")
+    return unless File.exist?(package_json_path)
+
+    begin
+      package_json = JSON.parse(File.read(package_json_path))
+    rescue JSON::ParserError => e
+      puts "  ERROR: Failed to parse #{package_json_path}: #{e.message}"
+      raise
+    end
+
+    changed = false
+    %w[dependencies devDependencies].each do |section|
+      deps = package_json[section]
+      next unless deps&.key?("shakapacker")
+      next if deps["shakapacker"] == gem_version
+
+      puts "  Pinning npm shakapacker in #{section} from #{deps['shakapacker']} to exact #{gem_version}"
+      deps["shakapacker"] = gem_version
+      changed = true
+    end
+
+    File.write(package_json_path, "#{JSON.pretty_generate(package_json)}\n") if changed
+  end
+
+  # Reads the shakapacker gem version from the example app's Gemfile.lock
+  def shakapacker_gem_version_from_lockfile(dir)
+    lockfile = File.join(dir, "Gemfile.lock")
+    return unless File.exist?(lockfile)
+
+    lockfile_content = File.read(lockfile)
+    exact_version_pattern = /(\d+\.\d+\.\d+(?:[.-][A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?)/
+
+    # Prefer the GEM specs section entry (4-space indent) to avoid matching dependency
+    # constraints like "shakapacker (>= 6.0)" from DEPENDENCIES.
+    gem_specs_match = lockfile_content.match(/^\s{4}shakapacker\s+\(#{exact_version_pattern}\)$/)
+    return gem_specs_match[1] if gem_specs_match
+
+    # Fallback for non-standard lockfile formatting that still includes an exact version.
+    fallback_match = lockfile_content.match(/^\s+shakapacker\s+\(#{exact_version_pattern}\)$/)
+    fallback_match&.[](1)
+  end
+
+  def local_react_on_rails_package_ref(dir)
+    package_dir = File.expand_path("../packages/react-on-rails", gem_root)
+    relative_package_dir = Pathname(package_dir).relative_path_from(Pathname(dir)).to_s
+    "file:#{relative_package_dir}"
+  end
+
+  # Makes generated examples use the local monorepo package for react-on-rails.
+  # This ensures CI validates the package code in this branch rather than a
+  # potentially stale published npm version.
+  def pin_react_on_rails_to_local_package(dir)
+    package_json_path = File.join(dir, "package.json")
+    return unless File.exist?(package_json_path)
+
+    begin
+      package_json = JSON.parse(File.read(package_json_path))
+    rescue JSON::ParserError => e
+      puts "  ERROR: Failed to parse #{package_json_path}: #{e.message}"
+      raise
+    end
+
+    deps = package_json["dependencies"]
+    return unless deps&.key?("react-on-rails")
+
+    local_package_ref = local_react_on_rails_package_ref(dir)
+
+    return if deps["react-on-rails"] == local_package_ref
+
+    puts "  Pinning react-on-rails npm dependency from #{deps['react-on-rails']} to #{local_package_ref}"
+    deps["react-on-rails"] = local_package_ref
+    File.write(package_json_path, "#{JSON.pretty_generate(package_json)}\n")
+  end
+
+  # Updates React-related dependencies to a specific version
+  def update_react_dependencies(deps, react_version)
+    return unless deps
+
+    deps["react"] = react_version
+    deps["react-dom"] = react_version
+  end
+
+  # Updates dependencies in package.json to use specific React version
+  def update_package_json_for_react_version(package_json_path, react_version)
+    return unless File.exist?(package_json_path)
+
+    begin
+      package_json = JSON.parse(File.read(package_json_path))
+    rescue JSON::ParserError => e
+      puts "  ERROR: Failed to parse #{package_json_path}: #{e.message}"
+      raise
+    end
+
+    deps = package_json["dependencies"]
+    dev_deps = package_json["devDependencies"]
+
+    update_react_dependencies(deps, react_version)
+    # Shakapacker 8.2.0 requires webpack-assets-manifest ^5.x (v6.x uses ESM and breaks)
+    # Always add this explicitly since the transitive dependency from shakapacker may be v6.x
+    dev_deps["webpack-assets-manifest"] = "^5.0.6" if dev_deps
+    # Shakapacker 8.2.0 requires babel-loader to be explicitly installed as a devDependency
+    # (in 9.x this requirement was relaxed or the package structure changed)
+    dev_deps["babel-loader"] = "^9.1.3" if dev_deps
+    # @babel/plugin-transform-runtime is required by the default babel config but not
+    # automatically included as a dependency in older Shakapacker versions
+    dev_deps["@babel/plugin-transform-runtime"] = "^7.24.0" if dev_deps
+
+    # Add npm overrides to force specific React version, preventing
+    # react-on-rails from pulling in React 19 as a transitive dependency
+    package_json["overrides"] = {
+      "react" => react_version,
+      "react-dom" => react_version
+    }
+
+    File.write(package_json_path, "#{JSON.pretty_generate(package_json)}\n")
+  end
+
+  # Updates package.json and Gemfile to use specific React version for compatibility testing
+  def apply_react_version(dir, react_version)
+    update_package_json_for_react_version(File.join(dir, "package.json"), react_version)
+
+    puts "  Updated package.json for compatibility testing:"
+    puts "    React: #{react_version}"
+  end
+
+  def install_local_react_on_rails_package(dir, legacy_peer_deps: false)
+    legacy_peer_deps_flag = legacy_peer_deps ? "--legacy-peer-deps " : ""
+    sh_in_dir(dir,
+              "npm install react-on-rails@#{local_react_on_rails_package_ref(dir)} " \
+              "#{legacy_peer_deps_flag}--install-links")
+  end
+
+  def install_example_node_dependencies(example_type)
+    pin_shakapacker_npm_version(example_type.dir)
+    pin_react_on_rails_to_local_package(example_type.dir)
+
+    if example_type.pinned_react_version?
+      # Use --legacy-peer-deps to avoid peer dependency conflicts when
+      # react-on-rails expects newer React versions.
+      sh_in_dir(example_type.dir, "npm install --legacy-peer-deps --install-links")
+      # Explicit re-install is required because npm install --install-links does not
+      # reliably copy a file: dependency that was just pinned in the same session.
+      install_local_react_on_rails_package(example_type.dir, legacy_peer_deps: true)
+      # Regenerate Shakapacker binstubs after downgrading from 9.x to 8.2.x
+      # The binstub format may differ between major versions.
+      unbundled_sh_in_dir(example_type.dir, "bundle exec rake shakapacker:binstubs")
+    else
+      # Use --install-links to copy file: dependencies instead of symlinking,
+      # preventing duplicate React instances from webpack resolving through symlinks.
+      sh_in_dir(example_type.dir, "npm install --install-links")
+      # Explicit re-install is required because npm install --install-links does not
+      # reliably copy a file: dependency that was just pinned in the same session.
+      install_local_react_on_rails_package(example_type.dir)
+    end
+  end
+
+  # Define tasks for each example type
+  ExampleType.all[:shakapacker_examples].each do |example_type| # rubocop:disable Metrics/BlockLength
+    relative_gem_root = Pathname(gem_root).relative_path_from(Pathname(example_type.dir))
+    # CLOBBER
+    desc "Clobbers (deletes) #{example_type.name_pretty}"
+    task example_type.clobber_task_name_short do
+      rm_rf(example_type.dir)
+    end
+
+    # GENERATE
+    desc "Generates #{example_type.name_pretty}"
+    task example_type.gen_task_name_short => example_type.clobber_task_name do
+      puts "Running shakapacker_examples:#{example_type.gen_task_name_short}"
+      mkdir_p(example_type.dir)
+      sh_in_dir(examples_dir, "rails new #{example_type.name} #{example_type.rails_options} --skip-javascript")
+      sh_in_dir(example_type.dir, "touch .gitignore")
+      sh_in_dir(example_type.dir,
+                "echo \"gem 'react_on_rails', path: '#{relative_gem_root}'\" >> #{example_type.gemfile}")
+      # json 3.0.0 (2026-09-07) raises ArgumentError on unknown keywords, and Rails < 8.1
+      # ActiveSupport still passes the removed quirks_mode: option to JSON.generate
+      # (fixed upstream in rails/rails#55534; released only in Rails >= 8.1.0).
+      # Self-retires when example apps generate on Rails >= 8.1; also removable if a
+      # json 3.x release restores tolerance for removed keywords.
+      if Gem::Version.new(Rails.version) < Gem::Version.new("8.1")
+        File.write(example_type.gemfile, "gem 'json', '>= 2', '< 3'\n", mode: "a")
+      end
+      # Shakapacker is automatically included as a dependency via react_on_rails.gemspec (>= 6.0)
+      bundle_install_in(example_type.dir)
+      # Use unbundled_sh_in_dir to ensure we're using the generated app's Gemfile
+      # and gem versions, not the parent workspace's bundle context.
+      unbundled_sh_in_dir(example_type.dir, "bundle exec rake shakapacker:install")
+      # Skip validation when running generators on example apps during development.
+      # The generator validates that certain config options exist in the initializer,
+      # but during example generation, we're often testing against the current gem
+      # codebase which may have new config options not yet in the released version.
+      # This allows examples to be generated without validation errors while still
+      # testing the generator functionality.
+      generator_commands = example_type.generator_shell_commands.map do |cmd|
+        "REACT_ON_RAILS_SKIP_VALIDATION=true #{cmd}"
+      end
+      # Use unbundled_sh_in_dir to ensure the generator uses the example app's
+      # gem versions, not the parent workspace's cached bundle context.
+      unbundled_sh_in_dir(example_type.dir, generator_commands)
+      # Re-run bundle install since dev_tests generator adds rspec-rails and simplecov to Gemfile
+      bundle_install_in(example_type.dir)
+
+      # Apply specific React version for compatibility testing examples
+      if example_type.pinned_react_version?
+        apply_react_version(example_type.dir, example_type.react_version_string)
+        # Re-run bundle install to ensure dependencies are resolved correctly
+        bundle_install_in(example_type.dir)
+      end
+      # Pin npm package versions and install node dependencies for generated example.
+      install_example_node_dependencies(example_type)
+      # Generate the component packs after running the generator to ensure all
+      # auto-bundled components have corresponding pack files created.
+      # Use unbundled_sh_in_dir to ensure we're using the generated app's Gemfile
+      # and gem versions, not the parent workspace's bundle context.
+      unbundled_sh_in_dir(example_type.dir, "bundle exec rake react_on_rails:generate_packs")
+      # Pre-build webpack bundles so server-side rendering works in tests.
+      # Even with build_test_command set, the server bundle needs to exist before
+      # test runs. Shakapacker's compile: true only triggers from javascript_pack_tag
+      # in the layout, which renders AFTER react_component(prerender: true) in the
+      # view body tries to read the server bundle.
+      unbundled_sh_in_dir(example_type.dir, "RAILS_ENV=test bundle exec bin/shakapacker")
+    end
+  end
+
+  desc "Clobbers (deletes) all example apps"
+  task :clobber do
+    rm_rf(examples_dir)
+  end
+
+  desc "Generates all example apps"
+  task gen_all: ExampleType.all[:shakapacker_examples].map(&:gen_task_name)
+end
+
+desc "Generates all example apps. Run `rake -D examples` to see all available options"
+task shakapacker_examples: ["shakapacker_examples:gen_all"]

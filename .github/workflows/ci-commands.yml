@@ -1,0 +1,1500 @@
+name: CI Commands
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # GitHub keeps at most one pending run per concurrency group. Scope the group
+  # to the triggering comment so queued +ci-* comments are all handled.
+  group: ci-command-${{ github.event.issue.number }}-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  handle-ci-command:
+    # `contains` is case-insensitive, matching the command parser below.
+    if: |
+      github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      contains(github.event.comment.body, '+ci-')
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Handle +ci command
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = context.issue.number;
+            const commentId = context.payload.comment.id;
+            const commentCreatedAt = context.payload.comment.created_at;
+            const actor = context.actor;
+            const repoFullName = `${owner}/${repo}`;
+            const hostedCiLabel = 'ready-for-hosted-ci';
+            const forceFullHostedCiLabel = 'force-full-hosted-ci';
+            const newerCommandVisibilityDelayMs = 5000;
+            const ciCommandSerializationVisibilityDelayMs = 5000;
+            const ciCommandSerializationPollDelayMs = 5000;
+            const ciCommandSerializationMaxAttempts = 12;
+            const ciCommandSerializationLookbackMs = 24 * 60 * 60 * 1000;
+            const dispatchRunVisibilityGraceMs = 2 * 60 * 1000;
+            const dispatchRunValidationPollDelayMs = 2000;
+            const dispatchRunValidationMaxAttempts = 3;
+            const dispatchResultCommentRetryDelayMs = 2000;
+            const dispatchResultCommentMaxAttempts = 3;
+
+            const validCommands = [
+              '+ci-run-hosted',
+              '+ci-force-full',
+              '+ci-stop-hosted',
+              '+ci-stop-full',
+              '+ci-skip-hosted',
+              '+ci-status',
+              '+ci-help'
+            ];
+            const trustedCommandAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const permissionByLogin = new Map();
+            const releaseBranchPrefixes = ['release/', 'releases/', 'release-'];
+            const activeWorkflowStatuses = new Set(['queued', 'in_progress', 'pending', 'requested', 'waiting']);
+
+            function isSameRepositoryPullRequest(pr) {
+              return pr.head.repo?.full_name === repoFullName;
+            }
+
+            function samePullRequestSnapshot(left, right) {
+              return left.state === right.state &&
+                left.merged === right.merged &&
+                left.head.sha === right.head.sha &&
+                left.head.ref === right.head.ref &&
+                left.head.repo?.full_name === right.head.repo?.full_name &&
+                left.base.ref === right.base.ref &&
+                left.base.sha === right.base.sha;
+            }
+
+            function isReleaseTargetPullRequest(pr) {
+              return releaseBranchPrefixes.some((prefix) => pr.base.ref.startsWith(prefix));
+            }
+
+            function hasAutomaticReleaseTargetCoverage(pr) {
+              return isSameRepositoryPullRequest(pr) &&
+                isReleaseTargetPullRequest(pr) &&
+                pr.user?.login !== 'dependabot[bot]';
+            }
+
+            function hostedWorkflows(pr, inputs = {}) {
+              return [
+                ['Lint JS and Ruby', 'lint-js-and-ruby.yml', inputs],
+                ['JS unit tests for Renderer package', 'package-js-tests.yml', inputs],
+                ['Rspec test for gem', 'gem-tests.yml', inputs],
+                ['Integration Tests', 'integration-tests.yml', inputs],
+                ['Assets Precompile Check', 'precompile-check.yml', inputs],
+                ['Generator tests', 'examples.yml', inputs],
+                ['Playwright E2E Tests', 'playwright.yml', inputs],
+                ...(pr.user?.login === 'dependabot[bot]' ? [] : [
+                  ['React on Rails Pro - Integration Tests', 'pro-integration-tests.yml', inputs],
+                  ['React on Rails Pro - Package Tests', 'pro-test-package-and-gem.yml', inputs]
+                ])
+              ];
+            }
+
+            function hostedWorkflowFiles(pr) {
+              return hostedWorkflows(pr).map(([, workflowFile]) => workflowFile);
+            }
+
+            function workflowFileForRun(run) {
+              return (run.path || '').split('@')[0].split('/').at(-1) || '';
+            }
+
+            function observedRunState(runs) {
+              if (runs.some((run) => run.status === 'completed' && run.conclusion === 'success')) {
+                return 'successful';
+              }
+              if (runs.some((run) => activeWorkflowStatuses.has(run.status))) {
+                return 'pending';
+              }
+              return runs.length > 0 ? 'failed' : 'missing';
+            }
+
+            function parseCoverageProof(comment, pr) {
+              if (comment.user?.login !== 'github-actions[bot]' || comment.user?.type !== 'Bot') {
+                return null;
+              }
+
+              const match = (comment.body || '').match(
+                /(?:^|[\r\n])<!-- hosted-ci-coverage:v1 (\{[^\r\n]*\}) -->(?=[\r\n]|$)/
+              );
+              if (!match) {
+                return null;
+              }
+
+              try {
+                const proof = JSON.parse(match[1]);
+                if (proof.head_sha !== pr.head.sha ||
+                    proof.pull_request_number !== issueNumber ||
+                    proof.base_ref !== pr.base.ref ||
+                    proof.base_sha !== pr.base.sha ||
+                    !['optimized', 'force-full'].includes(proof.requested_mode) ||
+                    !Array.isArray(proof.workflows) ||
+                    !proof.run_ids ||
+                    !proof.workflows.every((workflowFile) =>
+                      Number.isInteger(proof.run_ids[workflowFile]) && proof.run_ids[workflowFile] > 0
+                    ) ||
+                    (proof.workflow_modes !== undefined &&
+                      (typeof proof.workflow_modes !== 'object' ||
+                        !proof.workflows.every((workflowFile) =>
+                          ['optimized', 'force-full'].includes(proof.workflow_modes[workflowFile])
+                        ))) ||
+                    Number.isNaN(Date.parse(proof.requested_at || ''))) {
+                  return null;
+                }
+                return { ...proof, proof_comment_id: comment.id };
+              } catch (error) {
+                core.warning(`Ignoring malformed hosted-CI coverage proof: ${error.message || error}`);
+                return null;
+              }
+            }
+
+            function parseDispatchUncertainty(comment, pr) {
+              if (comment.user?.login !== 'github-actions[bot]' || comment.user?.type !== 'Bot') {
+                return null;
+              }
+
+              const match = (comment.body || '').match(
+                /(?:^|[\r\n])<!-- hosted-ci-coverage:v1 (\{[^\r\n]*\}) -->(?=[\r\n]|$)/
+              );
+              if (!match) {
+                return null;
+              }
+
+              try {
+                const marker = JSON.parse(match[1]);
+                if (marker.head_sha !== pr.head.sha ||
+                    marker.pull_request_number !== issueNumber ||
+                    marker.base_ref !== pr.base.ref ||
+                    marker.base_sha !== pr.base.sha ||
+                    !['optimized', 'force-full'].includes(marker.requested_mode) ||
+                    marker.coverage_status !== 'UNKNOWN' ||
+                    marker.dispatch_uncertain !== true ||
+                    !Array.isArray(marker.uncertain_workflows) ||
+                    marker.uncertain_workflows.length === 0 ||
+                    Number.isNaN(Date.parse(marker.requested_at || ''))) {
+                  return null;
+                }
+                return marker;
+              } catch (error) {
+                core.warning(`Ignoring malformed hosted-CI dispatch uncertainty: ${error.message || error}`);
+                return null;
+              }
+            }
+
+            function latestCoverageProof(proofs, workflowFile, requestedMode) {
+              return proofs
+                .filter((proof) =>
+                  proof.workflows.includes(workflowFile) &&
+                  (proof.workflow_modes?.[workflowFile] || proof.requested_mode) === requestedMode
+                )
+                .sort((left, right) =>
+                  Date.parse(right.requested_at) - Date.parse(left.requested_at) ||
+                  right.proof_comment_id - left.proof_comment_id
+                )[0] || null;
+            }
+
+            function observedProofRunState(runs, proof, workflowFile) {
+              if (!proof) {
+                return 'missing';
+              }
+
+              const exactRunId = proof.run_ids[workflowFile];
+              const exactRun = runs.find((run) =>
+                run.event === 'workflow_dispatch' && run.id === exactRunId
+              );
+              if (exactRun) {
+                return observedRunState([exactRun]);
+              }
+
+              const proofAgeMs = Math.max(0, Date.now() - Date.parse(proof.requested_at));
+              return proofAgeMs <= dispatchRunVisibilityGraceMs
+                ? 'pending'
+                : 'missing';
+            }
+
+            function coverageMarker(payload) {
+              return `<!-- hosted-ci-coverage:v1 ${JSON.stringify(payload)} -->`;
+            }
+
+            function coverageProofMarker({
+              baseRef,
+              baseSha,
+              dispatched,
+              headSha,
+              observed,
+              requestedMode,
+              reused,
+              runIds,
+              workflowModes,
+              workflows
+            }) {
+              return coverageMarker({
+                head_sha: headSha,
+                pull_request_number: issueNumber,
+                base_ref: baseRef,
+                base_sha: baseSha,
+                requested_mode: requestedMode,
+                requested_at: new Date(Date.now()).toISOString(),
+                workflows,
+                run_ids: runIds,
+                workflow_modes: workflowModes,
+                reused,
+                observed,
+                dispatched
+              });
+            }
+
+            async function observeExactHeadRuns(pr) {
+              try {
+                const [runs, comments] = await Promise.all([
+                  github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                    owner,
+                    repo,
+                    head_sha: pr.head.sha,
+                    per_page: 100
+                  }),
+                  github.paginate(github.rest.issues.listComments, {
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                    sort: 'created',
+                    direction: 'asc'
+                  })
+                ]);
+                const exactHeadRuns = runs.filter((run) => run.head_sha === pr.head.sha);
+                const dispatchUncertainties = comments
+                  .map((comment) => parseDispatchUncertainty(comment, pr))
+                  .filter(Boolean);
+                if (dispatchUncertainties.length > 0) {
+                  core.warning(
+                    'Exact-head hosted-CI coverage is UNKNOWN because a prior dispatch could not be correlated.'
+                  );
+                  return { status: 'UNKNOWN', workflows: [] };
+                }
+                const proofs = comments
+                  .map((comment) => parseCoverageProof(comment, pr))
+                  .filter(Boolean);
+                const automaticReleaseTarget = hasAutomaticReleaseTargetCoverage(pr);
+                const workflows = hostedWorkflowFiles(pr).map((workflowFile) => {
+                  const workflowRuns = exactHeadRuns.filter((run) => workflowFileForRun(run) === workflowFile);
+                  // Non-release pull_request runs can be successful selector-only shells. Only
+                  // workflow_dispatch runs, or explicitly trusted release-target runs below,
+                  // prove that the hosted jobs actually ran.
+                  const forceFullProof = latestCoverageProof(proofs, workflowFile, 'force-full');
+                  const forceFullState = observedProofRunState(
+                    workflowRuns,
+                    forceFullProof,
+                    workflowFile
+                  );
+                  const optimizedProof = latestCoverageProof(proofs, workflowFile, 'optimized');
+                  const optimizedProofState = observedProofRunState(
+                    workflowRuns,
+                    optimizedProof,
+                    workflowFile
+                  );
+                  const automaticReleaseRuns = automaticReleaseTarget
+                    ? workflowRuns.filter((run) =>
+                      run.event === 'pull_request' &&
+                      (run.pull_requests || []).some((associatedPullRequest) =>
+                        associatedPullRequest.number === issueNumber &&
+                        associatedPullRequest.base?.ref === pr.base.ref &&
+                        associatedPullRequest.base?.sha === pr.base.sha
+                      )
+                    )
+                    : [];
+                  const releaseState = observedRunState(automaticReleaseRuns);
+
+                  if (['pending', 'successful'].includes(forceFullState)) {
+                    return { file: workflowFile, mode: 'force-full', state: forceFullState, force_full_state: forceFullState };
+                  }
+                  if (['pending', 'successful'].includes(releaseState)) {
+                    return { file: workflowFile, mode: 'release-full', state: releaseState, force_full_state: forceFullState };
+                  }
+
+                  return {
+                    file: workflowFile,
+                    mode: optimizedProofState === 'missing' ? 'missing' : 'optimized',
+                    state: optimizedProofState,
+                    force_full_state: forceFullState
+                  };
+                });
+
+                return { status: 'known', baseRef: pr.base.ref, baseSha: pr.base.sha, workflows };
+              } catch (error) {
+                core.warning(`Unable to read exact-head workflow runs: ${error.message || error}`);
+                return { status: 'UNKNOWN', workflows: [] };
+              }
+            }
+
+            function commandText(commentBody) {
+              return commentBody
+                .replace(/```[\s\S]*?```/g, '')
+                .replace(/~~~[\s\S]*?~~~/g, '')
+                .split('\n')
+                .filter((line) => !/^\s*>/.test(line))
+                .join('\n');
+            }
+
+            function parseCommand(commentBody) {
+              const match = commandText(commentBody)
+                .match(/(?:^|\n)\s*(\+ci-[a-z0-9][a-z0-9-]*)(?:[ \t]+([^\n]*))?/i);
+
+              if (!match) {
+                return null;
+              }
+
+              return {
+                command: match[1].toLowerCase(),
+                args: (match[2] || '').trim()
+              };
+            }
+
+            async function postComment(body) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body
+              });
+            }
+
+            async function updateDispatchResultComment(commentId, body) {
+              for (let attempt = 1; attempt <= dispatchResultCommentMaxAttempts; attempt += 1) {
+                try {
+                  await github.rest.issues.updateComment({
+                    owner,
+                    repo,
+                    comment_id: commentId,
+                    body
+                  });
+                  return true;
+                } catch (error) {
+                  core.warning(
+                    `Unable to persist hosted-CI dispatch proof (attempt ${attempt}/` +
+                    `${dispatchResultCommentMaxAttempts}): ${error.message || error}`
+                  );
+                  if (attempt < dispatchResultCommentMaxAttempts) {
+                    await sleep(dispatchResultCommentRetryDelayMs);
+                  }
+                }
+              }
+
+              return false;
+            }
+
+            async function createDispatchResultComment(body) {
+              for (let attempt = 1; attempt <= dispatchResultCommentMaxAttempts; attempt += 1) {
+                try {
+                  await postComment(body);
+                  return true;
+                } catch (error) {
+                  core.warning(
+                    `Unable to persist hosted-CI result (attempt ${attempt}/` +
+                    `${dispatchResultCommentMaxAttempts}): ${error.message || error}`
+                  );
+                  if (attempt < dispatchResultCommentMaxAttempts) {
+                    await sleep(dispatchResultCommentRetryDelayMs);
+                  }
+                }
+              }
+
+              return false;
+            }
+
+            async function reconcileDispatchAnchor(pr) {
+              for (let attempt = 1; attempt <= dispatchResultCommentMaxAttempts; attempt += 1) {
+                try {
+                  const comments = await github.paginate(github.rest.issues.listComments, {
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    per_page: 100
+                  });
+                  const anchor = comments.find((comment) => {
+                    const marker = parseDispatchUncertainty(comment, pr);
+                    return marker?.source_comment_id === commentId &&
+                      marker.source_run_id === context.runId &&
+                      marker.requested_at === commentCreatedAt;
+                  });
+                  if (Number.isInteger(anchor?.id) && anchor.id > 0) {
+                    return anchor.id;
+                  }
+                } catch (error) {
+                  core.warning(
+                    `Unable to reconcile hosted-CI dispatch anchor (attempt ${attempt}/` +
+                    `${dispatchResultCommentMaxAttempts}): ${error.message || error}`
+                  );
+                }
+
+                if (attempt < dispatchResultCommentMaxAttempts) {
+                  await sleep(dispatchResultCommentRetryDelayMs);
+                }
+              }
+
+              return null;
+            }
+
+            async function addReaction(content) {
+              try {
+                await github.rest.reactions.createForIssueComment({
+                  owner,
+                  repo,
+                  comment_id: commentId,
+                  content
+                });
+              } catch (error) {
+                const status = error.status || 'unknown';
+                const message = error.message || String(error);
+                const details = `${status} ${message}`;
+                core.warning(
+                  `Reaction ${content} failed on comment ${commentId}: ` +
+                  details
+                );
+              }
+            }
+
+            async function hasWriteAccessFor(username) {
+              if (!username) {
+                return false;
+              }
+
+              if (permissionByLogin.has(username)) {
+                return permissionByLogin.get(username);
+              }
+
+              let permission;
+              try {
+                ({ data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner,
+                  repo,
+                  username
+                }));
+              } catch (error) {
+                if ([403, 404].includes(error.status)) {
+                  console.log(`Unable to read permission for ${username}: ${error.status}`);
+                  permissionByLogin.set(username, false);
+                  return false;
+                }
+
+                throw error;
+              }
+
+              const hasWritePermission = ['admin', 'write'].includes(permission.permission);
+              permissionByLogin.set(username, hasWritePermission);
+              return hasWritePermission;
+            }
+
+            async function hasWriteAccess() {
+              return hasWriteAccessFor(actor);
+            }
+
+            async function getPullRequest() {
+              const { data: pr } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: issueNumber
+              });
+
+              return pr;
+            }
+
+            async function ensureLabel(name, description, color) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name,
+                  description,
+                  color
+                });
+              } catch (error) {
+                if (error.status !== 422) {
+                  throw error;
+                }
+              }
+            }
+
+            async function addHostedCiLabels(forceFull) {
+              await ensureLabel(
+                hostedCiLabel,
+                'Run optimized hosted GitHub CI for this PR',
+                '0E8A16'
+              );
+
+              const labels = [hostedCiLabel];
+              if (forceFull) {
+                await ensureLabel(
+                  forceFullHostedCiLabel,
+                  'Bypass optimized hosted CI selection and run all hosted suites',
+                  'B60205'
+                );
+                labels.push(forceFullHostedCiLabel);
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels
+              });
+            }
+
+            async function removeLabels(labelNames) {
+              let removed = false;
+              for (const labelName of labelNames) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    name: labelName
+                  });
+                  removed = true;
+                } catch (error) {
+                  if (error.status !== 404) {
+                    throw error;
+                  }
+                }
+              }
+
+              return removed;
+            }
+
+            async function removeHostedCiLabels() {
+              return removeLabels([hostedCiLabel, forceFullHostedCiLabel]);
+            }
+
+            async function removeForceFullHostedCiLabel() {
+              return removeLabels([forceFullHostedCiLabel]);
+            }
+
+            async function listPullRequestLabels() {
+              const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100
+              });
+
+              return labels.map((label) => label.name);
+            }
+
+            async function listPullRequestFiles() {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number: issueNumber,
+                per_page: 100
+              });
+
+              return files;
+            }
+
+            function isDocsOnlyPath(filename) {
+              return filename.endsWith('.md') ||
+                filename.endsWith('.mdx') ||
+                filename.endsWith('.markdown') ||
+                filename.endsWith('.rst') ||
+                filename.endsWith('.txt') ||
+                filename === '.lychee.toml' ||
+                filename.startsWith('docs/') ||
+                filename.startsWith('internal/') ||
+                filename.startsWith('.github/ISSUE_TEMPLATE/') ||
+                filename.startsWith('.claude/') ||
+                filename.startsWith('.agents/') ||
+                filename.startsWith('.cursor/');
+            }
+
+            function isDocsOnly(files) {
+              return files.length > 0 &&
+                files.every((file) => isDocsOnlyPath(file.filename));
+            }
+
+            async function findCurrentWaiver(sha) {
+              const marker = `<!-- ci-skip-hosted:${sha} -->`;
+              for await (const page of github.paginate.iterator(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+                sort: 'created',
+                direction: 'desc'
+              })) {
+                const found = page.data.find((comment) =>
+                  comment.user?.login === 'github-actions[bot]' &&
+                  comment.user?.type === 'Bot' &&
+                  (comment.body || '').startsWith(marker)
+                );
+
+                if (found) {
+                  return found;
+                }
+              }
+
+              return null;
+            }
+
+            function oneLine(value) {
+              return value.replace(/[\r\n\u2028\u2029]+/g, ' ').replace(/`+/g, "'").trim();
+            }
+
+            function sleep(ms) {
+              return new Promise((resolve) => setTimeout(resolve, ms));
+            }
+
+            async function waitForOlderCiCommands() {
+              if (!Number.isInteger(context.runId) || context.runId <= 0) {
+                return { status: 'UNKNOWN', reason: 'Current CI Commands workflow run ID is unavailable.' };
+              }
+              if (context.runAttempt !== 1) {
+                return {
+                  status: 'UNKNOWN',
+                  reason: 'Manual reruns of CI Commands cannot safely dispatch hosted CI; post a new command instead.'
+                };
+              }
+
+              const createdLowerBound =
+                `>=${new Date(Date.now() - ciCommandSerializationLookbackMs).toISOString()}`;
+              await sleep(ciCommandSerializationVisibilityDelayMs);
+              for (let attempt = 1; attempt <= ciCommandSerializationMaxAttempts; attempt += 1) {
+                let runs;
+                try {
+                  runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner,
+                    repo,
+                    workflow_id: 'ci-commands.yml',
+                    event: 'issue_comment',
+                    created: createdLowerBound,
+                    per_page: 100
+                  });
+                } catch (error) {
+                  core.warning(`Unable to serialize CI Commands workflow runs: ${error.message || error}`);
+                  return { status: 'UNKNOWN', reason: 'Unable to read older CI Commands workflow runs.' };
+                }
+
+                const olderActiveRuns = runs.filter((run) =>
+                  run.id < context.runId &&
+                  activeWorkflowStatuses.has(run.status)
+                );
+                if (olderActiveRuns.length === 0) {
+                  return { status: 'known' };
+                }
+                if (attempt < ciCommandSerializationMaxAttempts) {
+                  await sleep(ciCommandSerializationPollDelayMs);
+                }
+              }
+
+              return {
+                status: 'UNKNOWN',
+                reason: 'An older CI Commands workflow did not finish within the bounded wait.'
+              };
+            }
+
+            function newerCommandScanSince() {
+              const createdAt = Date.parse(commentCreatedAt);
+              if (Number.isNaN(createdAt)) {
+                return undefined;
+              }
+
+              return new Date(Math.max(0, createdAt - 60000)).toISOString();
+            }
+
+            async function newerCiCommands(commandNames, { waitForVisibility = true } = {}) {
+              const commandNameSet = new Set(commandNames);
+              const newerCommands = new Set();
+              const since = newerCommandScanSince();
+
+              // Give GitHub's comments API a short visibility window so a later
+              // stop/skip command wins over an older run-hosted command that is
+              // still dispatching workflows.
+              if (waitForVisibility) {
+                await sleep(newerCommandVisibilityDelayMs);
+              }
+
+              for await (const page of github.paginate.iterator(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+                sort: 'created',
+                direction: 'asc',
+                ...(since ? { since } : {})
+              })) {
+                for (const comment of page.data) {
+                  const commenterLogin = comment.user?.login;
+
+                  if (comment.id <= commentId ||
+                      comment.user?.type === 'Bot' ||
+                      !commenterLogin ||
+                      !trustedCommandAssociations.has(comment.author_association) ||
+                      !(await hasWriteAccessFor(commenterLogin))) {
+                    continue;
+                  }
+
+                  const parsed = parseCommand(comment.body || '');
+                  if (
+                    parsed &&
+                    validCommands.includes(parsed.command) &&
+                    commandNameSet.has(parsed.command)
+                  ) {
+                    newerCommands.add(parsed.command);
+                    if (newerCommands.size === commandNameSet.size) {
+                      return newerCommands;
+                    }
+                  }
+                }
+              }
+
+              return newerCommands;
+            }
+
+            async function hasNewerCiCommand(commandNames) {
+              return (await newerCiCommands(commandNames)).size > 0;
+            }
+
+            async function hasNewerCiCommandBeforeMutation(commandNames) {
+              return (await newerCiCommands(commandNames, { waitForVisibility: false })).size > 0;
+            }
+
+            function helpBody() {
+              return [
+                '## CI Commands',
+                '',
+                'Use these commands at the start of a PR comment line:',
+                'Post one CI command per comment; if multiple commands are present, only the first is handled.',
+                '',
+                '- `+ci-run-hosted` - dispatch optimized hosted CI and add `ready-for-hosted-ci` for future commits',
+                '- `+ci-force-full` - dispatch hosted CI with optimized selection bypassed and add `force-full-hosted-ci`',
+                '- `+ci-stop-hosted` - remove hosted CI labels so future commits return to the required gate only',
+                '- `+ci-stop-full` - remove only the force-full hosted override',
+                '- `+ci-skip-hosted [reason]` - record a SHA-bound hosted CI waiver',
+                '- `+ci-status` - summarize the PR CI policy state',
+                '- `+ci-help` - show this help',
+                '',
+                'Arguments are optional free text after the command. For example:',
+                '',
+                '```',
+                '+ci-skip-hosted docs-only change; markdown checks are enough',
+                '```'
+              ].join('\n');
+            }
+
+            async function triggerHostedCi(pr, { forceFull }) {
+              if (pr.state !== 'open') {
+                await addReaction('confused');
+                await postComment([
+                  'Unable to run hosted CI from this command because the PR is not open.',
+                  '',
+                  `Current PR state: \`${pr.state || 'unknown'}\`; merged: \`${pr.merged ? 'yes' : 'no'}\`.`,
+                  'Hosted CI dispatch requires the live PR head ref before merge or close. After that point, branch-ref hosted-CI evidence is degraded/invalid; use the existing current-head checks, the merge commit, or a verification PR if more hosted evidence is required.'
+                ].join('\n'));
+                return;
+              }
+
+              const headRepoFullName = pr.head.repo?.full_name;
+
+              if (!headRepoFullName) {
+                await addReaction('confused');
+                await postComment([
+                  'Unable to run hosted CI from this command because the PR head repository is unavailable.',
+                  '',
+                  'The repository may have been deleted or made private. A maintainer should push the branch to this repository or trigger the required workflows manually.'
+                ].join('\n'));
+                return;
+              }
+
+              if (headRepoFullName !== repoFullName) {
+                await addReaction('confused');
+                await postComment([
+                  'Unable to run hosted CI from this command because the PR branch is from a fork.',
+                  '',
+                  'A maintainer should push the branch to this repository or trigger the required workflows manually.'
+                ].join('\n'));
+                return;
+              }
+
+              const serialization = await waitForOlderCiCommands();
+              if (serialization.status === 'UNKNOWN') {
+                await addReaction('confused');
+                await postComment([
+                  '## Hosted CI Command Serialization UNKNOWN',
+                  coverageMarker({
+                    head_sha: pr.head.sha,
+                    pull_request_number: issueNumber,
+                    base_ref: pr.base.ref,
+                    base_sha: pr.base.sha,
+                    requested_mode: forceFull ? 'force-full' : 'optimized',
+                    coverage_status: 'UNKNOWN',
+                    observed: [],
+                    dispatched: []
+                  }),
+                  '',
+                  serialization.reason,
+                  'No workflows were dispatched because an older CI command may still mutate hosted coverage.'
+                ].join('\n'));
+                core.setFailed('Older CI command state is UNKNOWN; dispatch stopped.');
+                return;
+              }
+
+              const inputs = {
+                pull_request_base_ref: pr.base.ref,
+                pull_request_base_sha: pr.base.sha,
+                ...(forceFull ? { force_full_hosted: 'true' } : {})
+              };
+              const baseContextInputNames = new Set(['pull_request_base_ref', 'pull_request_base_sha']);
+              const workflows = hostedWorkflows(pr, inputs);
+              const coverage = await observeExactHeadRuns(pr);
+              if (coverage.status === 'UNKNOWN') {
+                await addReaction('confused');
+                await postComment([
+                  '## Hosted CI Coverage UNKNOWN',
+                  coverageMarker({
+                    head_sha: pr.head.sha,
+                    requested_mode: forceFull ? 'force-full' : 'optimized',
+                    coverage_status: 'UNKNOWN',
+                    observed: [],
+                    dispatched: []
+                  }),
+                  '',
+                  `Unable to prove which hosted workflows are missing for \`${pr.head.sha.slice(0, 12)}\`.`,
+                  'No workflows were dispatched because exact-head coverage could not be read safely.'
+                ].join('\n'));
+                core.setFailed('Exact-head hosted CI coverage is UNKNOWN; dispatch stopped.');
+                return;
+              }
+
+              const coverageByFile = new Map(
+                coverage.workflows.map((workflow) => [workflow.file, workflow])
+              );
+              const coveredWorkflows = workflows.filter(([, workflowFile]) => {
+                const observed = coverageByFile.get(workflowFile);
+                const state = forceFull ? observed?.force_full_state : observed?.state;
+                return ['pending', 'successful'].includes(state);
+              });
+              const workflowsToDispatch = workflows.filter((workflow) => !coveredWorkflows.includes(workflow));
+
+              let currentPr;
+              try {
+                currentPr = await getPullRequest();
+              } catch (error) {
+                core.warning(`Unable to re-read the pull request before hosted-CI dispatch: ${error.message || error}`);
+              }
+              if (!currentPr || !samePullRequestSnapshot(pr, currentPr)) {
+                await addReaction('confused');
+                await postComment([
+                  '## Pull Request Changed - Hosted CI Stopped',
+                  coverageMarker({
+                    head_sha: pr.head.sha,
+                    pull_request_number: issueNumber,
+                    base_ref: pr.base.ref,
+                    base_sha: pr.base.sha,
+                    requested_mode: forceFull ? 'force-full' : 'optimized',
+                    requested_at: commentCreatedAt,
+                    coverage_status: 'UNKNOWN',
+                    observed: coverage.workflows,
+                    dispatched: []
+                  }),
+                  '',
+                  'The pull request head, base, repository, or state changed after hosted-CI coverage was planned.',
+                  'No workflows or labels were requested. Retry the command against the current pull request state.'
+                ].join('\n'));
+                core.setFailed('Pull request changed during hosted CI planning; dispatch stopped.');
+                return;
+              }
+
+              let dispatchResultCommentId;
+              if (workflowsToDispatch.length > 0) {
+                const plannedWorkflowFiles = workflowsToDispatch.map(([, workflowFile]) => workflowFile);
+                const dispatchAnchorBody = [
+                  coverageMarker({
+                    head_sha: pr.head.sha,
+                    pull_request_number: issueNumber,
+                    base_ref: pr.base.ref,
+                    base_sha: pr.base.sha,
+                    requested_mode: forceFull ? 'force-full' : 'optimized',
+                    requested_at: commentCreatedAt,
+                    source_comment_id: commentId,
+                    source_run_id: context.runId,
+                    coverage_status: 'UNKNOWN',
+                    dispatch_uncertain: true,
+                    uncertain_workflows: plannedWorkflowFiles,
+                    workflows: [],
+                    run_ids: {},
+                    reused: coveredWorkflows.map(([, workflowFile]) => workflowFile),
+                    observed: coverage.workflows,
+                    dispatched: []
+                  }),
+                  '## Hosted CI Dispatch In Progress',
+                  '',
+                  'This head-bound UNKNOWN marker is replaced with exact-run proof after dispatch validation.',
+                  'If the final update cannot be persisted, later same-head commands remain fail-closed.'
+                ].join('\n');
+
+                try {
+                  const { data: anchorComment } = await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: dispatchAnchorBody
+                  });
+                  dispatchResultCommentId = anchorComment?.id;
+                } catch (error) {
+                  core.warning(`Unable to create hosted-CI dispatch anchor: ${error.message || error}`);
+                }
+
+                if (!Number.isInteger(dispatchResultCommentId) || dispatchResultCommentId <= 0) {
+                  dispatchResultCommentId = await reconcileDispatchAnchor(pr);
+                }
+
+                if (!Number.isInteger(dispatchResultCommentId) || dispatchResultCommentId <= 0) {
+                  await addReaction('confused');
+                  core.setFailed('Unable to persist hosted-CI dispatch anchor; no workflows were dispatched.');
+                  return;
+                }
+
+                let anchoredPr;
+                try {
+                  anchoredPr = await getPullRequest();
+                } catch (error) {
+                  core.warning(
+                    `Unable to re-read the pull request after hosted-CI anchoring: ${error.message || error}`
+                  );
+                }
+                if (!anchoredPr || !samePullRequestSnapshot(pr, anchoredPr)) {
+                  await addReaction('confused');
+                  const stoppedBody = [
+                    '## Pull Request Changed After Dispatch Anchoring',
+                    coverageMarker({
+                      head_sha: pr.head.sha,
+                      pull_request_number: issueNumber,
+                      base_ref: pr.base.ref,
+                      base_sha: pr.base.sha,
+                      requested_mode: forceFull ? 'force-full' : 'optimized',
+                      requested_at: commentCreatedAt,
+                      coverage_status: 'known',
+                      observed: coverage.workflows,
+                      dispatched: []
+                    }),
+                    '',
+                    'The pull request head, base, repository, or state changed after the dispatch anchor was persisted.',
+                    'No workflow or hosted-CI label was requested. Post a new command for the current pull request state.'
+                  ].join('\n');
+                  const stoppedResultPersisted = await updateDispatchResultComment(
+                    dispatchResultCommentId,
+                    stoppedBody
+                  );
+                  if (!stoppedResultPersisted) {
+                    core.warning(
+                      'Unable to replace the pre-dispatch UNKNOWN anchor after the pull request changed.'
+                    );
+                  }
+                  core.setFailed('Pull request changed after hosted CI anchoring; dispatch stopped.');
+                  return;
+                }
+              }
+
+              function legacyCompatibleInputs(workflowInputs) {
+                const legacyInputs = Object.fromEntries(
+                  Object.entries(workflowInputs).filter(([name]) => !baseContextInputNames.has(name))
+                );
+                if (pr.base.ref !== 'main') {
+                  legacyInputs.force_full_hosted = 'true';
+                }
+
+                return legacyInputs;
+              }
+
+              function isUnexpectedInputError(error) {
+                const message = error?.message || '';
+                return error?.status === 422 &&
+                  /unexpected inputs?|provided inputs?/.test(message.toLowerCase()) &&
+                  [...baseContextInputNames].some((name) => message.includes(name));
+              }
+
+              function dispatchUncertainty(message, cause) {
+                const error = new Error(message, cause ? { cause } : undefined);
+                error.dispatchUncertain = true;
+                return error;
+              }
+
+              function classifyDispatchFailure(error, unknownMessage) {
+                if (Number.isInteger(error?.status) && error.status >= 400 && error.status <= 499) {
+                  return error;
+                }
+
+                return dispatchUncertainty(unknownMessage, error);
+              }
+
+              function isRetryableWorkflowRunReadError(error) {
+                return error?.status === 404 || (error?.status >= 500 && error?.status <= 599);
+              }
+
+              async function createWorkflowDispatchWithFallback(workflowName, workflowFile, workflowInputs) {
+                const dispatchOptions = (inputs) => ({
+                  owner,
+                  repo,
+                  workflow_id: workflowFile,
+                  ref: pr.head.ref,
+                  inputs,
+                  headers: { 'x-github-api-version': '2026-03-10' }
+                });
+                const dispatchedWorkflow = async (response, usedLegacyInputsFallback) => {
+                  const runId = response?.data?.workflow_run_id;
+                  if (response?.status !== 200 || !Number.isInteger(runId) || runId <= 0) {
+                    throw dispatchUncertainty(
+                      `${workflowFile} dispatch did not return an exact workflow run ID in a 200 response.`
+                    );
+                  }
+
+                  let run;
+                  for (let attempt = 1; attempt <= dispatchRunValidationMaxAttempts; attempt += 1) {
+                    try {
+                      ({ data: run } = await github.rest.actions.getWorkflowRun({
+                        owner,
+                        repo,
+                        run_id: runId,
+                        headers: { 'x-github-api-version': '2026-03-10' }
+                      }));
+                      break;
+                    } catch (error) {
+                      if (isRetryableWorkflowRunReadError(error) &&
+                          attempt < dispatchRunValidationMaxAttempts) {
+                        await sleep(dispatchRunValidationPollDelayMs);
+                        continue;
+                      }
+                      throw dispatchUncertainty(
+                        `${workflowFile} returned run ${runId}, but the exact workflow run could not be validated.`,
+                        error
+                      );
+                    }
+                  }
+
+                  const expectedPath = `.github/workflows/${workflowFile}`;
+                  const runPath = (run?.path || '').split('@')[0];
+                  if (run?.id !== runId ||
+                      run?.event !== 'workflow_dispatch' ||
+                      run?.head_sha !== pr.head.sha ||
+                      runPath !== expectedPath) {
+                    throw dispatchUncertainty(
+                      `${workflowFile} returned run did not match the expected workflow and head.`
+                    );
+                  }
+                  return {
+                    effectiveMode: usedLegacyInputsFallback && pr.base.ref !== 'main'
+                      ? 'force-full'
+                      : forceFull ? 'force-full' : 'optimized',
+                    file: workflowFile,
+                    name: workflowName,
+                    runId,
+                    usedLegacyInputsFallback
+                  };
+                };
+
+                let response;
+                let usedLegacyInputsFallback = false;
+                try {
+                  response = await github.rest.actions.createWorkflowDispatch(
+                    dispatchOptions(workflowInputs)
+                  );
+                } catch (error) {
+                  if (!isUnexpectedInputError(error)) {
+                    throw classifyDispatchFailure(
+                      error,
+                      `${workflowFile} dispatch result is UNKNOWN: ${error.message || error}`
+                    );
+                  }
+
+                  core.warning(
+                    `${workflowFile} rejected PR base context inputs; retrying with legacy workflow_dispatch inputs.`
+                  );
+                  usedLegacyInputsFallback = true;
+                  try {
+                    response = await github.rest.actions.createWorkflowDispatch(
+                      dispatchOptions(legacyCompatibleInputs(workflowInputs))
+                    );
+                  } catch (fallbackError) {
+                    throw classifyDispatchFailure(
+                      fallbackError,
+                      `${workflowFile} legacy dispatch result is UNKNOWN: ${fallbackError.message || fallbackError}`
+                    );
+                  }
+                }
+
+                return dispatchedWorkflow(response, usedLegacyInputsFallback);
+              }
+
+              const dispatchResults = await Promise.allSettled(
+                workflowsToDispatch.map(([workflowName, workflowFile, inputs]) =>
+                  createWorkflowDispatchWithFallback(workflowName, workflowFile, inputs)
+                )
+              );
+
+              const succeeded = [];
+              const failed = [];
+
+              for (const [index, result] of dispatchResults.entries()) {
+                if (result.status === 'fulfilled') {
+                  succeeded.push(result.value);
+                } else {
+                  failed.push({
+                    workflow: workflowsToDispatch[index][0],
+                    workflowFile: workflowsToDispatch[index][1],
+                    error: result.reason?.message || String(result.reason),
+                    dispatchUncertain: result.reason?.dispatchUncertain === true
+                  });
+                }
+              }
+
+              let labelAdded = false;
+              let forceFullLabelAdded = false;
+              let labelMessageOverride = '';
+              if (failed.length === 0) {
+                const labelControlCommands = [
+                  '+ci-stop-hosted',
+                  '+ci-skip-hosted',
+                  '+ci-stop-full'
+                ];
+                try {
+                  const newerCommands = await newerCiCommands(labelControlCommands);
+                  if (newerCommands.has('+ci-stop-hosted') || newerCommands.has('+ci-skip-hosted')) {
+                    labelMessageOverride =
+                      'Skipped hosted CI labels because a newer stop/skip command was posted after this command.';
+                  } else {
+                    for (const command of await newerCiCommands(labelControlCommands, { waitForVisibility: false })) {
+                      newerCommands.add(command);
+                    }
+
+                    if (newerCommands.has('+ci-stop-hosted') || newerCommands.has('+ci-skip-hosted')) {
+                      labelMessageOverride =
+                        'Skipped hosted CI labels because a newer stop/skip command was posted after this command.';
+                    } else {
+                      const shouldAddForceFullLabel = forceFull && !newerCommands.has('+ci-stop-full');
+                      try {
+                        await addHostedCiLabels(shouldAddForceFullLabel);
+                        labelAdded = true;
+                        forceFullLabelAdded = shouldAddForceFullLabel;
+                        if (forceFull && !shouldAddForceFullLabel) {
+                          labelMessageOverride =
+                            'Added `ready-for-hosted-ci`, but skipped `force-full-hosted-ci` because a newer `+ci-stop-full` command was posted after this command.';
+                        }
+                      } catch (error) {
+                        failed.push({
+                          workflow: forceFull ? 'force-full hosted CI labels' : 'hosted CI label',
+                          error: error.message
+                        });
+                      }
+                    }
+                  }
+                } catch (error) {
+                  failed.push({
+                    workflow: 'hosted CI newer-command check',
+                    error: error.message || String(error)
+                  });
+                  labelMessageOverride =
+                    'Skipped hosted CI labels because checking for newer stop/skip commands failed after workflows were triggered.';
+                }
+              }
+
+              await addReaction(failed.length > 0 ? 'confused' : succeeded.length > 0 ? 'rocket' : 'eyes');
+
+              const failedList = failed.length > 0
+                ? `\n\nFailed:\n${failed.map((failure) => `- ${failure.workflow}: ${failure.error}`).join('\n')}`
+                : '';
+              const uncertainWorkflows = failed
+                .filter((failure) => failure.dispatchUncertain)
+                .map((failure) => failure.workflowFile);
+              const dispatchIsUncertain = uncertainWorkflows.length > 0;
+              const fallbackCount = succeeded.filter((workflow) => workflow.usedLegacyInputsFallback).length;
+              const fallbackMessage = fallbackCount > 0
+                ? `Retried ${fallbackCount} workflow(s) without PR base context inputs because the PR branch has older workflow files.`
+                : '';
+              const dependabotTrustProof = pr.user?.login === 'dependabot[bot]' &&
+                succeeded.length === 0 && coveredWorkflows.length > 0 && failed.length === 0
+                ? `Trusted dispatch proof retained: Triggered ${coveredWorkflows.length} workflow(s) for ` +
+                  `\`${pr.head.sha.slice(0, 12)}\` by current-base prior requests.`
+                : '';
+              const labelMessage = labelMessageOverride || (labelAdded && forceFullLabelAdded
+                ? 'Added `ready-for-hosted-ci` and `force-full-hosted-ci`, so future commits will bypass optimized hosted CI selection until `+ci-stop-full` is used.'
+                : labelAdded
+                  ? 'Added `ready-for-hosted-ci`, so future commits will keep running optimized hosted CI until `+ci-stop-hosted` is used.'
+                  : succeeded.length > 0
+                    ? 'The workflows were triggered, but the hosted CI labels were not added. See the failure details below.'
+                  : 'Hosted CI labels were not added because no workflows were triggered.');
+              const resultMarker = dispatchIsUncertain
+                ? coverageMarker({
+                  head_sha: pr.head.sha,
+                  pull_request_number: issueNumber,
+                  base_ref: pr.base.ref,
+                  base_sha: pr.base.sha,
+                  requested_mode: forceFull ? 'force-full' : 'optimized',
+                  requested_at: commentCreatedAt,
+                  coverage_status: 'UNKNOWN',
+                  dispatch_uncertain: true,
+                  uncertain_workflows: uncertainWorkflows,
+                  workflows: [],
+                  run_ids: {},
+                  reused: [],
+                  observed: coverage.workflows,
+                  dispatched: []
+                })
+                : coverageProofMarker({
+                  baseRef: pr.base.ref,
+                  baseSha: pr.base.sha,
+                  headSha: pr.head.sha,
+                  requestedMode: forceFull ? 'force-full' : 'optimized',
+                  workflows: succeeded.map((workflow) => workflow.file),
+                  runIds: Object.fromEntries(
+                    succeeded.map((workflow) => [workflow.file, workflow.runId])
+                  ),
+                  workflowModes: Object.fromEntries(
+                    succeeded.map((workflow) => [workflow.file, workflow.effectiveMode])
+                  ),
+                  reused: coveredWorkflows.map(([, workflowFile]) => workflowFile),
+                  observed: coverage.workflows,
+                  dispatched: succeeded.map((workflow) => workflow.file)
+                });
+
+              const resultBody = [
+                dispatchIsUncertain
+                  ? '## Hosted CI Dispatch UNKNOWN'
+                  : forceFull ? '## Force-Full Hosted CI Requested' : '## Hosted CI Requested',
+                resultMarker,
+                '',
+                dispatchIsUncertain
+                  ? `Dispatch outcome is UNKNOWN for ${uncertainWorkflows.length} workflow(s); no exact-head dispatch proof was recorded.`
+                  : `Triggered ${succeeded.length} workflow(s) for \`${pr.head.sha.slice(0, 12)}\`.`,
+                `Skipped ${coveredWorkflows.length} workflow(s) with equivalent exact-head coverage.`,
+                ...(dependabotTrustProof ? [dependabotTrustProof] : []),
+                forceFull
+                  ? 'Mode: force-full hosted CI (bypasses optimized change selection).'
+                  : 'Mode: optimized hosted CI (path-selected by `script/ci-changes-detector`).',
+                ...(fallbackMessage ? [fallbackMessage] : []),
+                labelMessage,
+                '',
+                'View progress in the Actions tab.',
+                failedList
+              ].join('\n');
+              if (dispatchResultCommentId) {
+                const proofPersisted = await updateDispatchResultComment(
+                  dispatchResultCommentId,
+                  resultBody
+                );
+                if (!proofPersisted) {
+                  core.setFailed('Unable to persist final hosted-CI dispatch proof.');
+                  return;
+                }
+              } else {
+                const resultPersisted = await createDispatchResultComment(resultBody);
+                if (!resultPersisted) {
+                  core.setFailed('Unable to persist final hosted-CI result.');
+                  return;
+                }
+              }
+
+              if (failed.length > 0) {
+                core.setFailed(`Failed to trigger: ${failed.map((failure) => failure.workflow).join(', ')}`);
+              }
+            }
+
+            async function handleSkipHosted(pr, args) {
+              if (await hasNewerCiCommand(['+ci-run-hosted', '+ci-force-full'])) {
+                await postComment('Skipped hosted-CI waiver because a newer hosted-CI request command was posted after this command.');
+                return;
+              }
+
+              if (await hasNewerCiCommandBeforeMutation(['+ci-run-hosted', '+ci-force-full'])) {
+                await postComment('Skipped hosted-CI waiver because a newer hosted-CI request command was posted after this command.');
+                return;
+              }
+
+              const removedHostedCi = await removeHostedCiLabels();
+              const reason = oneLine(args) || 'not provided';
+              const shortSha = pr.head.sha.slice(0, 12);
+
+              await postComment([
+                `<!-- ci-skip-hosted:${pr.head.sha} -->`,
+                '## Hosted CI Waiver Recorded for This SHA',
+                '',
+                `@${actor} recorded a hosted-CI waiver for \`${shortSha}\` (audit record only - no workflow run was cancelled or blocked).`,
+                `Reason: \`${reason}\``,
+                '',
+                'This waiver is bound to the current head SHA and does not apply after another push.',
+                'The required fast gate still applies for this PR.',
+                ...(removedHostedCi ? ['', 'Removed hosted CI labels from this PR.'] : [])
+              ].join('\n'));
+            }
+
+            async function handleStopHosted() {
+              if (await hasNewerCiCommand(['+ci-run-hosted', '+ci-force-full'])) {
+                await postComment('Skipped hosted CI label removal because a newer hosted-CI request command was posted after this command.');
+                return;
+              }
+
+              if (await hasNewerCiCommandBeforeMutation(['+ci-run-hosted', '+ci-force-full'])) {
+                await postComment('Skipped hosted CI label removal because a newer hosted-CI request command was posted after this command.');
+                return;
+              }
+
+              const removed = await removeHostedCiLabels();
+              await postComment([
+                '## Hosted CI Mode Disabled',
+                '',
+                removed
+                  ? 'Removed hosted CI labels. Future commits will use only the required gate until hosted CI is requested again.'
+                  : 'No hosted CI labels were present. Future commits are already using only the required gate.',
+                '',
+                'Use `+ci-run-hosted` to re-enable optimized hosted CI.'
+              ].join('\n'));
+            }
+
+            async function handleStopFull() {
+              if (await hasNewerCiCommand(['+ci-force-full'])) {
+                await postComment('Skipped force-full label removal because a newer `+ci-force-full` command was posted after this command.');
+                return;
+              }
+
+              if (await hasNewerCiCommandBeforeMutation(['+ci-force-full'])) {
+                await postComment('Skipped force-full label removal because a newer `+ci-force-full` command was posted after this command.');
+                return;
+              }
+
+              const removed = await removeForceFullHostedCiLabel();
+              await postComment([
+                '## Force-Full Hosted CI Disabled',
+                '',
+                removed
+                  ? 'Removed `force-full-hosted-ci`. If `ready-for-hosted-ci` is still present, future commits keep running optimized hosted CI.'
+                  : 'No force-full hosted CI label was present.',
+                '',
+                'Use `+ci-force-full` to re-enable the force-full hosted override.'
+              ].join('\n'));
+            }
+
+            async function handleStatus(pr) {
+              const [labels, files, waiver, coverage] = await Promise.all([
+                listPullRequestLabels(),
+                listPullRequestFiles(),
+                findCurrentWaiver(pr.head.sha),
+                observeExactHeadRuns(pr)
+              ]);
+
+              const docsOnly = isDocsOnly(files);
+              const hasReadyForHostedCi = labels.includes(hostedCiLabel);
+              const hasForceFullHostedCi = labels.includes(forceFullHostedCiLabel);
+              const automaticReleaseTarget = hasAutomaticReleaseTargetCoverage(pr);
+              const coverageCounts = coverage.workflows.reduce((counts, workflow) => {
+                counts[workflow.state] += 1;
+                return counts;
+              }, { successful: 0, pending: 0, failed: 0, missing: 0 });
+              const coverageModeCounts = coverage.workflows.reduce((counts, workflow) => {
+                counts[workflow.mode] = (counts[workflow.mode] || 0) + 1;
+                return counts;
+              }, {});
+              const coverageModeSummary = Object.entries(coverageModeCounts)
+                .map(([mode, count]) => `${mode}=${count}`)
+                .join(', ');
+              const observedCoverage = coverage.status === 'UNKNOWN'
+                ? 'UNKNOWN'
+                : `modes[${coverageModeSummary}]; ` +
+                  `successful=${coverageCounts.successful}, pending=${coverageCounts.pending}, ` +
+                  `failed=${coverageCounts.failed}, missing=${coverageCounts.missing}`;
+
+              await postComment([
+                '## CI Status',
+                coverageMarker({
+                  head_sha: pr.head.sha,
+                  requested_mode: 'status',
+                  automatic_release_target: automaticReleaseTarget,
+                  coverage_status: coverage.status,
+                  observed: coverage.workflows
+                }),
+                '',
+                `Head SHA: \`${pr.head.sha.slice(0, 12)}\``,
+                `Changed files: ${files.length}`,
+                `Docs-only heuristic (matches ci-changes-detector metadata paths): ${docsOnly ? 'yes' : 'no'}`,
+                `\`${hostedCiLabel}\` label: ${hasReadyForHostedCi ? 'present' : 'absent'}`,
+                `\`${forceFullHostedCiLabel}\` label: ${hasForceFullHostedCi ? 'present' : 'absent'}`,
+                `Current hosted-CI waiver: ${waiver ? 'present for this SHA' : 'not present for this SHA'}`,
+                `Automatic release-target hosted mode: ${automaticReleaseTarget ? 'active' : 'inactive'}`,
+                `Observed exact-head coverage: ${observedCoverage}`,
+                '',
+                automaticReleaseTarget
+                  ? 'Release-target policy already enables hosted CI for this same-repository PR.'
+                  : hasForceFullHostedCi
+                  ? 'Force-full hosted CI is enabled for this PR.'
+                  : hasReadyForHostedCi
+                    ? 'Optimized hosted CI is enabled for this PR.'
+                    : 'Only the required gate is active unless hosted CI is requested.'
+              ].join('\n'));
+            }
+
+            const parsed = parseCommand(context.payload.comment.body || '');
+            if (!parsed) {
+              return;
+            }
+
+            const userHasWriteAccess = await hasWriteAccess();
+
+            if (!validCommands.includes(parsed.command)) {
+              if (!userHasWriteAccess) {
+                return;
+              }
+
+              await addReaction('confused');
+              await postComment([
+                `Unknown CI command: \`${parsed.command}\`.`,
+                '',
+                helpBody()
+              ].join('\n'));
+              return;
+            }
+
+            if (!userHasWriteAccess) {
+              await postComment(`@${actor} Sorry, only repository collaborators with write access can use CI commands.`);
+              core.warning(`User ${actor} does not have write access`);
+              return;
+            }
+
+            const pr = await getPullRequest();
+
+            switch (parsed.command) {
+              case '+ci-run-hosted':
+                await triggerHostedCi(pr, { forceFull: false });
+                break;
+              case '+ci-force-full':
+                await triggerHostedCi(pr, { forceFull: true });
+                break;
+              case '+ci-stop-hosted':
+                await addReaction('eyes');
+                await handleStopHosted();
+                break;
+              case '+ci-stop-full':
+                await addReaction('eyes');
+                await handleStopFull();
+                break;
+              case '+ci-skip-hosted':
+                await addReaction('eyes');
+                await handleSkipHosted(pr, parsed.args);
+                break;
+              case '+ci-status':
+                await addReaction('eyes');
+                await handleStatus(pr);
+                break;
+              case '+ci-help':
+                await addReaction('eyes');
+                await postComment(helpBody());
+                break;
+            }

@@ -1,0 +1,15 @@
+# Internal Documentation
+
+This directory holds internal-only documentation that should not be published on the ShakaCode docs site.
+
+## What lives here
+
+- `internal/analysis/`: investigations, benchmark postmortems, and decision records that inform maintainer process
+- `internal/contributor-info/`: contributor workflows, issue evaluation, release process, CI optimization notes
+- `internal/planning/`: planning notes, drafts, and historical analysis
+- `internal/react_on_rails_pro/contributors-info/`: Pro-internal contributor notes
+
+## Publishing rule
+
+- User-facing docs belong in `docs/` (including `docs/pro/`).
+- Internal docs belong in `internal/`.

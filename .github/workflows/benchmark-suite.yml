@@ -1,0 +1,354 @@
+name: Benchmark Suite (reusable)
+
+# Runs one benchmark suite/shard end to end and tracks it with Bencher using RELATIVE
+# continuous benchmarking (#3492,
+# https://bencher.dev/docs/how-to/track-benchmarks/#relative-continuous-benchmarking):
+# the job builds and benchmarks the comparison BASE ref first, then the HEAD ref, on
+# the SAME runner (the benchmark-suite-phase composite action, invoked twice), and
+# track_benchmarks.rb submits the pair to Bencher — base results as a throwaway per-run
+# baseline branch, head results compared against it with percentage thresholds. The
+# side-by-side run replaces the old statistical baseline built from main's history
+# across runners, whose cross-runner variance was noise-dominated on shared
+# GitHub-hosted runners (#4071).
+#
+# Both phases run the HEAD ref's benchmarks/ tree (stashed outside the workspace by
+# the "Stash head benchmark harness" step): the harness is the measuring instrument,
+# so measuring both refs with one instrument keeps harness changes from reading as
+# performance deltas. Each phase still builds and serves its own ref's app code.
+# Additionally, each route is sampled BENCHMARK_SAMPLES times per phase; medians ship
+# to Bencher and a boundary crossing must reproduce across samples (disjoint
+# base/head sample ranges) or the report downgrades it to "unconfirmed".
+#
+# Hosted suites are manual-only (workflow_dispatch via benchmark.yml): the trusted
+# Bencher trend runs on dedicated local hardware, and this workflow serves explicit
+# hosted diagnostics. The whole matrix row from benchmarks/generate_matrix.rb is
+# passed as a JSON string and unpacked into job-level env once.
+on:
+  workflow_call:
+    inputs:
+      matrix_row:
+        description: 'JSON-encoded benchmark matrix row (one entry of generate_matrix.rb include[])'
+        required: true
+        type: string
+      base_sha:
+        description: >-
+          Commit SHA of the comparison base benchmarked alongside the head ref (merge
+          parent for PRs, the previous main commit for pushes, the merge-base with main
+          for dispatches). Resolved once by benchmark.yml's detect-changes job.
+        required: true
+        type: string
+    secrets:
+      REACT_ON_RAILS_PRO_LICENSE_V2:
+        required: true
+      BENCHER_API_KEY:
+        required: false
+      BENCHER_API_TOKEN:
+        required: false
+
+# Same benchmark parameters as benchmark.yml's old top-level env: a reusable workflow
+# does NOT inherit the caller's env, but it DOES see the caller's github context, so the
+# workflow_dispatch inputs resolve identically (empty on push/pull_request). Ruby and
+# Node versions come from the committed tool-version files after checkout.
+env:
+  K6_VERSION: '2.0.0'
+  VEGETA_VERSION: '12.13.0'
+  ROUTES: ${{ github.event.inputs.routes }}
+  RATE: ${{ github.event.inputs.rate || 'max' }}
+  DURATION: ${{ github.event.inputs.duration }}
+  # Repeated k6 samples per route (bench.rb): medians ship to Bencher and the
+  # per-sample values let the relative comparison require a flagged change to
+  # reproduce across samples (#4580). Per-sample duration defaults to 12s when
+  # sampling (3x12s vs the old single 30s); an explicit DURATION input overrides
+  # per sample. Only the k6 suites read this; the vegeta node-renderer suite
+  # keeps its single fixed-rate run.
+  BENCHMARK_SAMPLES: '3'
+  REQUEST_TIMEOUT: ${{ github.event.inputs.request_timeout }}
+  CONNECTIONS: ${{ github.event.inputs.connections }}
+  MAX_CONNECTIONS: ${{ github.event.inputs.connections }}
+  WEB_CONCURRENCY: ${{ github.event.inputs.web_concurrency }}
+  RAILS_MAX_THREADS: ${{ github.event.inputs.rails_threads || 3 }}
+  RAILS_MIN_THREADS: ${{ github.event.inputs.rails_threads || 3 }}
+
+jobs:
+  run-suite:
+    runs-on: ubuntu-24.04
+    # Token permissions are set by the caller in benchmark.yml.
+    env:
+      SECRET_KEY_BASE: 'dummy-secret-key-for-ci-testing-not-used-in-production'
+      REACT_ON_RAILS_PRO_LICENSE: ${{ secrets.REACT_ON_RAILS_PRO_LICENSE_V2 }}
+      # Matrix row unpacked once. Names that begin with BENCHMARK_ are read by the bench
+      # scripts and track_benchmarks.rb directly; the rest drive step conditions/paths.
+      BENCHMARK_MODE: initial
+      BENCHMARK_SHARD_INDEX: ${{ fromJSON(inputs.matrix_row).shard_index }}
+      BENCHMARK_TOTAL_SHARDS: ${{ fromJSON(inputs.matrix_row).shard_total }}
+      BENCHMARK_SHARD_LABEL: ${{ fromJSON(inputs.matrix_row).shard_label }}
+      BENCHMARK_SUITE_NAME: ${{ fromJSON(inputs.matrix_row).bencher_suite_name }}
+      BENCHMARK_SUITE_GROUP: ${{ fromJSON(inputs.matrix_row).suite_name }}
+      BENCHER_REPORT_MARKER: ${{ fromJSON(inputs.matrix_row).report_marker }}
+      SUITE_NAME: ${{ fromJSON(inputs.matrix_row).suite_name }}
+      SHARD_LABEL: ${{ fromJSON(inputs.matrix_row).shard_label }}
+      APP_DIRECTORY: ${{ fromJSON(inputs.matrix_row).app_directory }}
+      BENCHMARK_TOOL: ${{ fromJSON(inputs.matrix_row).benchmark_tool }}
+      BENCHMARK_SCRIPT: ${{ fromJSON(inputs.matrix_row).benchmark_script }}
+      SERVER_KIND: ${{ fromJSON(inputs.matrix_row).server_kind }}
+      PRO_ENV: ${{ fromJSON(inputs.matrix_row).pro_env }}
+      GENERATE_PACKS: ${{ fromJSON(inputs.matrix_row).generate_packs }}
+      SUMMARY_FILE: ${{ fromJSON(inputs.matrix_row).summary_file }}
+      SUMMARY_TITLE: ${{ fromJSON(inputs.matrix_row).summary_title }}
+      RESULTS_ARTIFACT_NAME: ${{ fromJSON(inputs.matrix_row).artifact_name_prefix }}-${{ github.run_number }}${{ fromJSON(inputs.matrix_row).artifact_name_suffix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read runtime versions
+        id: tool-versions
+        uses: ./.github/actions/read-tool-versions
+
+      - name: Install Bencher CLI
+        # Pinned: reporting parses Bencher's `--format json` report — results +
+        # boundaries drive the summary-table significance highlighting, and the
+        # alerts[] array drives regression detection (benchmarks/track_benchmarks.rb
+        # via benchmarks/lib/bencher_report.rb). That JSON shape is not a documented
+        # stability contract, so the parser fails loudly on unexpected shapes and the
+        # CLI is pinned; before bumping, re-verify the shape against
+        # benchmarks/spec/bencher_report_spec.rb AND diff a live `--format json` run
+        # against a reference payload to confirm each boundary is still symmetric about
+        # baseline (lower_limit/upper_limit equidistant). The spec checks the parsing
+        # logic, not the payload's statistical symmetry that Boundary#mirror relies on.
+        uses: bencherdev/bencher@v0.6.8
+
+      - name: Add tools directory to PATH
+        run: |
+          mkdir -p ~/bin
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Setup k6
+        if: env.BENCHMARK_TOOL == 'k6'
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      - name: Cache Vegeta binary
+        id: cache-vegeta
+        if: env.BENCHMARK_TOOL == 'vegeta'
+        uses: actions/cache@v5
+        with:
+          path: ~/bin/vegeta
+          key: vegeta-${{ runner.os }}-${{ runner.arch }}-${{ env.VEGETA_VERSION }}
+
+      - name: Install Vegeta
+        if: env.BENCHMARK_TOOL == 'vegeta' && steps.cache-vegeta.outputs.cache-hit != 'true'
+        run: |
+          ARCH=$(dpkg --print-architecture)
+          echo "Installing Vegeta v${VEGETA_VERSION} (${ARCH})"
+          wget -q "https://github.com/tsenart/vegeta/releases/download/v${VEGETA_VERSION}/vegeta_${VEGETA_VERSION}_linux_${ARCH}.tar.gz"
+          tar -xzf "vegeta_${VEGETA_VERSION}_linux_${ARCH}.tar.gz"
+          mv vegeta ~/bin/
+
+      - name: Setup Ruby
+        uses: ./.github/actions/setup-ruby
+        with:
+          ruby-version: ${{ steps.tool-versions.outputs.minimum-ruby-version }}
+
+      - name: Get gem home directory
+        id: gem-home
+        run: echo "path=$(gem env home)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache foreman gem
+        id: cache-foreman
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.gem-home.outputs.path }}
+          key: foreman-gem-${{ runner.os }}-${{ runner.arch }}-ruby-${{ steps.tool-versions.outputs.minimum-ruby-version }}
+
+      - name: Install foreman
+        if: steps.cache-foreman.outputs.cache-hit != 'true'
+        run: gem install foreman
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          cache: true
+          cache_dependency_path: '**/pnpm-lock.yaml'
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          # Ruby stays on minimum to exercise gem compatibility; Node tracks the
+          # latest runtime from .tool-versions, pinned below the Node startup regression.
+          # This deliberate min-Ruby x latest-Node cross-profile does not match
+          # a regular CI matrix leg.
+          node-version: ${{ steps.tool-versions.outputs.node-version }}
+
+      - name: Print system information
+        run: |
+          echo "Linux release: "
+          cat /etc/issue
+          echo "Current user: "
+          whoami
+          echo "Current directory: "
+          pwd
+          echo "Ruby version: "
+          ruby -v
+          echo "Node version: "
+          node -v
+          echo "Pnpm version: "
+          pnpm --version
+          echo "Bundler version: "
+          bundle --version
+
+      - name: Configure benchmark commands
+        run: |
+          NPROC=$(nproc)
+          echo "Available CPUs: $NPROC"
+
+          if [ "$NPROC" -le 1 ]; then
+            SERVER_CMD="bin/prod"
+            BENCH_CMD="ruby"
+          else
+            SERVER_CMD="taskset -c 1-$((NPROC-1)) bin/prod"
+            BENCH_CMD="taskset -c 0 ruby"
+          fi
+
+          echo "SERVER_CMD=$SERVER_CMD" >> "$GITHUB_ENV"
+          echo "BENCH_CMD=$BENCH_CMD" >> "$GITHUB_ENV"
+
+          if [ -z "$WEB_CONCURRENCY" ]; then
+            # Clamp to >=1 so single-CPU runners don't end up with WEB_CONCURRENCY=0 (Puma
+            # would start in single-mode, which the benchmarks aren't tuned for).
+            WEB_CONCURRENCY=$((NPROC > 1 ? NPROC - 1 : 1))
+            echo "WEB_CONCURRENCY=$WEB_CONCURRENCY" >> "$GITHUB_ENV"
+            echo "WEB_CONCURRENCY (auto): $WEB_CONCURRENCY"
+          else
+            echo "WEB_CONCURRENCY (from input): $WEB_CONCURRENCY"
+          fi
+
+          echo "SERVER_CMD: $SERVER_CMD"
+          echo "BENCH_CMD: $BENCH_CMD"
+
+      - name: Validate comparison base input
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::base_sha input is empty; relative continuous benchmarking cannot run without a comparison base."
+            exit 1
+          fi
+          echo "Comparison base: $BASE_SHA"
+
+      # The bench harness (benchmarks/) is the measuring instrument. BOTH phases must
+      # run the HEAD ref's copy: each phase checks out its own ref, so running the
+      # checked-out benchmarks/ would measure the two refs with two different
+      # instruments, and any harness change (k6 connection behavior, sampling,
+      # durations) would masquerade as a base-vs-head performance delta. Stash the
+      # head copy outside the workspace (phases git-clean it) while the head ref is
+      # still checked out; the phase action runs scripts from this stash. App-side
+      # inputs (bin/prod*, gems, packs, renderer config) still come from each
+      # phase's own checkout — only the instrument is pinned.
+      - name: Stash head benchmark harness
+        run: |
+          rm -rf "$RUNNER_TEMP/bench-harness"
+          cp -R benchmarks "$RUNNER_TEMP/bench-harness"
+          echo "Stashed head benchmarks/ -> $RUNNER_TEMP/bench-harness"
+
+      # Relative continuous benchmarking, phase 1 of 2: build + benchmark the comparison
+      # BASE ref on this runner. Its results are stashed under runner.temp because the
+      # head phase git-cleans the workspace.
+      - name: Benchmark base ref
+        uses: ./.github/actions/benchmark-suite-phase
+        with:
+          ref: ${{ inputs.base_sha }}
+          phase: base
+          results-dir: ${{ runner.temp }}/bench_results_base
+          app-directory: ${{ env.APP_DIRECTORY }}
+          server-kind: ${{ env.SERVER_KIND }}
+          pro-env: ${{ env.PRO_ENV }}
+          generate-packs: ${{ env.GENERATE_PACKS }}
+          benchmark-script: ${{ env.BENCHMARK_SCRIPT }}
+          harness-dir: ${{ runner.temp }}/bench-harness
+          benchmark-timeout-minutes: ${{ fromJSON(inputs.matrix_row).benchmark_timeout_minutes }}
+          suite-name: ${{ env.SUITE_NAME }}
+          summary-file: ${{ env.SUMMARY_FILE }}
+          summary-title: ${{ env.SUMMARY_TITLE }}
+          ruby-version: ${{ steps.tool-versions.outputs.minimum-ruby-version }}
+
+      # The base phase leaves the workspace checked out at the base ref. Restore the
+      # head checkout BEFORE the next `uses: ./...` step: GitHub resolves local actions
+      # from the workspace when the step starts, so without this the head phase would
+      # execute the BASE ref's (possibly older or missing) copy of benchmark-suite-phase.
+      - name: Restore head checkout
+        run: git checkout --force "$GITHUB_SHA"
+
+      # Phase 2 of 2: build + benchmark the HEAD ref on the same runner. Results stay in
+      # bench_results/ for the tracking step.
+      - name: Benchmark head ref
+        uses: ./.github/actions/benchmark-suite-phase
+        with:
+          ref: ${{ github.sha }}
+          phase: head
+          results-dir: bench_results
+          app-directory: ${{ env.APP_DIRECTORY }}
+          server-kind: ${{ env.SERVER_KIND }}
+          pro-env: ${{ env.PRO_ENV }}
+          generate-packs: ${{ env.GENERATE_PACKS }}
+          benchmark-script: ${{ env.BENCHMARK_SCRIPT }}
+          harness-dir: ${{ runner.temp }}/bench-harness
+          benchmark-timeout-minutes: ${{ fromJSON(inputs.matrix_row).benchmark_timeout_minutes }}
+          suite-name: ${{ env.SUITE_NAME }}
+          summary-file: ${{ env.SUMMARY_FILE }}
+          summary-title: ${{ env.SUMMARY_TITLE }}
+          ruby-version: ${{ steps.tool-versions.outputs.minimum-ruby-version }}
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ${{ env.RESULTS_ARTIFACT_NAME }}
+          path: bench_results/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload base benchmark results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: base-${{ env.RESULTS_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/bench_results_base/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Track benchmarks with Bencher
+        env:
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_KEY == '' && secrets.BENCHER_API_TOKEN || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          # The base phase's results — this runner's own comparison baseline.
+          BENCHMARK_BASELINE_JSON: ${{ runner.temp }}/bench_results_base/benchmark.json
+          BENCHER_BASELINE_REPORT_JSON: ${{ runner.temp }}/bench_results_base/bencher_report.json
+          # The base phase's per-sample values, paired with the head sidecar for
+          # sample confirmation (unreproduced boundary crossings are downgraded).
+          BENCHMARK_BASELINE_DISPLAY_JSON: ${{ runner.temp }}/bench_results_base/benchmark_display.json
+        run: ruby benchmarks/track_benchmarks.rb
+
+      - name: Benchmark workflow summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "📋 Benchmark Workflow Summary"
+          echo "===================================="
+          echo "Mode: $BENCHMARK_MODE"
+          echo "Suite: $SUITE_NAME"
+          echo "Shard: $SHARD_LABEL"
+          echo "Status: $JOB_STATUS"
+          echo "Run number: $RUN_NUMBER"
+          echo "Triggered by: $ACTOR"
+          echo "Branch: $REF_NAME"

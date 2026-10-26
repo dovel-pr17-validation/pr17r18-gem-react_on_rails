@@ -1,0 +1,443 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "repository",
+    "definition",
+    "agent",
+    "environment",
+    "security",
+    "network_preflight",
+    "runner",
+    "result"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "dirty"],
+      "properties": {
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "const": false }
+      }
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputs"],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "executable"],
+            "properties": {
+              "path": { "type": "string", "pattern": "^(?!/)(?!.*\\.\\.).+$" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "executable": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "model", "probe_invoked", "scaffold_invoked"],
+      "properties": {
+        "name": { "enum": ["codex", "claude"] },
+        "version": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "probe_invoked": { "const": true },
+        "scaffold_invoked": { "type": "boolean" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "ruby", "node", "npm", "pnpm", "git"],
+      "properties": {
+        "os": { "type": "string" },
+        "ruby": { "type": "string" },
+        "node": { "type": "string" },
+        "npm": { "type": "string" },
+        "pnpm": { "type": "string" },
+        "git": { "type": "string" }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "umask",
+        "process_environment",
+        "shell_environment_inherit",
+        "credential_store",
+        "auth_material_available",
+        "stripped_sensitive_variable_categories",
+        "raw_cleanup",
+        "auth_material_persisted"
+      ],
+      "properties": {
+        "umask": { "const": "077" },
+        "process_environment": { "const": "env -i" },
+        "shell_environment_inherit": { "const": "none" },
+        "credential_store": { "const": "file" },
+        "auth_material_available": { "type": "boolean" },
+        "auth_source": { "enum": ["none", "operator-attested-file-broker"] },
+        "stripped_sensitive_variable_categories": {
+          "type": "array",
+          "items": { "enum": ["auth", "cookie", "credential", "password", "secret", "token"] },
+          "uniqueItems": true
+        },
+        "raw_cleanup": { "const": "EXIT/INT/TERM" },
+        "auth_material_persisted": { "const": false }
+      }
+    },
+    "network_preflight": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["endpoint", "status"],
+        "properties": {
+          "endpoint": { "type": "string", "format": "uri" },
+          "status": { "const": "pass" }
+        }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timeout_command",
+        "scaffold_timeout_seconds",
+        "probe_timeout_seconds",
+        "maximum_agent_call_wall_clock_seconds",
+        "sandbox_network_access",
+        "isolated_host_attestation",
+        "network_probe_artifact",
+        "exit_code",
+        "timed_out",
+        "config_artifact"
+      ],
+      "properties": {
+        "timeout_command": { "type": "string", "minLength": 1 },
+        "scaffold_timeout_seconds": { "type": "integer", "minimum": 1 },
+        "probe_timeout_seconds": { "type": "integer", "minimum": 1 },
+        "timeout_kill_grace_seconds": { "type": "integer", "minimum": 0 },
+        "maximum_agent_call_wall_clock_seconds": { "type": "integer", "minimum": 2 },
+        "sandbox_network_access": { "type": "boolean" },
+        "agent_configuration_mode": {
+          "enum": ["codex-native", "claude-bare", "claude-safe-mode"]
+        },
+        "isolated_host_attestation": { "type": "boolean" },
+        "network_probe_artifact": { "const": "sandbox-network-probe.json" },
+        "exit_code": { "type": "integer" },
+        "timed_out": { "type": "boolean" },
+        "config_artifact": { "const": "invocation.json" },
+        "execution_boundary": {
+          "enum": ["workspace-write", "isolated-host-attested", "claude-permission-gated"]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "sandbox_network_access": { "const": true } } },
+          "then": { "properties": { "isolated_host_attestation": { "const": true } } }
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "reason", "tutorial_claims_supported"],
+      "properties": {
+        "classification": { "enum": ["pass", "fail", "incomplete", "needs-review"] },
+        "reason": { "type": "string" },
+        "tutorial_claims_supported": { "const": false }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "codex" } },
+            "required": ["name"]
+          },
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": true } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["agent", "runner"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "execution_boundary": { "const": "isolated-host-attested" } },
+            "required": ["execution_boundary"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "agent_configuration_mode": { "const": "claude-safe-mode" } },
+            "required": ["agent_configuration_mode"]
+          }
+        },
+        "required": ["runner"]
+      },
+      "then": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "claude" } },
+            "required": ["name"]
+          },
+          "security": {
+            "type": "object",
+            "properties": {
+              "auth_material_available": { "const": true },
+              "auth_source": { "const": "operator-attested-file-broker" }
+            },
+            "required": ["auth_material_available", "auth_source"]
+          },
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": true } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["agent", "runner"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "codex" } },
+            "required": ["name"]
+          }
+        },
+        "required": ["agent"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "agent_configuration_mode": { "const": "codex-native" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "claude" } },
+            "required": ["name"]
+          }
+        },
+        "required": ["agent"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": {
+              "agent_configuration_mode": { "enum": ["claude-bare", "claude-safe-mode"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "codex" } },
+            "required": ["name"]
+          },
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": false } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["agent", "runner"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "execution_boundary": { "const": "workspace-write" } }
+          }
+        },
+        "anyOf": [
+          {
+            "properties": {
+              "runner": {
+                "type": "object",
+                "properties": { "execution_boundary": {} },
+                "required": ["execution_boundary"]
+              }
+            }
+          },
+          {
+            "properties": {
+              "security": {
+                "type": "object",
+                "required": ["auth_material_available"],
+                "properties": {
+                  "auth_material_available": { "const": false },
+                  "auth_source": false
+                }
+              },
+              "runner": {
+                "type": "object",
+                "properties": {
+                  "execution_boundary": false,
+                  "sandbox_network_access": { "const": false }
+                },
+                "required": ["sandbox_network_access"]
+              }
+            },
+            "required": ["security", "runner"]
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "claude" } },
+            "required": ["name"]
+          },
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": true } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["agent", "runner"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "execution_boundary": { "const": "isolated-host-attested" } },
+            "required": ["execution_boundary"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "agent": {
+            "type": "object",
+            "properties": { "name": { "const": "claude" } },
+            "required": ["name"]
+          },
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": false } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["agent", "runner"]
+      },
+      "then": {
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "execution_boundary": { "const": "claude-permission-gated" } },
+            "required": ["execution_boundary"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "security": {
+            "type": "object",
+            "properties": { "auth_material_available": { "const": true } },
+            "required": ["auth_material_available"]
+          }
+        },
+        "required": ["security"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "runner": {
+            "type": "object",
+            "properties": { "isolated_host_attestation": { "const": true } },
+            "required": ["isolated_host_attestation"]
+          }
+        },
+        "required": ["runner"]
+      },
+      "else": {
+        "type": "object",
+        "properties": {
+          "security": {
+            "type": "object",
+            "properties": { "auth_source": { "const": "none" } }
+          }
+        },
+        "required": ["security"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "security": {
+            "type": "object",
+            "properties": { "auth_material_available": { "const": true } },
+            "required": ["auth_material_available"]
+          }
+        },
+        "required": ["security"]
+      },
+      "then": {
+        "properties": {
+          "security": {
+            "type": "object",
+            "properties": { "auth_source": { "const": "operator-attested-file-broker" } },
+            "required": ["auth_source"]
+          }
+        },
+        "required": ["security"]
+      }
+    }
+  ]
+}
