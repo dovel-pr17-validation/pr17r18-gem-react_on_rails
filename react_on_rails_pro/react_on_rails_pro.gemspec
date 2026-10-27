@@ -49,7 +49,7 @@ Gem::Specification.new do |s|
 
   s.required_ruby_version = ">= 3.3.0"
 
-  s.add_runtime_dependency "async", ">= 2.29"
+  s.add_runtime_dependency "async", ">= 2.46.0"
   s.add_runtime_dependency "async-http", "~> 0.95"
   s.add_runtime_dependency "execjs", "~> 2.9"
   s.add_runtime_dependency "io-endpoint", "~> 0.17.0"
